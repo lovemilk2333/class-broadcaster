@@ -1,0 +1,6 @@
+# Deprecated compatibility file. Use `uv sync` in this directory instead.
+argon2-cffi>=23.1,<24
+cryptography>=43,<45
+pydantic>=2.7,<3
+pymongo>=4.6,<4.10
+PySide6>=6.5,<6.7

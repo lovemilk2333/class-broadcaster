@@ -1,0 +1,25 @@
+{
+  "name": "lovemilk-class-broadcaster-admin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@primeuix/themes": "^3.0.1",
+    "@primevue/forms": "^5.0.2",
+    "pinia": "^4.0.3",
+    "primeicons": "^8.0.2",
+    "primevue": "^4",
+    "vue": "^3.5.43"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "vue-tsc": "^2.2.12"
+  }
+}

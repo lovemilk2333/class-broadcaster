@@ -41,12 +41,15 @@ func (h *Hub) Register(clientID string, conn net.Conn) func() {
 	}
 }
 
+// ErrClientOffline is returned when Send targets a client with no live TLS session.
+var ErrClientOffline = errors.New("client is offline")
+
 func (h *Hub) Send(clientID string, packet protocol.Packet) error {
 	h.mu.RLock()
 	session := h.sessions[clientID]
 	h.mu.RUnlock()
 	if session == nil {
-		return errors.New("client is offline")
+		return ErrClientOffline
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -79,4 +82,20 @@ func (h *Hub) Disconnect(clientID string) {
 	if session != nil {
 		_ = session.conn.Close()
 	}
+}
+
+// SuspendClient tells the client to stop its automatic reconnect loop, then
+// closes the session. A later explicit connection attempt remains possible.
+func (h *Hub) SuspendClient(clientID string) {
+	h.mu.Lock()
+	session := h.sessions[clientID]
+	delete(h.sessions, clientID)
+	h.mu.Unlock()
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	_ = protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.ClientDisconnect, 0, 0, nil).WritePacket(session.conn)
+	_ = session.conn.Close()
+	session.mu.Unlock()
 }

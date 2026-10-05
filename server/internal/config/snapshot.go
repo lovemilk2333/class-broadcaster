@@ -10,10 +10,17 @@ import (
 )
 
 const (
-	ConfigIDRandomBytes                 = 4
-	DefaultConfigMaxAge                 = 7 * 24 * time.Hour
-	DefaultDisplayPosition              = "center"
-	DefaultDisplayDurationRatio float64 = 0.2
+	ConfigIDRandomBytes                  = 4
+	DefaultConfigMaxAge                  = 7 * 24 * time.Hour
+	DefaultAckTimeout                    = 300 * time.Second
+	MaxAckTimeout                        = 7 * 24 * time.Hour
+	DefaultDisplayPosition               = "center"
+	DefaultDisplayDurationRatio  float64 = 0.4
+	DefaultListenerProbeInterval         = 1 * time.Minute
+	DefaultListenerProbeDuration         = 12 * time.Hour
+	DefaultListenerProbeReset            = 31 * 24 * time.Hour
+	DefaultListenerLossThreshold         = 10
+	DefaultListenerIdleTimeout           = 1 * time.Minute
 )
 
 var ErrInvalidConfigID = errors.New("invalid config id")
@@ -57,15 +64,21 @@ func NeedsRefresh(id string, now time.Time, maxAge time.Duration) bool {
 }
 
 type Snapshot struct {
-	ID                   string        `bson:"config_id"`
-	IssuedAt             int64         `bson:"issued_at"`
-	HeartbeatInterval    time.Duration `bson:"heartbeat_interval"`
-	HeartbeatTimeout     time.Duration `bson:"heartbeat_timeout"`
-	MessageTTL           time.Duration `bson:"message_ttl"`
-	MaxSpeechDepth       int32         `bson:"max_speech_depth"`
-	MaxRepeatExpansion   int32         `bson:"max_repeat_expansion"`
-	DisplayPosition      string        `bson:"default_display_position"`
-	DisplayDurationRatio float64       `bson:"default_display_duration_ratio"`
+	ID                    string        `bson:"config_id"`
+	IssuedAt              int64         `bson:"issued_at"`
+	HeartbeatInterval     time.Duration `bson:"heartbeat_interval"`
+	HeartbeatTimeout      time.Duration `bson:"heartbeat_timeout"`
+	MessageTTL            time.Duration `bson:"message_ttl"`
+	AckTimeout            time.Duration `bson:"ack_timeout_seconds"`
+	MaxSpeechDepth        int32         `bson:"max_speech_depth"`
+	MaxRepeatExpansion    int32         `bson:"max_repeat_expansion"`
+	DisplayPosition       string        `bson:"default_display_position"`
+	DisplayDurationRatio  float64       `bson:"default_display_duration_ratio"`
+	ListenerProbeInterval time.Duration `bson:"listener_probe_interval"`
+	ListenerProbeDuration time.Duration `bson:"listener_probe_duration"`
+	ListenerProbeReset    time.Duration `bson:"listener_probe_reset"`
+	ListenerLossThreshold int32         `bson:"listener_loss_threshold"`
+	ListenerIdleTimeout   time.Duration `bson:"listener_idle_timeout"`
 }
 
 func NewSnapshot(now time.Time) (Snapshot, error) {
@@ -74,14 +87,20 @@ func NewSnapshot(now time.Time) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	return Snapshot{
-		ID:                   id,
-		IssuedAt:             now.UnixMilli(),
-		HeartbeatInterval:    15 * time.Second,
-		HeartbeatTimeout:     45 * time.Second,
-		MessageTTL:           24 * time.Hour,
-		MaxSpeechDepth:       8,
-		MaxRepeatExpansion:   100,
-		DisplayPosition:      DefaultDisplayPosition,
-		DisplayDurationRatio: DefaultDisplayDurationRatio,
+		ID:                    id,
+		IssuedAt:              now.UnixMilli(),
+		HeartbeatInterval:     15 * time.Second,
+		HeartbeatTimeout:      45 * time.Second,
+		MessageTTL:            24 * time.Hour,
+		AckTimeout:            DefaultAckTimeout,
+		MaxSpeechDepth:        8,
+		MaxRepeatExpansion:    100,
+		DisplayPosition:       DefaultDisplayPosition,
+		DisplayDurationRatio:  DefaultDisplayDurationRatio,
+		ListenerProbeInterval: DefaultListenerProbeInterval,
+		ListenerProbeDuration: DefaultListenerProbeDuration,
+		ListenerProbeReset:    DefaultListenerProbeReset,
+		ListenerLossThreshold: DefaultListenerLossThreshold,
+		ListenerIdleTimeout:   DefaultListenerIdleTimeout,
 	}, nil
 }

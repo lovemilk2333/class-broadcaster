@@ -10,4 +10,11 @@ dist/
 
 server/bin/
 server/data/
+# frontend built
+server/cmd/server/web/
 client/data/
+build/
+bin/
+# Generated Windows PE icon objects (rebuilt by make windows-icon).
+**/rsrc_windows_*.syso
+**/winres/

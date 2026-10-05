@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/gin-gonic/gin v1.12.0
+	github.com/klauspost/compress v1.17.11
 	go.mongodb.org/mongo-driver v1.17.10
 )
 

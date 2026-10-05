@@ -26,6 +26,24 @@ func NewManagerFromSnapshot(snapshot Snapshot) (*Manager, error) {
 	if snapshot.ID == "" || snapshot.IssuedAt <= 0 {
 		return nil, errors.New("config snapshot is incomplete")
 	}
+	if snapshot.AckTimeout <= 0 {
+		snapshot.AckTimeout = DefaultAckTimeout
+	}
+	if snapshot.ListenerProbeInterval <= 0 {
+		snapshot.ListenerProbeInterval = DefaultListenerProbeInterval
+	}
+	if snapshot.ListenerProbeDuration <= 0 {
+		snapshot.ListenerProbeDuration = DefaultListenerProbeDuration
+	}
+	if snapshot.ListenerProbeReset <= 0 {
+		snapshot.ListenerProbeReset = DefaultListenerProbeReset
+	}
+	if snapshot.ListenerLossThreshold < 0 || snapshot.ListenerLossThreshold > 100 {
+		snapshot.ListenerLossThreshold = DefaultListenerLossThreshold
+	}
+	if snapshot.ListenerIdleTimeout <= 0 {
+		snapshot.ListenerIdleTimeout = DefaultListenerIdleTimeout
+	}
 	return &Manager{snapshot: cloneSnapshot(snapshot), subscribers: make(map[chan Snapshot]struct{})}, nil
 }
 
@@ -43,13 +61,19 @@ func (m *Manager) Current() Snapshot {
 }
 
 type Update struct {
-	HeartbeatInterval    *time.Duration
-	HeartbeatTimeout     *time.Duration
-	MessageTTL           *time.Duration
-	MaxSpeechDepth       *int32
-	MaxRepeatExpansion   *int32
-	DisplayPosition      *string
-	DisplayDurationRatio *float64
+	HeartbeatInterval     *time.Duration
+	HeartbeatTimeout      *time.Duration
+	MessageTTL            *time.Duration
+	AckTimeout            *time.Duration
+	MaxSpeechDepth        *int32
+	MaxRepeatExpansion    *int32
+	DisplayPosition       *string
+	DisplayDurationRatio  *float64
+	ListenerProbeInterval *time.Duration
+	ListenerProbeDuration *time.Duration
+	ListenerProbeReset    *time.Duration
+	ListenerLossThreshold *int32
+	ListenerIdleTimeout   *time.Duration
 }
 
 func (m *Manager) Update(update Update, now time.Time) (Snapshot, error) {
@@ -76,6 +100,13 @@ func (m *Manager) Update(update Update, now time.Time) (Snapshot, error) {
 		}
 		next.MessageTTL = *update.MessageTTL
 	}
+	if update.AckTimeout != nil {
+		if *update.AckTimeout <= 0 || *update.AckTimeout > MaxAckTimeout {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("ack timeout must be between 1 second and 7 days")
+		}
+		next.AckTimeout = *update.AckTimeout
+	}
 	if update.MaxSpeechDepth != nil {
 		if *update.MaxSpeechDepth < 1 || *update.MaxSpeechDepth > 64 {
 			m.mu.Unlock()
@@ -98,11 +129,46 @@ func (m *Manager) Update(update Update, now time.Time) (Snapshot, error) {
 		next.DisplayPosition = *update.DisplayPosition
 	}
 	if update.DisplayDurationRatio != nil {
-		if *update.DisplayDurationRatio < 0 || *update.DisplayDurationRatio > 60 {
+		if *update.DisplayDurationRatio < 0 || *update.DisplayDurationRatio > 120 {
 			m.mu.Unlock()
-			return Snapshot{}, errors.New("display duration ratio must be between 0 and 60")
+			return Snapshot{}, errors.New("display duration ratio must be between 0 and 120")
 		}
 		next.DisplayDurationRatio = *update.DisplayDurationRatio
+	}
+	if update.ListenerProbeInterval != nil {
+		if *update.ListenerProbeInterval < time.Second || *update.ListenerProbeInterval > time.Hour {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("listener probe interval must be between 1 second and 1 hour")
+		}
+		next.ListenerProbeInterval = *update.ListenerProbeInterval
+	}
+	if update.ListenerProbeDuration != nil {
+		if *update.ListenerProbeDuration < time.Hour || *update.ListenerProbeDuration > 7*24*time.Hour {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("listener probe duration must be between 1 hour and 7 days")
+		}
+		next.ListenerProbeDuration = *update.ListenerProbeDuration
+	}
+	if update.ListenerProbeReset != nil {
+		if *update.ListenerProbeReset < 24*time.Hour || *update.ListenerProbeReset > 365*24*time.Hour {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("listener probe reset must be between 1 day and 365 days")
+		}
+		next.ListenerProbeReset = *update.ListenerProbeReset
+	}
+	if update.ListenerLossThreshold != nil {
+		if *update.ListenerLossThreshold < 0 || *update.ListenerLossThreshold > 100 {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("listener loss threshold must be between 0 and 100")
+		}
+		next.ListenerLossThreshold = *update.ListenerLossThreshold
+	}
+	if update.ListenerIdleTimeout != nil {
+		if *update.ListenerIdleTimeout < time.Second || *update.ListenerIdleTimeout > time.Hour {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("listener idle timeout must be between 1 second and 1 hour")
+		}
+		next.ListenerIdleTimeout = *update.ListenerIdleTimeout
 	}
 	id, err := NewConfigID(now)
 	if err != nil {

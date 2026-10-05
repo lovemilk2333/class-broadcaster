@@ -3,32 +3,35 @@ package session
 import (
 	"net"
 	"testing"
+	"time"
 
 	"lovemilk-class-broadcaster/server/internal/protocol"
 )
 
-func TestHubSendsToRegisteredConnection(t *testing.T) {
-	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
+func TestSuspendClientSendsDisconnectBeforeClosingSession(t *testing.T) {
 	hub := NewHub()
-	unregister := hub.Register("client", left)
-	defer unregister()
-	done := make(chan error, 1)
+	serverConn, clientConn := net.Pipe()
+	hub.Register("client", serverConn)
+	done := make(chan struct{})
 	go func() {
-		_, err := protocol.ReadPacket(right)
-		done <- err
+		hub.SuspendClient("client")
+		close(done)
 	}()
-	if err := hub.Send("client", protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.Pong, 1, 0, nil)); err != nil {
-		t.Fatal(err)
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	packet, err := protocol.ReadPacket(clientConn)
+	if err != nil {
+		t.Fatalf("read disconnect packet: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	if packet.Type != protocol.ClientDisconnect {
+		t.Fatalf("packet type=0x%04x, want 0x%04x", packet.Type, protocol.ClientDisconnect)
 	}
-}
-
-func TestHubSendOfflineFails(t *testing.T) {
-	if err := NewHub().Send("missing", protocol.Packet{}); err == nil {
-		t.Fatal("expected offline error")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("suspend did not close the connection")
 	}
+	if hub.Online("client") {
+		t.Fatal("suspended client remains online")
+	}
+	_ = clientConn.Close()
 }

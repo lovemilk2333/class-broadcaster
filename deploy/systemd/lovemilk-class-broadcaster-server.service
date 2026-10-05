@@ -1,0 +1,20 @@
+[Unit]
+Description=lovemilk class broadcaster server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/lovemilk-class-broadcaster
+ExecStart=%h/.local/share/lovemilk-class-broadcaster/bin/lovemilk-class-broadcaster-server --identity-dir=%h/.local/share/lovemilk-class-broadcaster/data
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/lovemilk-class-broadcaster
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

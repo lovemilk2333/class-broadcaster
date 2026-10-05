@@ -29,3 +29,15 @@ func TestQueuePriorityAndFIFO(t *testing.T) {
 		t.Fatal("empty queue returned a message")
 	}
 }
+
+func TestValidateSpeechLimitsExpansionAndDepth(t *testing.T) {
+	if err := ValidateSpeech([]SpeechNode{{Type: "repeat", Count: 2, Children: []SpeechNode{{Type: "text", Value: "hi"}}}}, 2, 4); err != nil {
+		t.Fatalf("valid speech rejected: %v", err)
+	}
+	if err := ValidateSpeech([]SpeechNode{{Type: "repeat", Count: 3, Children: []SpeechNode{{Type: "text"}}}}, 2, 2); err == nil {
+		t.Fatal("expansion limit was not enforced")
+	}
+	if err := ValidateSpeech([]SpeechNode{{Type: "repeat", Count: 1, Children: []SpeechNode{{Type: "repeat", Count: 1, Children: []SpeechNode{{Type: "text"}}}}}}, 1, 4); err == nil {
+		t.Fatal("depth limit was not enforced")
+	}
+}

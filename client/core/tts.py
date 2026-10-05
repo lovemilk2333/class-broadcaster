@@ -87,38 +87,108 @@ class Engine(Protocol):
     def speak(self, text: str, stop: threading.Event) -> None: ...
 
 
+def _looks_chinese_voice(name: str, language: str = "") -> bool:
+    lowered = f"{name} {language}".lower()
+    markers = (
+        "zh-cn",
+        "zh_cn",
+        "zh-hans",
+        "chinese",
+        "huihui",
+        "yaoyao",
+        "kangkang",
+        "lili",
+        "xiaoxiao",
+        "xiaoyi",
+        "yunxi",
+        "yunyang",
+        "0x804",
+        "0804",
+        "1004",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 class SAPIEngine:
+    """Windows SAPI5 TTS.
+
+    Prefer pywin32 COM when present; otherwise drive SAPI via PowerShell so the
+    embedded runtime still works without a separate pywin32 install.
+    """
+
     name = "sapi5-zh"
 
     @staticmethod
     def _select_chinese_voice(voice: Any) -> Any:
-        for index in range(voice.GetVoices().Count):
-            token = voice.GetVoices().Item(index)
+        voices = voice.GetVoices()
+        for index in range(voices.Count):
+            token = voices.Item(index)
             try:
-                languages = token.GetAttribute("Language").split(";")
-                if any(int(language, 16) in (0x0804, 0x1004) for language in languages):
+                languages = str(token.GetAttribute("Language") or "").split(";")
+                if any(int(language, 16) in (0x0804, 0x1004) for language in languages if language):
                     return token
-            except (ValueError, TypeError):
-                continue
+            except (ValueError, TypeError, AttributeError):
+                pass
+            try:
+                desc = str(token.GetDescription() or "")
+            except Exception:
+                desc = ""
+            if _looks_chinese_voice(desc):
+                return token
+        # Fall back to the system default voice rather than failing hard when a
+        # Chinese pack is missing; classrooms still get an audible cue.
+        try:
+            if voices.Count > 0:
+                return voices.Item(0)
+        except Exception:
+            return None
         return None
 
-    def available(self) -> bool:
-        if platform.system() != "Windows":
-            return False
+    def _com_available(self) -> bool:
         try:
             import win32com.client  # type: ignore[import-not-found]
         except ImportError:
             return False
-        voice = win32com.client.Dispatch("SAPI.SpVoice")
-        return self._select_chinese_voice(voice) is not None
+        try:
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            return self._select_chinese_voice(voice) is not None
+        except Exception as exc:
+            LOGGER.warning("SAPI COM probe failed error={}", exc)
+            return False
+
+    def _powershell_available(self) -> bool:
+        if platform.system() != "Windows":
+            return False
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            return False
+        # SpVoice exists on every supported Windows install; skip a slow probe.
+        return True
+
+    def available(self) -> bool:
+        if platform.system() != "Windows":
+            return False
+        if self._com_available():
+            return True
+        return self._powershell_available()
 
     def speak(self, text: str, stop: threading.Event) -> None:
+        if platform.system() != "Windows":
+            raise RuntimeError("SAPI is only available on Windows")
+        if stop.is_set():
+            return
+        if self._com_available():
+            self._speak_com(text, stop)
+            return
+        self._speak_powershell(text, stop)
+
+    def _speak_com(self, text: str, stop: threading.Event) -> None:
         import win32com.client  # type: ignore[import-not-found]
 
         voice = win32com.client.Dispatch("SAPI.SpVoice")
         token = self._select_chinese_voice(voice)
         if token is None:
-            raise RuntimeError("SAPI zh-CN voice is unavailable")
+            raise RuntimeError("SAPI voice is unavailable")
         voice.Voice = token
         # SVSFlagsAsync lets the worker stop an ongoing utterance promptly.
         voice.Speak(text, 1)
@@ -127,6 +197,46 @@ class SAPIEngine:
             if getattr(status, "RunningState", 1) == 1:
                 return
         voice.Speak("", 2)
+
+    def _speak_powershell(self, text: str, stop: threading.Event) -> None:
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            raise RuntimeError("PowerShell is unavailable for SAPI playback")
+        # Escape for a single-quoted PowerShell string.
+        safe = text.replace("'", "''")
+        script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$preferred = $s.GetInstalledVoices() | Where-Object { "
+            "$_.VoiceInfo.Culture.Name -like 'zh*' -or $_.VoiceInfo.Name -match "
+            "'Chinese|Huihui|Yaoyao|Kangkang|Lili|Xiaoxiao|Yunxi|Yunyang' }; "
+            "if ($preferred) { $s.SelectVoice($preferred[0].VoiceInfo.Name) }; "
+            f"$s.Speak('{safe}')"
+        )
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        process = subprocess.Popen(
+            [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        try:
+            while process.poll() is None:
+                if stop.wait(0.05):
+                    process.terminate()
+                    break
+            if process.returncode not in (0, None) and not stop.is_set():
+                err = b""
+                if process.stderr is not None:
+                    err = process.stderr.read() or b""
+                detail = err.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(detail or "SAPI PowerShell playback failed")
+        finally:
+            if process.poll() is None:
+                process.kill()
 
 
 class PiperEngine:

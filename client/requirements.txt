@@ -1,6 +1,11 @@
-# Deprecated compatibility file. Use `uv sync` in this directory instead.
+# Windows embeddable runtime dependencies. Keep in sync with pyproject.toml.
 argon2-cffi>=23.1,<24
 cryptography>=43,<45
+loguru>=0.7.3,<0.8
 pydantic>=2.7,<3
 pymongo>=4.6,<4.10
-PySide6>=6.5,<6.7
+PySide6-Essentials>=6.6,<6.7
+# Preferred path for SAPI5 TTS on the Windows embeddable runtime (PowerShell fallback remains).
+# No environment marker: this file is only used for Windows wheel installs from Linux.
+pywin32>=306,<309
+zstandard>=0.22,<0.23

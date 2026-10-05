@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import io
 import struct
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel
 
 MAGIC = b"MKCB"
 HEADER_SIZE = 16
-MAX_PAYLOAD_SIZE = 1 << 20
+MAX_PAYLOAD_SIZE = 256 << 20
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR = 0
 
@@ -77,10 +77,43 @@ def decode_from(data: bytes) -> tuple[Packet, int]:
     )
 
 
+def _read_exact(stream: Union[io.BufferedIOBase, object], size: int) -> bytes:
+    """Read exactly ``size`` bytes.
+
+    ``ssl.SSLSocket.read(n)`` (and some OS sockets) may return fewer than ``n``
+    bytes without meaning EOF. A single short ``read`` must not be treated as a
+    closed connection — that broke session frames and multi-MiB update chunks.
+
+    ``socket.timeout`` / ``BlockingIOError`` propagate to the caller so the
+    connection loop can keep waiting for the next frame.
+    """
+    if size <= 0:
+        return b""
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        # Timeouts and would-block must not be swallowed as empty reads.
+        chunk = stream.read(remaining)  # type: ignore[attr-defined]
+        if chunk is None:
+            # Non-blocking socket with no data yet.
+            continue
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise TypeError("stream.read must return bytes")
+        if len(chunk) == 0:
+            # True EOF / peer closed before the full frame arrived.
+            got = size - remaining
+            if got == 0 and size == HEADER_SIZE:
+                raise EOFError("incomplete packet header")
+            raise EOFError("incomplete packet payload" if got > 0 or size != HEADER_SIZE else "incomplete packet header")
+        chunks.append(bytes(chunk))
+        remaining -= len(chunk)
+    if len(chunks) == 1:
+        return chunks[0]
+    return b"".join(chunks)
+
+
 def read_packet(stream: io.BufferedIOBase) -> Packet:
-    header = stream.read(HEADER_SIZE)
-    if len(header) != HEADER_SIZE:
-        raise EOFError("incomplete packet header")
+    header = _read_exact(stream, HEADER_SIZE)
     if header[:4] != MAGIC:
         raise PacketError("invalid MKCB magic")
     packet_type, length, sequence, flags = struct.unpack(">H I H H", header[6:16])
@@ -88,7 +121,6 @@ def read_packet(stream: io.BufferedIOBase) -> Packet:
         raise PacketError("invalid packet length")
     if length > HEADER_SIZE + MAX_PAYLOAD_SIZE:
         raise PacketError("packet payload exceeds limit")
-    payload = stream.read(length - HEADER_SIZE)
-    if len(payload) != length - HEADER_SIZE:
-        raise EOFError("incomplete packet payload")
+    payload_size = length - HEADER_SIZE
+    payload = _read_exact(stream, payload_size) if payload_size else b""
     return Packet(header[4], header[5], packet_type, sequence, flags, payload)

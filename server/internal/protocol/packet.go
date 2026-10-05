@@ -11,24 +11,43 @@ import (
 )
 
 const (
-	Magic                  = "MKCB"
-	HeaderSize             = 16
-	MaxPayloadSize         = 1 << 20
-	ProtocolMajor          = 1
-	ProtocolMinor          = 0
-	DiscoveryReq    uint16 = 0x0001
-	DiscoveryResp   uint16 = 0x0002
-	ConnectReq      uint16 = 0x0101
-	ConnectResp     uint16 = 0x0102
-	ConfigUpdate    uint16 = 0x0103
-	Ping            uint16 = 0x0201
-	Pong            uint16 = 0x0202
-	ServerShutdown  uint16 = 0x0203
-	Message         uint16 = 0x1001
-	MessageAck      uint16 = 0x1002
-	MessageWithdraw uint16 = 0x1003
-	Error           uint16 = 0x7f00
+	Magic      = "MKCB"
+	HeaderSize = 16
+	// MaxPayloadSize bounds TLS/control packet payloads (messages, handshakes, updates).
+	// Keep well under typical low-end device RAM; client update packages are ~100MB compressed.
+	MaxPayloadSize = 128 << 20
+	// MaxDiscoveryDatagram is the UDP read buffer for discovery only.
+	// Discovery packets are tiny; never allocate MaxPayloadSize for UDP.
+	MaxDiscoveryDatagram = 64 << 10
+	ProtocolMajor        = 1
+	ProtocolMinor        = 0
+	DiscoveryReq     uint16 = 0x0001
+	DiscoveryResp    uint16 = 0x0002
+	ConnectReq       uint16 = 0x0101
+	ConnectResp      uint16 = 0x0102
+	ConfigUpdate     uint16 = 0x0103
+	Ping             uint16 = 0x0201
+	Pong             uint16 = 0x0202
+	ServerShutdown   uint16 = 0x0203
+	ClientDisconnect uint16 = 0x0205
+	ClientLog          uint16 = 0x0206
+	UpdateAvailable    uint16 = 0x0207
+	UpdateDownloadReq  uint16 = 0x0208 // dedicated TLS session: request package by token
+	UpdateDownloadResp uint16 = 0x0209 // chunked package bytes (or error)
+	// ClientSessionEnd is a client→server goodbye before closing the TLS session.
+	// Payload reason: user_exit | update | admin (optional detail).
+	ClientSessionEnd uint16 = 0x020A
+	ListenerPing     uint16 = 0x0204
+	Message          uint16 = 0x1001
+	MessageAck       uint16 = 0x1002
+	MessageWithdraw  uint16 = 0x1003
+	Error            uint16 = 0x7f00
 )
+
+// Update download chunk size keeps memory bounded on low-RAM hosts.
+// Keep well under a single TLS application record cascade so slow clients can
+// assemble frames without multi-second stalls (BSON overhead is a few hundred bytes).
+const UpdateDownloadChunkSize = 256 << 10 // 256 KiB
 
 var (
 	ErrInvalidMagic    = errors.New("invalid MKCB magic")

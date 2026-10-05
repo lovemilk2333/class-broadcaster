@@ -49,3 +49,18 @@ func TestBuildResponseRefreshesSnapshot(t *testing.T) {
 		t.Fatal("matching config should include its connection snapshot without marking it updated")
 	}
 }
+
+func TestReconnectAllowedUsesServerModeAndManualOverride(t *testing.T) {
+	if !ReconnectAllowed("pull", true, false) {
+		t.Fatal("pull mode should accept a periodic reconnect probe")
+	}
+	if ReconnectAllowed("listen", true, false) {
+		t.Fatal("listen mode should decline an automatic reconnect probe")
+	}
+	if !ReconnectAllowed("listen", true, true) {
+		t.Fatal("manual connection should override listen-mode probe policy")
+	}
+	if !ReconnectAllowed("listen", false, false) {
+		t.Fatal("ordinary initial connections should remain allowed")
+	}
+}

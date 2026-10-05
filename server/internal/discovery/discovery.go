@@ -110,7 +110,9 @@ func signingBytes(payload []byte) []byte {
 }
 
 func (r Responder) Serve(ctx context.Context, conn *net.UDPConn) error {
-	buf := make([]byte, protocol.HeaderSize+protocol.MaxPayloadSize)
+	// Discovery is UDP-only and tiny. Allocating MaxPayloadSize (hundreds of MiB)
+	// here OOMs low-RAM devices (e.g. 256–512 MiB class boards) on startup.
+	buf := make([]byte, protocol.MaxDiscoveryDatagram)
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			return err

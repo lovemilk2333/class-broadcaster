@@ -1,6 +1,6 @@
 # lovemilk class broadcaster
 
-> [!WARN]
+> [!WARNING]
 > This software has made by AI. I only give the basic design for the general structure.
 
 ## 版本号

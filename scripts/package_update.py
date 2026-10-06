@@ -3,6 +3,13 @@
 
 The zstd stream contains a tar archive directly. Top-level entries are
 ``metadata.json`` and the files to install (no nested zip).
+
+Full packages include every file under ``--input-dir``. Incremental packages
+(``--base-dir`` / ``--base-zip``) include only new or changed files relative to
+the previous install tree or green ``.zip``; the Go updater already overlays
+file-by-file, so a sparse files-v1 package is enough. When the new tree deletes
+paths that existed in the base, packaging falls back to a full package (overlay
+cannot remove files).
 """
 
 from __future__ import annotations
@@ -11,10 +18,23 @@ import argparse
 import hashlib
 import io
 import json
+import shutil
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def file_manifest(files: list[Path], root: Path) -> bytes:
@@ -88,6 +108,85 @@ def normalize_output_path(path: Path) -> Path:
     return path.with_name(stem + ".tar.zst")
 
 
+def list_files(root: Path) -> list[Path]:
+    return sorted(
+        (path for path in root.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+
+
+def file_index(root: Path) -> dict[str, Path]:
+    return {path.relative_to(root).as_posix(): path for path in list_files(root)}
+
+
+def extract_base_zip(zip_path: Path, destination: Path) -> Path:
+    """Extract a green install zip; return the install-tree root inside it."""
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(destination)
+    children = [path for path in destination.iterdir() if path.is_dir()]
+    # Green zip uses a single top-level folder (lovemilk-class-broadcaster/).
+    if len(children) == 1 and not any(path.is_file() for path in destination.iterdir()):
+        return children[0]
+    return destination
+
+
+def select_incremental_files(
+    input_dir: Path,
+    base_dir: Path,
+) -> tuple[list[Path], bool, dict[str, int]]:
+    """Return (files_to_pack, is_incremental, stats).
+
+    Falls back to a full file list when the new tree deletes base paths (overlay
+    cannot remove files) or when every file changed.
+    """
+    new_index = file_index(input_dir)
+    base_index = file_index(base_dir)
+    deleted = sorted(set(base_index) - set(new_index))
+    if deleted:
+        return (
+            list_files(input_dir),
+            False,
+            {
+                "new_files": len(new_index),
+                "base_files": len(base_index),
+                "changed": len(new_index),
+                "deleted": len(deleted),
+                "reason": "base_has_deleted_paths",
+            },
+        )
+
+    changed: list[Path] = []
+    unchanged = 0
+    for relative, path in new_index.items():
+        base_path = base_index.get(relative)
+        if base_path is None:
+            changed.append(path)
+            continue
+        try:
+            if file_sha256(path) != file_sha256(base_path):
+                changed.append(path)
+            else:
+                unchanged += 1
+        except OSError:
+            changed.append(path)
+
+    stats = {
+        "new_files": len(new_index),
+        "base_files": len(base_index),
+        "changed": len(changed),
+        "unchanged": unchanged,
+        "deleted": 0,
+    }
+    if not changed:
+        # Nothing differs — still emit a tiny package with metadata only? Prefer
+        # packing zero payload files is invalid for verify; fall back to full.
+        return list_files(input_dir), False, {**stats, "reason": "no_changes"}
+    if len(changed) >= len(new_index):
+        return list_files(input_dir), False, {**stats, "reason": "all_files_changed"}
+    return changed, True, stats
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a files-v1 .tar.zst update package")
     parser.add_argument(
@@ -111,9 +210,28 @@ def main() -> None:
     parser.add_argument("--client-version", default="")
     parser.add_argument("--updater-version", default="")
     parser.add_argument("--zstd", default="zstd")
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=None,
+        help="previous install tree; pack only new/changed files (incremental)",
+    )
+    parser.add_argument(
+        "--base-zip",
+        type=Path,
+        default=None,
+        help="previous green install .zip used as the incremental base",
+    )
+    parser.add_argument(
+        "--force-full",
+        action="store_true",
+        help="ignore --base-dir/--base-zip and always pack the full tree",
+    )
     args = parser.parse_args()
     if not args.input_dir.is_dir():
         raise SystemExit(f"input directory does not exist: {args.input_dir}")
+    if args.base_dir and args.base_zip:
+        raise SystemExit("pass only one of --base-dir or --base-zip")
     output = normalize_output_path(args.output)
     raw_components: list[str] = []
     if args.components:
@@ -123,12 +241,41 @@ def main() -> None:
     if not raw_components:
         raise SystemExit("pass --component and/or --components")
     components = normalize_components(raw_components)
+
     with tempfile.TemporaryDirectory(prefix="mkcb-package-") as temp:
         temp_path = Path(temp)
-        files = sorted(
-            (path for path in args.input_dir.rglob("*") if path.is_file()),
-            key=lambda path: path.relative_to(args.input_dir).as_posix(),
-        )
+        base_dir: Path | None = None
+        cleanup_base = False
+        if not args.force_full:
+            if args.base_dir is not None:
+                if not args.base_dir.is_dir():
+                    raise SystemExit(f"base directory does not exist: {args.base_dir}")
+                base_dir = args.base_dir
+            elif args.base_zip is not None:
+                if not args.base_zip.is_file():
+                    raise SystemExit(f"base zip does not exist: {args.base_zip}")
+                extract_root = temp_path / "base-zip"
+                base_dir = extract_base_zip(args.base_zip, extract_root)
+                cleanup_base = True
+
+        incremental = False
+        stats: dict[str, object] = {}
+        if base_dir is not None:
+            files, incremental, stats = select_incremental_files(args.input_dir, base_dir)
+            mode = "incremental" if incremental else "full"
+            print(
+                f"package base comparison mode={mode} "
+                f"new={stats.get('new_files')} base={stats.get('base_files')} "
+                f"changed={stats.get('changed')} deleted={stats.get('deleted')} "
+                f"reason={stats.get('reason', '')}".rstrip(),
+                flush=True,
+            )
+        else:
+            files = list_files(args.input_dir)
+
+        if not files:
+            raise SystemExit(f"input directory is empty: {args.input_dir}")
+
         digest = hashlib.sha256(file_manifest(files, args.input_dir)).hexdigest()
         primary = components[0] if len(components) == 1 else "bundle"
         metadata: dict[str, object] = {
@@ -141,6 +288,10 @@ def main() -> None:
             "client_version": args.client_version if "client" in components else "",
             "updater_version": args.updater_version if "updater" in components else "",
         }
+        if incremental:
+            metadata["incremental"] = True
+            metadata["file_count"] = len(files)
+
         tar_path = temp_path / "package.tar"
         write_tar(tar_path, metadata, files, args.input_dir)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +301,13 @@ def main() -> None:
                 raise SystemExit(result.returncode)
         meta_path = Path(str(output)[: -len(".tar.zst")] + ".metadata.json")
         meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-        print(f"wrote {output} sha256={digest} components={components}", flush=True)
+        kind = "incremental" if incremental else "full"
+        print(
+            f"wrote {output} kind={kind} files={len(files)} sha256={digest} components={components}",
+            flush=True,
+        )
+        if cleanup_base:
+            shutil.rmtree(temp_path / "base-zip", ignore_errors=True)
 
 
 if __name__ == "__main__":

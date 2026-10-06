@@ -76,7 +76,7 @@ STOPPED -> DISCOVERING -> CANDIDATE -> TRUST_CONFIRM -> CONNECTING -> ONLINE
 
 使用 `loguru` 写本地滚动日志，并在业务连接建立后通过 `ClientLog` 包将结构化本地日志批量上传；网络暂时不可用时最多在内存排队 1000 条，优先保留较新的日志。上传记录包含时间、级别、logger 名称和日志消息，不包含消息正文、公钥私钥或 TTS 音频。服务端单独按客户端 ID 保留最近 500 条，最多保存 1000 个客户端的日志，并由前端客户端日志 Dialog 读取；新日志通过按客户端节流的 SSE 通知该 Dialog 刷新。这些内容与服务端进程日志完全分开。
 
-管理员从前端断开客户端时，服务端发送 `ClientDisconnect`。客户端不持久化管理员断开状态，并依据握手响应中的服务端 `connection_mode` 处理：监听模式停止自动重连，客户端设置页仍可手动连接；从模式每 5 分钟发送一次带 `reconnect_probe` 的握手，由服务端返回 `connect_allowed` 决定是否建立会话。手动连接使用 `manual_connect` 标记，成功后重置退避状态；失败后继续原有探测间隔，不改变监听/从模式策略。启动时仍会连接上次选中的服务端。
+管理员从前端断开客户端时，服务端发送 `ClientDisconnect`。客户端不持久化管理员断开状态，并依据握手响应中的服务端 `connection_mode` 处理：监听模式停止自动重连，客户端设置页仍可手动连接；从模式每 5 分钟发送一次带 `reconnect_probe` 的握手，由服务端返回 `connect_allowed` 决定是否建立会话。手动连接使用 `manual_connect` 标记，成功后重置退避状态；失败后继续原有探测间隔，不改变监听/从模式策略。启动时仍会连接上次选中的服务端。服务端在已知客户端主动结束会话（`user_exit` / `update` / `admin`）且 TLS hub 已离线时，**不**再对该客户端累计监听探测丢包，避免人为退出/更新重启污染 `probe_loss_percent`。
 
 开发者面板「Exit client」或更新退出前，客户端对每条在线 TLS 会话发送 `ClientSessionEnd`（`reason=user_exit` 或 `update`），服务端据此显示 **人为终止** / **更新重启中**；未上报而掉线的客户端在 30 秒未重连后显示 **意外终止**。
 
@@ -88,7 +88,7 @@ STOPPED -> DISCOVERING -> CANDIDATE -> TRUST_CONFIRM -> CONNECTING -> ONLINE
 
 ## 更新包
 
-更新包仅为 zstd level 3 压缩的 `.tar.zst`（内部直接 tar，顶层含 `metadata.json` 与安装文件，无嵌套 zip）。metadata 含 `components`（如 `["updater","client"]`）、兼容字段 `component`（单组件名或 `bundle`）、`version`、`client_version`、`updater_version`、`platform`、`payload_format`、`sha256`。服务端存 `data/updates/<manifest-sha256>.tar.zst`；`UPDATE_AVAILABLE` 只推 meta + 鉴权 `download_token`（Ed25519，绑定 sha256/client_id/expires）+ 可选 `force`，**不**走管理 HTTP `39003`。客户端对推送方 `host:tcp_port` **新建** TLS 连接，`ConnectReq.update_download=true` 后发送 `UpdateDownloadReq`（`0x0208`），服务端以 `UpdateDownloadResp`（`0x0209`）分块下发包体；短会话不加入 hub。管理端「强制更新」会推送给全部已批准客户端，离线客户端上线后按 seq 自动补推。组合包安装顺序：先 updater 再 client。独立 Go updater 写 `data/updater.log`（与 `client.log` 分离）。`Makefile` 同时生成：绿色安装 `bin/*-windows-amd64.zip`（首次部署解压即用，管理端发布不接受）与更新包 `bin/*-windows-amd64.tar.zst`。
+更新包仅为 zstd level 3 压缩的 `.tar.zst`（内部直接 tar，顶层含 `metadata.json` 与安装文件，无嵌套 zip）。metadata 含 `components`（如 `["updater","client"]`）、兼容字段 `component`（单组件名或 `bundle`）、`version`、`client_version`、`updater_version`、`platform`、`payload_format`、`sha256`；增量包可含 `incremental=true`。相对上一构建缓存或上一绿色 `.zip` 可只打变更/新增文件（删除路径时回退全量）。服务端存 `data/updates/<manifest-sha256>.tar.zst`；`UPDATE_AVAILABLE` 只推 meta + 鉴权 `download_token`（Ed25519，绑定 sha256/client_id/expires）+ 可选 `force`，**不**走管理 HTTP `39003`，也**不**写入握手响应。客户端对推送方 `host:tcp_port` **新建** TLS 连接，`ConnectReq.update_download=true` 后发送 `UpdateDownloadReq`（`0x0208`），服务端以 `UpdateDownloadResp`（`0x0209`）分块下发包体；短会话不加入 hub。下载进度日志按 `>0%` / `25%` / `50%` / `75%` / `>99%` 里程碑输出 `%=… speed=…MiB/s`。发布时在线目标即时推送；发布时离线或 `last_seq` 落后的目标客户端，在下次成功建立业务会话后自动补推最高适用 seq（强制与非强制同一规则）。已上报 `client_version` ≥ 包内 `client_version` 的客户端不再补推，避免强制更新同包反复重启。客户端在 `data/applied_updates.json` 持久化已应用 sha256，跨重启拒绝同一包。组合包安装顺序：先 updater 再 client。独立 Go updater 写 `data/updater.log`（与 `client.log` 分离）。`Makefile` 同时生成：绿色安装 `bin/*-windows-amd64.zip`（始终全量，首次部署解压即用，管理端发布不接受）与更新包 `bin/*-windows-amd64.tar.zst`（默认可增量）。
 
 客户端发行目录由 CPython 3.11 Windows x64 embeddable runtime、PySide6 Essentials Windows wheels、优化字节码以及 Go GUI 启动器组成。启动器设置安装根目录后运行 `runtime/pythonw.exe -O -m client`；状态始终写入安装根目录的 `data/`。独立 Go updater 写 `data/updater.log`；成功覆盖后以 detached 方式重启同目录启动器，避免更新后进程不在线、管理端版本/在线状态不同步。Linux 使用 `scripts/build_embedded_client.py` 直接组装 Windows 包，不运行 PyInstaller；构建器拒绝混入 Linux `.so` 并检查入口、updater、Python runtime 均为 x86-64 PE。
 

@@ -32,10 +32,11 @@ NATIVE_SERVER_ARCH := $(shell u=$$(uname -m); if [ "$$u" = x86_64 ] || [ "$$u" =
 #   make server / make client     → compile + package releasable artifacts under bin/
 #   make build-server / build-client → same (explicit “compile and package” alias)
 #   make package-server / package-client → bin/ archives only (expects build/ already present)
+#   make client-full / package-client-full → client packages + an extra full .tar.zst
 #   make package / make all       → server + client release packages
 .PHONY: all package \
-	server client build-server build-client \
-	package-server package-client \
+	server client client-full build-server build-client \
+	package-server package-client package-client-full \
 	build-server-amd64 build-server-arm64 \
 	server-amd64 server-arm64 \
 	frontend-embed frontend-embed-force sync-version \
@@ -61,12 +62,16 @@ build-server: build-server-amd64 build-server-arm64
 # `client` and `build-client` are equivalent (compile + package).
 client: build-client
 
+# Same as client, but also emit a full files-v1 .tar.zst beside the incremental one.
+client-full:
+	@$(MAKE) --no-print-directory build-client CLIENT_FULL=1
+
 build-client: updater
 	# Windows wheels/site-packages are cached under build/cache/windows-site-packages
 	# (keyed by client/requirements.txt). Pass --refresh-site-packages to force reinstall.
 	# Launcher/updater PE icons come from assets/icons/mkcb.ico via windows-icon.
 	BUILD_DATE='$(BUILD_DATE)' python3 $(ROOT)/scripts/build_embedded_client.py --root $(ROOT) --output $(BUILD_DIR)/client/lovemilk-class-broadcaster --build-date '$(BUILD_DATE)'
-	@$(MAKE) --no-print-directory package-client
+	@$(MAKE) --no-print-directory package-client CLIENT_FULL='$(CLIENT_FULL)' PACKAGE_FULL='$(PACKAGE_FULL)'
 
 # -----------------------------------------------------------------------------
 # Version stamp
@@ -163,9 +168,13 @@ windows-icon:
 	@command -v rsrc >/dev/null || go install github.com/akavel/rsrc@latest
 	python3 $(ROOT)/scripts/embed_windows_icon.py --root $(ROOT) --icon $(ICON_ICO) --target all
 
+# Updater identity is stamped with the client version (same release train).
+UPDATER_LDFLAGS = -s -w -H=windowsgui -X 'main.Version=$(CLIENT_VERSION)' -X 'main.BuildDate=$(BUILD_DATE)'
+
 updater: windows-icon
 	@mkdir -p $(BUILD_DIR)/updater
-	cd $(ROOT) && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w -H=windowsgui' -o $(BUILD_DIR)/updater/lovemilk-class-broadcaster-updater.exe ./updater
+	@echo "updater version=$(CLIENT_VERSION) build_date=$(BUILD_DATE)"
+	cd $(ROOT) && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$(UPDATER_LDFLAGS)" -o $(BUILD_DIR)/updater/lovemilk-class-broadcaster-updater.exe ./updater
 
 # -----------------------------------------------------------------------------
 # Package only → bin/ (expects build/ already present)
@@ -182,16 +191,58 @@ package-server:
 	bash $(ROOT)/scripts/package-server-zip.sh amd64 $(SERVER_VERSION)
 	bash $(ROOT)/scripts/package-server-zip.sh arm64 $(SERVER_VERSION)
 
+# Previous install tree used as the incremental .tar.zst base (refreshed after each package-client).
+CLIENT_PACKAGE_BASE_DIR := $(BUILD_DIR)/cache/client-package-base
+# Set PACKAGE_FULL=1 to force the primary .tar.zst to be full (no incremental).
+PACKAGE_FULL ?= 0
+# Set CLIENT_FULL=1 (or use make client-full / package-client-full) to also emit a
+# separate full files-v1 archive beside the (possibly incremental) primary package.
+CLIENT_FULL ?= 0
+
+package-client-full:
+	@$(MAKE) --no-print-directory package-client CLIENT_FULL=1
+
 package-client:
 	@test -f $(BUILD_DIR)/client/lovemilk-class-broadcaster/lovemilk-class-broadcaster.exe || (echo "Missing Windows client bundle. Run 'make build-client' or 'make client' first." >&2; exit 2)
 	@test -f $(BUILD_DIR)/updater/lovemilk-class-broadcaster-updater.exe || (echo "Missing updater PE. Run 'make updater' or 'make client' first." >&2; exit 2)
 	@mkdir -p $(BIN_DIR)
-	# Green install zip: plain install tree for first-time deploy (NOT accepted by updates/publish).
+	# Green install zip: always full install tree (first-time deploy; NOT accepted by updates/publish).
 	python3 $(ROOT)/scripts/package_client_zip.py --input-dir $(BUILD_DIR)/client/lovemilk-class-broadcaster --output $(BIN_DIR)/lovemilk-class-broadcaster-$(CLIENT_VERSION)-windows-amd64.zip
 	# Update packages are only .tar.zst (server publish rejects .zip).
+	# Prefer incremental against build/cache/client-package-base or the previous green zip.
 	# Full client install tree includes the updater PE → components ["updater","client"].
-	python3 $(ROOT)/scripts/package_update.py --components updater client --version $(CLIENT_VERSION) --platform windows-amd64 --input-dir $(BUILD_DIR)/client/lovemilk-class-broadcaster --output $(BIN_DIR)/lovemilk-class-broadcaster-$(CLIENT_VERSION)-windows-amd64.tar.zst --client-version $(CLIENT_VERSION) --updater-version $(CLIENT_VERSION) --zstd '$(ZSTD)'
+	# CLIENT_FULL=1 → also write *-windows-amd64-full.tar.zst (always --force-full).
+	@set -euo pipefail; \
+	OUT='$(BIN_DIR)/lovemilk-class-broadcaster-$(CLIENT_VERSION)-windows-amd64.tar.zst'; \
+	FULL_OUT='$(BIN_DIR)/lovemilk-class-broadcaster-$(CLIENT_VERSION)-windows-amd64-full.tar.zst'; \
+	INPUT='$(BUILD_DIR)/client/lovemilk-class-broadcaster'; \
+	BASE_ARGS=(); \
+	if [ '$(PACKAGE_FULL)' = '1' ]; then \
+		echo 'PACKAGE_FULL=1 → primary .tar.zst is full'; \
+		BASE_ARGS+=(--force-full); \
+	elif [ -d '$(CLIENT_PACKAGE_BASE_DIR)' ] && [ -n "$$(find '$(CLIENT_PACKAGE_BASE_DIR)' -type f 2>/dev/null | head -n 1)" ]; then \
+		echo "incremental base: $(CLIENT_PACKAGE_BASE_DIR)"; \
+		BASE_ARGS+=(--base-dir '$(CLIENT_PACKAGE_BASE_DIR)'); \
+	else \
+		PREV_ZIP=$$(ls -1t '$(BIN_DIR)'/lovemilk-class-broadcaster-*-windows-amd64.zip 2>/dev/null | grep -v '$(CLIENT_VERSION)' | head -n 1 || true); \
+		if [ -n "$$PREV_ZIP" ]; then \
+			echo "incremental base zip: $$PREV_ZIP"; \
+			BASE_ARGS+=(--base-zip "$$PREV_ZIP"); \
+		else \
+			echo 'no previous base → primary .tar.zst is full'; \
+		fi; \
+	fi; \
+	python3 '$(ROOT)/scripts/package_update.py' --components updater client --version '$(CLIENT_VERSION)' --platform windows-amd64 --input-dir "$$INPUT" --output "$$OUT" --client-version '$(CLIENT_VERSION)' --updater-version '$(CLIENT_VERSION)' --zstd '$(ZSTD)' "$${BASE_ARGS[@]}"; \
+	if [ '$(CLIENT_FULL)' = '1' ]; then \
+		echo "CLIENT_FULL=1 → also writing $$FULL_OUT"; \
+		python3 '$(ROOT)/scripts/package_update.py' --components updater client --version '$(CLIENT_VERSION)' --platform windows-amd64 --input-dir "$$INPUT" --output "$$FULL_OUT" --client-version '$(CLIENT_VERSION)' --updater-version '$(CLIENT_VERSION)' --zstd '$(ZSTD)' --force-full; \
+	fi
 	python3 $(ROOT)/scripts/package_update.py --component updater --version $(CLIENT_VERSION) --platform windows-amd64 --input-dir $(BUILD_DIR)/updater --output $(BIN_DIR)/lovemilk-class-broadcaster-updater-$(CLIENT_VERSION)-windows-amd64.tar.zst --client-version $(CLIENT_VERSION) --updater-version $(CLIENT_VERSION) --zstd '$(ZSTD)'
+	# Refresh incremental base cache from the just-built install tree for the next package-client.
+	@rm -rf '$(CLIENT_PACKAGE_BASE_DIR)'
+	@mkdir -p '$(CLIENT_PACKAGE_BASE_DIR)'
+	@cp -a '$(BUILD_DIR)/client/lovemilk-class-broadcaster/.' '$(CLIENT_PACKAGE_BASE_DIR)/'
+	@echo "updated incremental base cache → $(CLIENT_PACKAGE_BASE_DIR)"
 
 # -----------------------------------------------------------------------------
 # Install / clean

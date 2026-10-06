@@ -107,6 +107,8 @@ from .core.updater import (
     verify_metadata,
     verify_package_files,
 )
+from .core.updater_log_upload import queue_pending_updater_logs
+from .core.applied_updates import is_update_applied, load_applied_digests, mark_update_applied
 
 
 LOGGER = logger.bind(name="mkcb.client")
@@ -114,30 +116,34 @@ CLIENT_LOG_UPLOAD = 0x0206
 _CLIENT_LOG_QUEUE: queue.Queue = queue.Queue(maxsize=1000)
 
 
-def _queue_client_log(message: Any) -> None:
-    record = message.record
-    log_message = record["message"]
-    entry = ""
-    for _ in range(2):
-        entry = json.dumps(
-            {
-                "time": record["time"].isoformat(),
-                "level": record["level"].name,
-                "msg": log_message,
-                "logger": record["name"],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        if len(entry.encode("utf-8")) <= 16 * 1024:
-            break
-        log_message = log_message[: max(100, len(log_message) // 2)]
-    if len(entry.encode("utf-8")) > 16 * 1024:
-        entry = json.dumps(
-            {"time": record["time"].isoformat(), "level": record["level"].name,
-             "msg": log_message[:3000], "logger": record["name"]},
-            ensure_ascii=False, separators=(",", ":"),
-        )
+def _parse_version_parts(value: str) -> list[object]:
+    parts: list[object] = []
+    for part in str(value or "").strip().split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(part)
+    return parts
+
+
+def _client_version_behind(reported: str, target: str) -> bool:
+    """True when reported is strictly older than target (numeric dotted versions)."""
+    reported = str(reported or "").strip()
+    target = str(target or "").strip()
+    if not reported or not target or reported == target:
+        return False
+    left = _parse_version_parts(reported)
+    right = _parse_version_parts(target)
+    width = max(len(left), len(right))
+    left.extend([0] * (width - len(left)))
+    right.extend([0] * (width - len(right)))
+    return left < right
+
+
+def _enqueue_client_log_entry(entry: str) -> None:
+    """Push a pre-serialized ClientLog JSON string onto the upload queue."""
+    if not entry:
+        return
     if _CLIENT_LOG_QUEUE.full():
         try:
             _CLIENT_LOG_QUEUE.get_nowait()
@@ -147,6 +153,42 @@ def _queue_client_log(message: Any) -> None:
         _CLIENT_LOG_QUEUE.put_nowait(entry)
     except queue.Full:
         pass
+
+
+def _queue_client_log(message: Any) -> None:
+    record = message.record
+    log_message = record["message"]
+    extra = record.get("extra") or {}
+    logger_name = str(extra.get("name") or record.get("name") or "mkcb.client")
+    entry = ""
+    for _ in range(2):
+        entry = json.dumps(
+            {
+                "time": record["time"].isoformat(),
+                "level": record["level"].name,
+                "msg": log_message,
+                "logger": logger_name,
+                "source": "client",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(entry.encode("utf-8")) <= 16 * 1024:
+            break
+        log_message = log_message[: max(100, len(log_message) // 2)]
+    if len(entry.encode("utf-8")) > 16 * 1024:
+        entry = json.dumps(
+            {
+                "time": record["time"].isoformat(),
+                "level": record["level"].name,
+                "msg": log_message[:3000],
+                "logger": logger_name,
+                "source": "client",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    _enqueue_client_log_entry(entry)
 
 
 def _data_dir() -> Path:
@@ -226,19 +268,77 @@ def _application_icon() -> QIcon:
     return QIcon(pixmap)
 
 
+def _make_client_log_file_sink(log_path: Path):
+    """Return a loguru sink that appends one JSON object per line.
+
+    Must be a sink (not ``format=``): loguru still runs ``str.format_map`` on
+    format templates, so a JSON body with ``{...}`` would raise KeyError.
+    """
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    max_bytes = 2 * 1024 * 1024
+    retain = 3
+
+    def _rotate_if_needed() -> None:
+        try:
+            if not path.is_file() or path.stat().st_size < max_bytes:
+                return
+        except OSError:
+            return
+        # Simple size rotation: client.log -> client.log.1 ... keep ``retain`` files.
+        try:
+            oldest = path.with_name(f"{path.name}.{retain}")
+            if oldest.exists():
+                oldest.unlink(missing_ok=True)
+            for index in range(retain - 1, 0, -1):
+                src = path.with_name(f"{path.name}.{index}")
+                dst = path.with_name(f"{path.name}.{index + 1}")
+                if src.exists():
+                    src.replace(dst)
+            path.replace(path.with_name(f"{path.name}.1"))
+        except OSError:
+            pass
+
+    def sink(message: Any) -> None:
+        record = message.record
+        extra = record.get("extra") or {}
+        logger_name = str(extra.get("name") or record.get("name") or "mkcb.client")
+        payload = {
+            "time": record["time"].isoformat(),
+            "level": record["level"].name,
+            "msg": record["message"],
+            "logger": logger_name,
+            "source": "client",
+        }
+        try:
+            line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        except (TypeError, ValueError):
+            payload["msg"] = str(record.get("message", ""))[:4000]
+            payload["logger"] = "mkcb.client"
+            line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        _rotate_if_needed()
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(line)
+        except OSError:
+            pass
+
+    return sink
+
+
 def _configure_logging(data_dir: Path) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     logger.remove()
     logger.configure(extra={"name": "mkcb.client"})
+    # Disk + upload share the same JSON schema the server already requires (json.Valid).
+    # Use a sink callable — do NOT put JSON in format= (braces break str.format_map).
     logger.add(
-        data_dir / "client.log",
-        rotation="2 MB",
-        retention=3,
-        encoding="utf-8",
+        _make_client_log_file_sink(data_dir / "client.log"),
         level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss,SSS} {level} {extra[name]}: {message}",
         backtrace=False,
         diagnose=False,
+        enqueue=True,
+        catch=True,
     )
     logger.add(_queue_client_log, level="DEBUG", enqueue=True, catch=True)
 
@@ -860,6 +960,8 @@ class UpdateApplyWorker(QThread):
                 source,
             )
             should_quit = self._verify_and_launch(package_path, metadata)
+            # Persist before quit so a force catch-up after restart cannot re-apply.
+            mark_update_applied(self.data_dir, digest)
             self.finished_ok.emit(digest)
             if should_quit:
                 self.quit_for_update.emit()
@@ -1043,12 +1145,14 @@ class ConnectionWorker(QThread):
         private_key: Ed25519PrivateKey,
         certificate: bytes,
         state_store: StateStore,
+        data_dir: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self.endpoint = endpoint
         self.private_key = private_key
         self.certificate = certificate
         self.state_store = state_store
+        self.data_dir = Path(data_dir) if data_dir is not None else _data_dir()
         self.keep_running = True
         self._manual_reconnect = threading.Event()
         self.admin_disconnected = False
@@ -1222,6 +1326,14 @@ class ConnectionWorker(QThread):
                     self.endpoint["tcp_port"],
                     snapshot.config_id,
                 )
+                # Detached updater wrote data/updater.log while we were offline —
+                # queue those lines for ClientLog upload with logger=mkcb.updater.
+                try:
+                    queued = queue_pending_updater_logs(self.data_dir, _enqueue_client_log_entry)
+                    if queued:
+                        LOGGER.info("queued {} updater log line(s) for server upload", queued)
+                except Exception as exc:
+                    LOGGER.debug("updater log upload queue skipped error={}", exc)
                 last_ping = time.monotonic()
                 last_pong = last_ping
                 while self.keep_running:
@@ -1737,8 +1849,9 @@ class ClientWindow(QMainWindow):
         self._server_display_defaults: dict[tuple[str, int], tuple[str, float]] = {}
         self._server_config_ids: dict[tuple[str, int], str] = {}
         # Deduplicate concurrent UPDATE_AVAILABLE pushes for the same package digest.
+        # Seed from disk so a force catch-up after restart cannot re-apply the same sha.
         self._update_apply_in_progress: set[str] = set()
-        self._update_apply_done: set[str] = set()
+        self._update_apply_done: set[str] = set(load_applied_digests(self.data_dir))
         self._update_workers: list[UpdateApplyWorker] = []
         self._server_status_text: dict[tuple[str, int], str] = {}
         self.current_error = ""
@@ -2281,7 +2394,7 @@ class ClientWindow(QMainWindow):
             return
         if existing is not None:
             self.connection_workers.pop(endpoint_key, None)
-        worker = ConnectionWorker(endpoint, self.private_key, self.certificate, self.state_store)
+        worker = ConnectionWorker(endpoint, self.private_key, self.certificate, self.state_store, self.data_dir)
         LOGGER.info("starting connection {}:{}", endpoint.get("host"), endpoint.get("tcp_port"))
         self.connection_workers[endpoint_key] = worker
         self._connection_attempts.add(endpoint_key)
@@ -2312,18 +2425,36 @@ class ClientWindow(QMainWindow):
             LOGGER.error("update available ignored: payload is not a dict type={}", type(update).__name__)
             return
         digest = str(update.get("sha256") or "").lower()
+        target_client_version = str(update.get("client_version") or "").strip()
         LOGGER.info(
-            "update available received on UI thread sha256={} version={} force={} has_token={}",
+            "update available received on UI thread sha256={} version={} client_version={} force={} has_token={}",
             digest,
             update.get("version"),
+            target_client_version or "-",
             bool(update.get("force")),
             bool(update.get("download_token")),
         )
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             LOGGER.error("update available ignored: invalid sha256={!r}", update.get("sha256"))
             return
-        if digest in self._update_apply_done or digest in self._update_apply_in_progress:
-            LOGGER.info("update apply skipped (already handled) sha256={}", digest)
+        # Ignore packages we already applied (persisted across restart) or whose
+        # client_version we already meet/exceed — stops force catch-up restart loops.
+        if is_update_applied(self.data_dir, digest) or digest in self._update_apply_done:
+            LOGGER.info("update apply skipped (already applied) sha256={}", digest)
+            self._update_apply_done.add(digest)
+            return
+        if target_client_version and not _client_version_behind(VERSION_STR, target_client_version):
+            LOGGER.info(
+                "update apply skipped (client_version={} meets/exceeds target={}) sha256={}",
+                VERSION_STR,
+                target_client_version,
+                digest,
+            )
+            mark_update_applied(self.data_dir, digest)
+            self._update_apply_done.add(digest)
+            return
+        if digest in self._update_apply_in_progress:
+            LOGGER.info("update apply skipped (already in progress) sha256={}", digest)
             return
         # Ensure peer routing fields even if the signal payload lost them.
         if not update.get("source_host") or not update.get("source_tcp_port"):
@@ -2353,6 +2484,7 @@ class ClientWindow(QMainWindow):
 
         def _on_ok(sha: str, worker_ref: UpdateApplyWorker = apply_worker) -> None:
             self._update_apply_done.add(sha)
+            mark_update_applied(self.data_dir, sha)
             self._update_apply_in_progress.discard(sha)
             try:
                 self._update_workers.remove(worker_ref)

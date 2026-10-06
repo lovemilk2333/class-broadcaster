@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -320,6 +321,166 @@ func TestPublishUpdateAllowsLocalPackageMetadataWithoutSignature(t *testing.T) {
 	}
 	if input.Component != "client" || len(input.Components) != 1 || input.Components[0] != "client" {
 		t.Fatalf("normalized components=%#v primary=%q", input.Components, input.Component)
+	}
+}
+
+func TestCompareClientVersions(t *testing.T) {
+	if compareClientVersions("0.1.0", "0.1.1") >= 0 {
+		t.Fatal("0.1.0 should be behind 0.1.1")
+	}
+	if compareClientVersions("0.1.1", "0.1.1") != 0 {
+		t.Fatal("equal versions")
+	}
+	if compareClientVersions("0.2.0", "0.1.9") <= 0 {
+		t.Fatal("0.2.0 should be ahead of 0.1.9")
+	}
+	if clientVersionBehind("0.1.1", "0.1.1") {
+		t.Fatal("same version is not behind")
+	}
+	if !clientVersionBehind("0.1.0", "0.1.1") {
+		t.Fatal("0.1.0 is behind 0.1.1")
+	}
+}
+
+func TestUpdateTargetsClientAndCatchUpSelection(t *testing.T) {
+	clientA := strings.Repeat("a", 64)
+	clientB := strings.Repeat("b", 64)
+	forceAll := updateRecord{Force: true, Targets: nil}
+	if !updateTargetsClient(forceAll, clientA) {
+		t.Fatal("force update should target every client")
+	}
+	targeted := updateRecord{Targets: []string{clientA}}
+	if !updateTargetsClient(targeted, clientA) {
+		t.Fatal("explicit target should match")
+	}
+	if updateTargetsClient(targeted, clientB) {
+		t.Fatal("non-target client must not match")
+	}
+
+	dir := t.TempDir()
+	prefs, err := openServerPreferences(filepath.Join(dir, "prefs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prefs.db.Close()
+	prefs.updatesDir = filepath.Join(dir, "updates")
+	_ = os.MkdirAll(prefs.updatesDir, 0o700)
+
+	older := updateRecord{
+		UpdateID: "upd-1", Component: "client", Components: []string{"client"},
+		Version: "0.1.0", Platform: "windows-amd64", ClientVersion: "0.1.0",
+		SHA256: strings.Repeat("1", 64), Status: "published", Seq: 1, CreatedAt: 1,
+		Targets: []string{clientA, clientB},
+	}
+	newer := updateRecord{
+		UpdateID: "upd-2", Component: "client", Components: []string{"client"},
+		Version: "0.1.1", Platform: "windows-amd64", ClientVersion: "0.1.1",
+		SHA256: strings.Repeat("2", 64), Status: "published", Seq: 2, CreatedAt: 2,
+		Targets: []string{clientA},
+	}
+	metaOlder, _ := json.Marshal(publishUpdateRequest{
+		Component: "client", Components: []string{"client"}, Version: "0.1.0",
+		ClientVersion: "0.1.0", Platform: "windows-amd64", PayloadFormat: "files-v1",
+		SHA256: older.SHA256, Targets: older.Targets,
+	})
+	metaNewer, _ := json.Marshal(publishUpdateRequest{
+		Component: "client", Components: []string{"client"}, Version: "0.1.1",
+		ClientVersion: "0.1.1", Platform: "windows-amd64", PayloadFormat: "files-v1",
+		SHA256: newer.SHA256, Targets: newer.Targets,
+	})
+	if err := prefs.saveUpdateFile(older, metaOlder, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := prefs.saveUpdateFile(newer, metaNewer, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client A never offered → should get highest applicable seq (2).
+	got, ok := prefs.latestPublishedUpdateForClient(clientA, "0.0.9")
+	if !ok || got.Seq != 2 {
+		t.Fatalf("client A catch-up seq=%d ok=%v want 2", got.Seq, ok)
+	}
+	// Already on 0.1.1 → must not re-offer seq 2 or roll back to seq 1 (0.1.0),
+	// even when last_seq was never marked (offline during original fan-out).
+	if _, ok := prefs.latestPublishedUpdateForClient(clientA, "0.1.1"); ok {
+		t.Fatal("client A already on 0.1.1 must not catch up to older/same package")
+	}
+	// Client B was only in seq 1 targets; after marking seq 1 offered, no catch-up.
+	if err := prefs.markClientUpdateOffered(clientB, older); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := prefs.latestPublishedUpdateForClient(clientB, "0.1.0"); ok {
+		t.Fatal("client B should not catch up to A-only seq 2")
+	}
+	// Client B never offered → catch up to seq 1.
+	prefs2, err := openServerPreferences(filepath.Join(dir, "prefs2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prefs2.db.Close()
+	prefs2.updatesDir = prefs.updatesDir
+	if err := prefs2.saveUpdateFile(older, metaOlder, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := prefs2.saveUpdateFile(newer, metaNewer, ""); err != nil {
+		t.Fatal(err)
+	}
+	gotB, ok := prefs2.latestPublishedUpdateForClient(clientB, "0.0.9")
+	if !ok || gotB.Seq != 1 {
+		t.Fatalf("client B catch-up seq=%d ok=%v want 1", gotB.Seq, ok)
+	}
+
+	// Force same-version must not restart-loop after last_seq is marked / version met.
+	forceSame := updateRecord{
+		UpdateID: "upd-force", Component: "client", Components: []string{"client"},
+		Version: "0.1.1", Platform: "windows-amd64", ClientVersion: "0.1.1",
+		SHA256: strings.Repeat("f", 64), Status: "published", Seq: 3, CreatedAt: 3,
+		Force: true, Targets: nil,
+	}
+	metaForce, _ := json.Marshal(publishUpdateRequest{
+		Component: "client", Components: []string{"client"}, Version: "0.1.1",
+		ClientVersion: "0.1.1", Platform: "windows-amd64", PayloadFormat: "files-v1",
+		SHA256: forceSame.SHA256, Force: true,
+	})
+	if err := prefs.saveUpdateFile(forceSame, metaForce, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := prefs.markClientUpdateOffered(clientA, forceSame); err != nil {
+		t.Fatal(err)
+	}
+	if pending, ok := prefs.latestPublishedUpdateForClient(clientA, "0.1.1"); ok {
+		t.Fatalf("force same-version must not catch up after offer seq=%d", pending.Seq)
+	}
+	// Client B still on 0.1.0 with last_seq=1 → force catch-up to seq 3.
+	gotForce, ok := prefs.latestPublishedUpdateForClient(clientB, "0.1.0")
+	if !ok || gotForce.Seq != 3 {
+		t.Fatalf("force catch-up for behind client seq=%d ok=%v want 3", gotForce.Seq, ok)
+	}
+}
+
+func TestNextDownloadProgressMilestone(t *testing.T) {
+	logged := map[float64]bool{}
+	if _, ok := nextDownloadProgressMilestone(0, logged); ok {
+		t.Fatal("0% should not emit")
+	}
+	mark, ok := nextDownloadProgressMilestone(0.1, logged)
+	if !ok || mark != 0 {
+		t.Fatalf("expected >0%% mark got %v ok=%v", mark, ok)
+	}
+	logged[0] = true
+	for _, want := range []float64{25, 50, 75} {
+		mark, ok = nextDownloadProgressMilestone(want, logged)
+		if !ok || mark != want {
+			t.Fatalf("expected %v got %v ok=%v", want, mark, ok)
+		}
+		logged[mark] = true
+	}
+	if _, ok = nextDownloadProgressMilestone(99, logged); ok {
+		t.Fatal("exactly 99% should not emit >99 mark")
+	}
+	mark, ok = nextDownloadProgressMilestone(99.1, logged)
+	if !ok || mark != 99 {
+		t.Fatalf("expected >99%% mark got %v ok=%v", mark, ok)
 	}
 }
 

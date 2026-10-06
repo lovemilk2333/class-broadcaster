@@ -297,6 +297,7 @@ type updateRecord struct {
 	Status         string   `json:"status"`                  // verifying | published | failed | withdrawn
 	StatusDetail   string   `json:"status_detail,omitempty"` // human-readable failure reason
 	Force          bool     `json:"force,omitempty"`         // mandatory for all approved clients
+	Targets        []string `json:"target_client_ids,omitempty"` // from publish metadata; empty + force ⇒ all approved
 	CreatedAt      int64    `json:"created_at"`
 }
 
@@ -456,6 +457,12 @@ func (p *serverPreferences) getUpdateRecord(updateID string) (updateRecord, []by
 				if item.Component == "" {
 					item.Component = primary
 				}
+			}
+			if len(meta.Targets) > 0 {
+				item.Targets = append([]string(nil), meta.Targets...)
+			}
+			if meta.Force {
+				item.Force = true
 			}
 		}
 	}
@@ -635,6 +642,12 @@ func (p *serverPreferences) updateRecords() ([]updateRecord, error) {
 					if item.Component == "" {
 						item.Component = primary
 					}
+				}
+				if len(meta.Targets) > 0 {
+					item.Targets = append([]string(nil), meta.Targets...)
+				}
+				if meta.Force {
+					item.Force = true
 				}
 			}
 		}
@@ -1119,7 +1132,7 @@ func main() {
 		}
 	}()
 	go dispatchMessages(ctx, messageStore, sessionHub, configManager, deviceRegistry)
-	go probeClientListeners(ctx, serverIdentity, deviceRegistry, configManager)
+	go probeClientListeners(ctx, serverIdentity, deviceRegistry, configManager, sessionHub)
 	go runRetentionCleanup(ctx, messageStore, deviceRegistry)
 	go runSessionEndWatcher(ctx, deviceRegistry, sessionHub)
 
@@ -1244,7 +1257,10 @@ func runRetentionCleanup(ctx context.Context, store *broadcast.Store, registry *
 
 // probeClientListeners 每分钟探测声明监听能力的客户端，统计 12 小时试用窗口内的丢包和延迟。
 // 消息主链路仍保留 TLS 长连接，只有试用窗口结束且丢包率不高于 10% 才标记为监听模式。
-func probeClientListeners(ctx context.Context, serverIdentity identity.Identity, registry *session.Registry, configManager *config.Manager) {
+// When the server already knows the client left intentionally (user_exit / update / admin)
+// and the TLS hub session is gone, skip the probe so intentional downtime does not inflate
+// probe_loss_percent.
+func probeClientListeners(ctx context.Context, serverIdentity identity.Identity, registry *session.Registry, configManager *config.Manager, hub *session.Hub) {
 	interval := config.DefaultListenerProbeInterval
 	if configManager != nil && configManager.Current().ListenerProbeInterval > 0 {
 		interval = configManager.Current().ListenerProbeInterval
@@ -1261,6 +1277,9 @@ func probeClientListeners(ctx context.Context, serverIdentity identity.Identity,
 					continue
 				}
 				if device.RequestedMode == "auto" && device.ProbeUntil == 0 {
+					continue
+				}
+				if hub != nil && !hub.Online(device.ClientID) && session.IsIntentionalSessionEnd(device.SessionEndReason) {
 					continue
 				}
 				latency, received := probeClientListener(serverIdentity, device.ClientID, device.ListenerAddress, device.ListenerPort, registry.ListenerPolicy().IdleTimeout)
@@ -1467,46 +1486,44 @@ func serveTLSConnection(ctx context.Context, raw net.Conn, serverIdentity identi
 		}
 		managementEvents.publish("devices")
 	}()
-	// Catch up mandatory (force) updates until the client reports the target client_version
-	// (or, when the package has no client_version, until the offered seq is reached).
+	// Catch up any published update this client still needs: seq behind (including
+	// offline at publish time). Force and non-force share the same rule — never
+	// re-offer a package whose client_version the client already meets/exceeds.
+	// Offer the highest applicable seq so one reconnect can jump to the latest.
 	if preferences != nil {
-		if forceRecord, ok := preferences.latestPublishedForceUpdate(); ok {
-			lastSeq := preferences.clientUpdateSeq(clientID)
-			needCatchUp := forceRecord.Seq > lastSeq
-			if forceRecord.ClientVersion != "" && request.ClientVersion != "" && request.ClientVersion != forceRecord.ClientVersion {
-				// Client still runs an older build after a failed/skipped apply — re-offer.
-				needCatchUp = true
+		if pending, ok := preferences.latestPublishedUpdateForClient(clientID, request.ClientVersion); ok {
+			priorSeq := preferences.clientUpdateSeq(clientID)
+			metaInput := publishUpdateRequest{
+				Component: pending.Component, Components: append([]string(nil), pending.Components...),
+				Version: pending.Version, ClientVersion: pending.ClientVersion, UpdaterVersion: pending.UpdaterVersion,
+				Platform: pending.Platform, PayloadFormat: "files-v1", SHA256: pending.SHA256, Force: pending.Force,
+				Targets: append([]string(nil), pending.Targets...),
 			}
-			if needCatchUp {
-				metaInput := publishUpdateRequest{
-					Component: forceRecord.Component, Components: append([]string(nil), forceRecord.Components...),
-					Version: forceRecord.Version, ClientVersion: forceRecord.ClientVersion, UpdaterVersion: forceRecord.UpdaterVersion,
-					Platform: forceRecord.Platform, PayloadFormat: "files-v1", SHA256: forceRecord.SHA256, Force: true,
+			if len(metaInput.Components) == 0 {
+				if comps, primary, normErr := normalizeUpdateComponents(nil, pending.Component); normErr == nil {
+					metaInput.Components = comps
+					metaInput.Component = primary
 				}
-				if len(metaInput.Components) == 0 {
-					if comps, primary, normErr := normalizeUpdateComponents(nil, forceRecord.Component); normErr == nil {
-						metaInput.Components = comps
-						metaInput.Component = primary
+			}
+			notify, buildErr := buildUpdateAvailablePayload(metaInput, pending, clientID, nil, serverIdentity.PrivateKey, preferences)
+			if buildErr == nil {
+				if payload, marshalErr := protocol.MarshalBSON(notify); marshalErr == nil {
+					if sendErr := hub.Send(clientID, protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.UpdateAvailable, 0, 0, payload)); sendErr == nil {
+						_ = preferences.markClientUpdateOffered(clientID, pending)
+						slog.Info("update catch-up sent",
+							"client_id", clientID,
+							"seq", pending.Seq,
+							"sha256", pending.SHA256,
+							"version", pending.Version,
+							"force", pending.Force,
+							"client_version", request.ClientVersion,
+							"target_client_version", pending.ClientVersion,
+							"prior_seq", priorSeq,
+						)
 					}
 				}
-				notify, buildErr := buildUpdateAvailablePayload(metaInput, forceRecord, clientID, nil, serverIdentity.PrivateKey, preferences)
-				if buildErr == nil {
-					if payload, marshalErr := protocol.MarshalBSON(notify); marshalErr == nil {
-						if sendErr := hub.Send(clientID, protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.UpdateAvailable, 0, 0, payload)); sendErr == nil {
-							_ = preferences.markClientUpdateOffered(clientID, forceRecord)
-							slog.Info("force update catch-up sent",
-								"client_id", clientID,
-								"seq", forceRecord.Seq,
-								"sha256", forceRecord.SHA256,
-								"version", forceRecord.Version,
-								"client_version", request.ClientVersion,
-								"target_client_version", forceRecord.ClientVersion,
-							)
-						}
-					}
-				} else {
-					slog.Warn("force update catch-up skipped", "client_id", clientID, "error", buildErr)
-				}
+			} else {
+				slog.Warn("update catch-up skipped", "client_id", clientID, "seq", pending.Seq, "error", buildErr)
 			}
 		}
 	}
@@ -1858,7 +1875,11 @@ type publishUpdateRequest struct {
 	SHA256         string   `json:"sha256"`
 	Targets        []string `json:"target_client_ids"`
 	// Force marks a mandatory update: every approved client must receive it
-	// (online fan-out + catch-up on connect until they reach this seq).
+	// (online fan-out + catch-up on connect while last_seq is behind this package).
+	// Catch-up never re-offers once the client reports client_version >= package
+	// client_version (avoids restart loops when force republishes the same version).
+	// Non-force updates also catch up on connect when the client's last_seq is behind
+	// (covers clients that were offline during the original fan-out).
 	Force      bool   `json:"force,omitempty"`
 	Signature  string `json:"signature,omitempty"`   // deprecated
 	ReleaseURL string `json:"release_url,omitempty"` // deprecated
@@ -2063,7 +2084,8 @@ func serveUpdateDownloadSession(
 	var offset int64
 	var chunks int
 	startedAt := time.Now()
-	lastProgressLog := startedAt
+	// Milestone progress: >0%, 25%, 50%, 75%, >99% (same cadence as the client).
+	loggedMilestones := map[float64]bool{}
 	slog.Info("update download streaming start",
 		"client_id", clientID,
 		"sha256", claims.SHA256,
@@ -2114,27 +2136,30 @@ func serveUpdateDownloadSession(
 			}
 			offset += int64(n)
 			chunks++
-			now := time.Now()
-			if chunks == 1 || offset == total || now.Sub(lastProgressLog) >= 5*time.Second {
-				elapsed := now.Sub(startedAt).Seconds()
-				rate := float64(0)
+			if total > 0 {
+				pct := 100.0 * float64(offset) / float64(total)
+				elapsed := time.Since(startedAt).Seconds()
+				speed := float64(0)
 				if elapsed > 0 {
-					rate = float64(offset) / elapsed / 1024.0
+					speed = float64(offset) / elapsed / (1024.0 * 1024.0)
 				}
-				pct := float64(0)
-				if total > 0 {
-					pct = 100.0 * float64(offset) / float64(total)
+				for {
+					mark, ok := nextDownloadProgressMilestone(pct, loggedMilestones)
+					if !ok {
+						break
+					}
+					loggedMilestones[mark] = true
+					// Only >0% / 25% / 50% / 75% / >99% — never per-chunk spam.
+					slog.Info("update download progress",
+						"client_id", clientID,
+						"sha256", claims.SHA256,
+						"milestone", mark,
+						"offset", offset,
+						"total_bytes", total,
+						"pct", pct,
+						"speed_mib_s", speed,
+					)
 				}
-				slog.Info("update download progress",
-					"client_id", clientID,
-					"sha256", claims.SHA256,
-					"offset", offset,
-					"total_bytes", total,
-					"pct", pct,
-					"rate_kib_s", rate,
-					"chunks", chunks,
-				)
-				lastProgressLog = now
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
@@ -2153,9 +2178,9 @@ func serveUpdateDownloadSession(
 				return
 			}
 			elapsed := time.Since(startedAt).Seconds()
-			rate := float64(0)
+			speed := float64(0)
 			if elapsed > 0 {
-				rate = float64(offset) / elapsed / 1024.0
+				speed = float64(offset) / elapsed / (1024.0 * 1024.0)
 			}
 			slog.Info("update download completed",
 				"client_id", clientID,
@@ -2163,7 +2188,8 @@ func serveUpdateDownloadSession(
 				"bytes", offset,
 				"chunks", chunks,
 				"elapsed_s", elapsed,
-				"rate_kib_s", rate,
+				"pct", 100.0,
+				"speed_mib_s", speed,
 				"client_ip", clientIP,
 			)
 			return
@@ -2174,6 +2200,31 @@ func serveUpdateDownloadSession(
 			return
 		}
 	}
+}
+
+// nextDownloadProgressMilestone returns the next percentage milestone for download logs.
+// Marks: >0% (key 0), 25, 50, 75, >99% (key 99). Each mark is emitted at most once.
+func nextDownloadProgressMilestone(pct float64, logged map[float64]bool) (float64, bool) {
+	for _, mark := range []float64{0, 25, 50, 75, 99} {
+		if logged[mark] {
+			continue
+		}
+		switch mark {
+		case 0:
+			if pct > 0 {
+				return mark, true
+			}
+		case 99:
+			if pct > 99 {
+				return mark, true
+			}
+		default:
+			if pct >= mark {
+				return mark, true
+			}
+		}
+	}
+	return 0, false
 }
 
 type updatePackageMetadata struct {
@@ -2686,6 +2737,152 @@ func (p *serverPreferences) latestPublishedForceUpdate() (updateRecord, bool) {
 	return best, found
 }
 
+// updateTargetsClient reports whether clientID is in the publish target set.
+// Force updates (or empty targets with Force) apply to every approved client.
+func updateTargetsClient(record updateRecord, clientID string) bool {
+	if record.Force {
+		return true
+	}
+	if len(record.Targets) == 0 {
+		// Legacy / incomplete metadata: treat as broadcast so offline catch-up still works.
+		return true
+	}
+	for _, target := range record.Targets {
+		normalized, err := session.NormalizeClientID(target)
+		if err != nil {
+			if strings.EqualFold(strings.TrimSpace(target), clientID) {
+				return true
+			}
+			continue
+		}
+		if normalized == clientID {
+			return true
+		}
+	}
+	return false
+}
+
+// compareClientVersions returns -1 / 0 / 1 for a < b / a == b / a > b.
+// Dot-separated numeric segments (non-numeric tails sort after the numeric prefix).
+func compareClientVersions(a, b string) int {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return 0
+	}
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		var ai, bi int
+		var aOk, bOk bool
+		if i < len(as) {
+			if v, err := strconv.Atoi(as[i]); err == nil {
+				ai, aOk = v, true
+			}
+		} else {
+			aOk = true
+		}
+		if i < len(bs) {
+			if v, err := strconv.Atoi(bs[i]); err == nil {
+				bi, bOk = v, true
+			}
+		} else {
+			bOk = true
+		}
+		if aOk && bOk {
+			if ai < bi {
+				return -1
+			}
+			if ai > bi {
+				return 1
+			}
+			continue
+		}
+		// Fall back to lexical for non-numeric segments.
+		avar, bvar := "", ""
+		if i < len(as) {
+			avar = as[i]
+		}
+		if i < len(bs) {
+			bvar = bs[i]
+		}
+		if avar < bvar {
+			return -1
+		}
+		if avar > bvar {
+			return 1
+		}
+	}
+	return 0
+}
+
+// clientVersionBehind reports whether reported is strictly older than target.
+func clientVersionBehind(reported, target string) bool {
+	reported = strings.TrimSpace(reported)
+	target = strings.TrimSpace(target)
+	if reported == "" || target == "" {
+		return false
+	}
+	return compareClientVersions(reported, target) < 0
+}
+
+// latestPublishedUpdateForClient returns the highest-seq published update that
+// this client still needs (seq behind the effective last applied/offered seq).
+// Force and non-force share the same catch-up rule: never re-offer a package
+// whose client_version the client already meets or exceeds (prevents force
+// restart loops when overlay did not change version.json / version stayed put).
+func (p *serverPreferences) latestPublishedUpdateForClient(clientID, reportedClientVersion string) (updateRecord, bool) {
+	if p == nil || p.db == nil || clientID == "" {
+		return updateRecord{}, false
+	}
+	items, err := p.updateRecords()
+	if err != nil {
+		return updateRecord{}, false
+	}
+	lastSeq := p.clientUpdateSeq(clientID)
+	// If the client already reports a published package's client_version (or newer),
+	// treat the highest such seq as applied so older packages cannot roll back and
+	// force packages cannot loop after a successful overlay that left the version
+	// string unchanged relative to a republished force of the same version.
+	if reportedClientVersion != "" {
+		for _, item := range items {
+			if item.Status != "published" || item.ClientVersion == "" || item.Seq == 0 {
+				continue
+			}
+			if compareClientVersions(reportedClientVersion, item.ClientVersion) >= 0 && item.Seq > lastSeq {
+				lastSeq = item.Seq
+			}
+		}
+	}
+	var best updateRecord
+	found := false
+	for _, item := range items {
+		if item.Status != "published" || item.Seq == 0 {
+			continue
+		}
+		if !updateTargetsClient(item, clientID) {
+			continue
+		}
+		// Already on this package version (or newer) → do not re-offer.
+		if item.ClientVersion != "" && reportedClientVersion != "" &&
+			compareClientVersions(reportedClientVersion, item.ClientVersion) >= 0 {
+			continue
+		}
+		if item.Seq <= lastSeq {
+			continue
+		}
+		if !found || item.Seq > best.Seq {
+			best = item
+			found = true
+		}
+	}
+	return best, found
+}
+
 // buildUpdateAvailablePayload builds a signed UPDATE_AVAILABLE for one client.
 func buildUpdateAvailablePayload(input publishUpdateRequest, record updateRecord, clientID string, packageBytes []byte, privateKey ed25519.PrivateKey, preferences *serverPreferences) (updateAvailablePayload, error) {
 	notify := updateAvailablePayload{
@@ -3041,7 +3238,8 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			packet := protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.UpdateAvailable, 0, 0, payload)
 			if sendErr := hub.Send(id, packet); sendErr != nil {
 				offline = append(offline, id)
-				// Do not mark offered while offline: force catch-up on connect uses last_seq < force.seq.
+				// Do not mark offered while offline: connect catch-up uses last_seq < update.seq
+				// for both force and non-force publishes.
 				continue
 			}
 			if preferences != nil {

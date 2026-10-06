@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -56,15 +55,17 @@ func main() {
 		logPath = filepath.Join(*installDir, "data", "updater.log")
 	}
 	setupUpdaterLog(logPath)
-	updaterLog("info", "updater started package=%s install_dir=%s pid=%d log=%s", *packagePath, *installDir, *pid, logPath)
+	updaterLog("info", "updater started identity=%s version=%s build_date=%s package=%s install_dir=%s pid=%d log=%s",
+		updaterIdentity, Version, BuildDate, *packagePath, *installDir, *pid, logPath)
 	if *pid > 0 {
 		updaterLog("info", "waiting for client process exit pid=%d", *pid)
 		if err := waitForProcess(*pid); err != nil {
 			fatal(err)
 		}
 		updaterLog("info", "client process exited pid=%d", *pid)
-		// Allow the Windows launcher PE and single-instance lock to settle after pythonw exits.
-		time.Sleep(1250 * time.Millisecond)
+		// Allow the Windows launcher PE, single-instance lock, and Qt/Python DLL
+		// unmaps to settle after pythonw exits (Access is denied on Qt6*.dll otherwise).
+		time.Sleep(2500 * time.Millisecond)
 	}
 	if err := applyPackage(*packagePath, *installDir); err != nil {
 		fatal(err)
@@ -93,15 +94,37 @@ func setupUpdaterLog(path string) {
 
 var updaterLogFile *os.File
 
+// updaterIdentity is the stable logger name uploaded to the server via ClientLog after restart.
+const updaterIdentity = "mkcb.updater"
+
 func updaterLog(level, format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
-	line := fmt.Sprintf("%s %s mkcb.updater: %s\n", time.Now().Format("2006-01-02 15:04:05.000"), strings.ToUpper(level), message)
+	// JSON lines so the restarted client can forward them as structured ClientLog entries
+	// with an explicit updater identity (distinct from mkcb.client).
+	payload, err := json.Marshal(map[string]any{
+		"time":   time.Now().Format(time.RFC3339Nano),
+		"level":  strings.ToUpper(level),
+		"logger": updaterIdentity,
+		"msg":    message,
+		"source": "updater",
+	})
+	line := string(payload) + "\n"
+	if err != nil {
+		line = fmt.Sprintf(
+			`{"time":%q,"level":%q,"logger":%q,"msg":%q,"source":"updater"}`+"\n",
+			time.Now().Format(time.RFC3339Nano),
+			strings.ToUpper(level),
+			updaterIdentity,
+			message,
+		)
+	}
 	if updaterLogFile != nil {
 		_, _ = updaterLogFile.WriteString(line)
 		_ = updaterLogFile.Sync()
 	}
-	// Always mirror to stderr so detached-process diagnostics remain visible when redirected.
-	_, _ = os.Stderr.WriteString(line)
+	// Human-readable mirror for detached-process stderr / local tailing.
+	human := fmt.Sprintf("%s %s %s: %s\n", time.Now().Format("2006-01-02 15:04:05.000"), strings.ToUpper(level), updaterIdentity, message)
+	_, _ = os.Stderr.WriteString(human)
 }
 
 func applyPackage(packagePath, installDir string) error {
@@ -213,21 +236,12 @@ func replaceFile(source, destination string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	// Write via a sibling temp file then rename for a best-effort atomic swap
-	// on the same volume (works for most PE replacements after the client exits).
-	temporary := destination + ".mkcb-new-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	if err := os.WriteFile(temporary, data, mode|0o600); err != nil {
-		return err
+	// Identical content → skip replace (avoids touching locked Qt/Python DLLs that
+	// did not change, which is the common Windows "Access is denied" case).
+	if existing, readErr := os.ReadFile(destination); readErr == nil && bytes.Equal(existing, data) {
+		return nil
 	}
-	if err := os.Rename(temporary, destination); err != nil {
-		// Windows may still hold a share lock; fall back to remove+rename.
-		_ = os.Remove(destination)
-		if err2 := os.Rename(temporary, destination); err2 != nil {
-			_ = os.Remove(temporary)
-			return fmt.Errorf("replace %s: %w", destination, err2)
-		}
-	}
-	return nil
+	return replaceFileWithRetry(destination, data, mode)
 }
 
 func validateMetadata(metadata updateMetadata) error {

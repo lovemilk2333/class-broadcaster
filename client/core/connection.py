@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from .protocol.bson import decode, encode
 from .protocol.packet import Packet, read_packet
 from .store import StateStore
+from .update_progress import format_speed_mib_s, next_progress_milestone
 from ..version import VERSION_STR
 
 
@@ -432,15 +433,15 @@ def download_update_package_tls(
     *,
     idle_warn_seconds: float = 5.0,
     idle_fail_seconds: float = 120.0,
-    progress_log_bytes: int = 1 << 20,
 ) -> None:
     """Open a short-lived TLS session and stream an update package to disk.
 
     Uses ConnectReq.update_download=true so the server does not register a hub session.
     Chunks arrive as UpdateDownloadResp BSON documents (offset/total_size/data/done).
 
-    Read deadline is short and polled so stalled transfers emit WARN every
-    ``idle_warn_seconds`` without data (default 5s) instead of hanging silently.
+    Progress logs fire **only** at percentage milestones (>0%, 25%, 50%, 75%, >99%)
+    with ``%=… speed=…MiB/s``. No per-chunk / per-MiB spam. Stalled transfers still
+    emit WARN every ``idle_warn_seconds`` without data (default 5s).
     """
     from pathlib import Path
 
@@ -462,7 +463,6 @@ def download_update_package_tls(
     temporary = dest.with_name(dest.name + ".partial")
     idle_warn = max(1.0, float(idle_warn_seconds))
     idle_fail = max(idle_warn, float(idle_fail_seconds))
-    progress_every = max(64 << 10, int(progress_log_bytes))
     # Full-packet read window: large enough for one UpdateDownloadResp (~256 KiB BSON).
     packet_read_timeout = max(float(timeout), 60.0)
 
@@ -489,8 +489,7 @@ def download_update_package_tls(
     started_at = time.monotonic()
     last_data_at = started_at
     last_idle_warn_at = started_at
-    last_progress_log_at = started_at
-    last_progress_bytes = 0
+    logged_milestones: set[float] = set()
     try:
         # Idle is detected with select() between complete packets. Socket timeout only
         # applies while reading one full frame so a mid-payload timeout cannot desync MKCB.
@@ -649,29 +648,25 @@ def download_update_package_tls(
                     chunks += 1
                     last_data_at = time.monotonic()
                     last_idle_warn_at = last_data_at
-                    # Progress: every progress_every bytes, or at least every idle_warn while moving.
-                    if (
-                        received - last_progress_bytes >= progress_every
-                        or (last_data_at - last_progress_log_at) >= idle_warn
-                        or chunks == 1
-                    ):
-                        elapsed = max(0.001, last_data_at - started_at)
-                        rate = received / elapsed
-                        pct = (100.0 * received / total_size) if total_size > 0 else -1.0
-                        LOGGER.info(
-                            "update download progress host={} port={} received={} total={} "
-                            "pct={:.1f} rate_kib_s={:.1f} chunks={} sha256={}",
-                            host,
-                            port,
-                            received,
-                            total_size if total_size >= 0 else "unknown",
-                            pct,
-                            rate / 1024.0,
-                            chunks,
-                            digest,
-                        )
-                        last_progress_bytes = received
-                        last_progress_log_at = last_data_at
+                    # Milestone progress: >0%, 25%, 50%, 75%, >99% with MiB/s speed.
+                    if total_size > 0:
+                        pct = 100.0 * received / total_size
+                        while True:
+                            mark = next_progress_milestone(pct, logged_milestones)
+                            if mark is None:
+                                break
+                            logged_milestones.add(mark)
+                            elapsed = max(0.001, last_data_at - started_at)
+                            LOGGER.info(
+                                "update download progress milestone={:.0f} %={:.1f} speed={} "
+                                "received={} total={} sha256={}",
+                                mark,
+                                pct,
+                                format_speed_mib_s(received / elapsed),
+                                received,
+                                total_size,
+                                digest,
+                            )
                 if bool(document.get("done")):
                     break
         if total_size >= 0 and received != total_size:
@@ -684,14 +679,15 @@ def download_update_package_tls(
         elapsed = max(0.001, time.monotonic() - started_at)
         LOGGER.info(
             "update package downloaded via TLS host={} port={} path={} bytes={} "
-            "chunks={} elapsed_s={:.2f} rate_kib_s={:.1f} sha256={}",
+            "chunks={} elapsed_s={:.2f} %={:.1f} speed={} sha256={}",
             host,
             port,
             dest,
             received,
             chunks,
             elapsed,
-            received / elapsed / 1024.0,
+            100.0 if total_size > 0 else -1.0,
+            format_speed_mib_s(received / elapsed),
             digest,
         )
     except Exception as exc:

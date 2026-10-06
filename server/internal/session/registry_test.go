@@ -168,6 +168,19 @@ func TestForcedListenRequiresAdvertisedListenerPort(t *testing.T) {
 	}
 }
 
+func TestIsIntentionalSessionEnd(t *testing.T) {
+	for _, reason := range []string{SessionEndUserExit, SessionEndUpdate, SessionEndAdmin} {
+		if !IsIntentionalSessionEnd(reason) {
+			t.Fatalf("%q should be intentional", reason)
+		}
+	}
+	for _, reason := range []string{SessionEndNone, SessionEndUnexpected, "reconnecting", "bogus"} {
+		if IsIntentionalSessionEnd(reason) {
+			t.Fatalf("%q must not be intentional", reason)
+		}
+	}
+}
+
 func TestSessionEndUserExitAndUnexpectedGrace(t *testing.T) {
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

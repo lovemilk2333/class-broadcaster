@@ -289,16 +289,20 @@ body { margin: 0; min-width: 320px; }
 .message-preview-button { display: block; width: 100%; max-width: 32rem; overflow: hidden; text-align: left; white-space: nowrap; text-overflow: ellipsis; }
 .message-preview-content { max-height: 60vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
 .api-skeleton { margin-bottom: 1rem; }
-.message-filters {
+.message-filters,
+.table-filters {
   display: grid;
   grid-template-columns: minmax(14rem, 2fr) repeat(3, minmax(10rem, 1fr));
   align-items: end;
   gap: .75rem;
   margin-bottom: 1rem;
 }
-.message-filters label { display: grid; gap: .375rem; min-width: 0; }
+.message-filters label,
+.table-filters label { display: grid; gap: .375rem; min-width: 0; }
 .message-filters .p-inputtext,
-.message-filters .p-select { width: 100%; min-width: 0; }
+.message-filters .p-select,
+.table-filters .p-inputtext,
+.table-filters .p-select { width: 100%; min-width: 0; }
 .device-actions { display: flex; flex-wrap: wrap; gap: .25rem; }
 .form { display: grid; gap: .9375rem; }
 .log-filters { display: grid; grid-template-columns: repeat(4, minmax(10rem, 1fr)) auto; align-items: end; gap: .875rem; margin-bottom: 1rem; }
@@ -530,6 +534,6 @@ body { margin: 0; min-width: 320px; }
   .metrics strong { font-size: 1.3125rem; }
   .section-head { align-items: center; }
   .section-head p { display: none; }
-  .form-row, .settings-grid, .message-filters, .log-filters { grid-template-columns: 1fr; }
+  .form-row, .settings-grid, .message-filters, .table-filters, .log-filters { grid-template-columns: 1fr; }
   .log-filter-actions { grid-column: auto; justify-content: flex-start; flex-wrap: wrap; }
 }

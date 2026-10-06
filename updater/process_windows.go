@@ -4,8 +4,13 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
+	"time"
+	"unsafe"
 )
 
 const windowsErrorInvalidParameter syscall.Errno = 87
@@ -59,4 +64,82 @@ func startDetachedProcess(executable, workDir string) error {
 		_ = cmd.Process.Release()
 	}
 	return nil
+}
+
+var (
+	modKernel32     = syscall.NewLazyDLL("kernel32.dll")
+	procMoveFileExW = modKernel32.NewProc("MoveFileExW")
+)
+
+const (
+	moveFileReplaceExisting = 0x1
+	moveFileWriteThrough    = 0x8
+)
+
+func moveFileEx(src, dst string) error {
+	from, err := syscall.UTF16PtrFromString(src)
+	if err != nil {
+		return err
+	}
+	to, err := syscall.UTF16PtrFromString(dst)
+	if err != nil {
+		return err
+	}
+	r1, _, callErr := procMoveFileExW.Call(
+		uintptr(unsafe.Pointer(from)),
+		uintptr(unsafe.Pointer(to)),
+		uintptr(moveFileReplaceExisting|moveFileWriteThrough),
+	)
+	if r1 == 0 {
+		if callErr != nil {
+			return callErr
+		}
+		return errors.New("MoveFileExW failed")
+	}
+	return nil
+}
+
+// replaceFileWithRetry writes via a sibling temp file, then renames with retries.
+// Windows often keeps Qt/Python DLLs mapped briefly after process exit; identical
+// content is skipped by the caller, and here we retry remove+MoveFileEx.
+func replaceFileWithRetry(destination string, data []byte, mode os.FileMode) error {
+	temporary := destination + ".mkcb-new-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := os.WriteFile(temporary, data, mode|0o600); err != nil {
+		return err
+	}
+	var lastErr error
+	for attempt := 0; attempt < 40; attempt++ {
+		if attempt > 0 {
+			time.Sleep(250 * time.Millisecond)
+		}
+		// Prefer MoveFileEx (atomic replace when possible).
+		if err := moveFileEx(temporary, destination); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		// Fall back: move locked destination aside, then rename temp into place.
+		stale := destination + ".mkcb-old-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		if renameErr := os.Rename(destination, stale); renameErr == nil {
+			if err := os.Rename(temporary, destination); err == nil {
+				_ = os.Remove(stale)
+				return nil
+			} else {
+				lastErr = err
+				_ = os.Rename(stale, destination) // best-effort restore
+			}
+		} else {
+			_ = os.Remove(destination)
+			if err := os.Rename(temporary, destination); err == nil {
+				return nil
+			} else {
+				lastErr = err
+			}
+		}
+	}
+	_ = os.Remove(temporary)
+	if lastErr == nil {
+		lastErr = errors.New("replace failed after retries")
+	}
+	return fmt.Errorf("replace %s: %w", destination, lastErr)
 }

@@ -48,6 +48,16 @@ const (
 	SessionEndUnexpected = "unexpected" // dropped without goodbye; confirmed after grace
 )
 
+// IsIntentionalSessionEnd reports goodbye reasons that must not count as listen-probe loss.
+func IsIntentionalSessionEnd(reason string) bool {
+	switch reason {
+	case SessionEndUserExit, SessionEndUpdate, SessionEndAdmin:
+		return true
+	default:
+		return false
+	}
+}
+
 // UnexpectedDisconnectGrace is how long an unexplained drop stays "reconnecting"
 // before the admin UI marks it as 意外终止.
 const UnexpectedDisconnectGrace = 30 * time.Second

@@ -4,8 +4,10 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -41,6 +43,21 @@ func startDetachedProcess(executable, workDir string) error {
 	}
 	if cmd.Process != nil {
 		_ = cmd.Process.Release()
+	}
+	return nil
+}
+
+func replaceFileWithRetry(destination string, data []byte, mode os.FileMode) error {
+	temporary := destination + ".mkcb-new-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := os.WriteFile(temporary, data, mode|0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, destination); err != nil {
+		_ = os.Remove(destination)
+		if err2 := os.Rename(temporary, destination); err2 != nil {
+			_ = os.Remove(temporary)
+			return fmt.Errorf("replace %s: %w", destination, err2)
+		}
 	}
 	return nil
 }

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 MAGIC = b"MKCB"
 HEADER_SIZE = 16
-MAX_PAYLOAD_SIZE = 256 << 20
+MAX_PAYLOAD_SIZE = 512 << 20
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR = 0
 

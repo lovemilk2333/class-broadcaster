@@ -207,7 +207,7 @@ UDP 响应必须携带服务端 IP、TCP/API 端口、协议版本、设备名�
 | `0x0E-0x0F` | 标志位 `uint16 BE` |
 | `0x10-` | BSON Payload |
 
-TCP 读取必须先读满固定头，再按长度读取 payload；业务包最大 payload 为 256 MiB（兼容更新包直传），超限立即断开。BSON 文档统一使用 `snake_case` 字段名。每个请求包含 `request_id`，业务消息包含全局唯一 `message_id`；服务端以 `message_id` 做幂等，客户端仅在进程内按 `(server_id, message_id)` 去重，不将去重记录持久化。客户端重启后允许因服务端重发而再次播报。
+TCP 读取必须先读满固定头，再按长度读取 payload；业务包最大 payload 为 512 MiB（兼容含 TTS 的完整更新包上传/直传），超限立即断开。BSON 文档统一使用 `snake_case` 字段名。每个请求包含 `request_id`，业务消息包含全局唯一 `message_id`；服务端以 `message_id` 做幂等，客户端仅在进程内按 `(server_id, message_id)` 去重，不将去重记录持久化。客户端重启后允许因服务端重发而再次播报。
 
 包类型按方向分段：`0x0001-0x00FF` 发现，`0x0100-0x01FF` 握手，`0x0200-0x02FF` 会话/心跳，`0x1000-0x10FF` 叫号业务，`0x7F00-0x7FFF` 错误。错误响应统一包含 `code`、`message`、`retryable`。
 
@@ -314,7 +314,7 @@ ciphertext = AES-256-GCM(key, nonce = random_12_bytes, plaintext = private_key)
 
 管理端“更新发布”只接受 `.tar.zst`，经 `POST /api/v1/updates/publish` 向已选客户端推送通知。服务端从包内 `metadata.json` 识别组件/版本/平台与清单摘要；前端不手填这些字段。不接受 `.zip` 上传，也不再二次重压。收到更新时客户端只写日志（不弹 Windows 托盘通知）。
 
-业务包最大 payload 为 256 MiB，以容纳包含 CPython、Qt 和原生 `.pyd` 的客户端更新包；Go 与 Python 解码器使用相同上限。更新包仍在 TLS 连接内发送，并在写盘和解包前校验 metadata、清单摘要及安全路径。
+业务包最大 payload 为 512 MiB，以容纳包含 CPython、Qt、原生 `.pyd` 与 Piper TTS 模型的客户端更新包；Go 与 Python 解码器使用相同上限。更新包仍在 TLS 连接内发送，并在写盘和解包前校验 metadata、清单摘要及安全路径。
 
 ### 目录建议
 

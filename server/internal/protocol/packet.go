@@ -13,9 +13,10 @@ import (
 const (
 	Magic      = "MKCB"
 	HeaderSize = 16
-	// MaxPayloadSize bounds TLS/control packet payloads (messages, handshakes, updates).
-	// Keep well under typical low-end device RAM; client update packages are ~100MB compressed.
-	MaxPayloadSize = 128 << 20
+	// MaxPayloadSize bounds TLS/control packet payloads (messages, handshakes, updates)
+	// and the HTTP upload size for .tar.zst packages (maxUpdatePackageBytes).
+	// Full Windows clients with Piper TTS can exceed 256 MiB compressed.
+	MaxPayloadSize = 512 << 20
 	// MaxDiscoveryDatagram is the UDP read buffer for discovery only.
 	// Discovery packets are tiny; never allocate MaxPayloadSize for UDP.
 	MaxDiscoveryDatagram = 64 << 10

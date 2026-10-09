@@ -263,7 +263,7 @@ function formatDateTime(value?: string) {
 - 不使用 PyInstaller
 - 支持缓存后完全离线重建
 - CIDR 扫描增加定向广播和单播回退
-- 更新包协议上限调整为 256 MiB
+- 更新包协议上限调整为 512 MiB
 
 构建命令：
 

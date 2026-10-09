@@ -205,6 +205,11 @@ def ensure_windows_site_packages(root: Path, cache: Path, requirements: Path, of
     if stamped.exists():
         shutil.rmtree(stamped)
     stamped.mkdir(parents=True, exist_ok=True)
+    # Prefer wheels for everything (cross-install from Linux cannot compile native
+    # extensions). A few pure-Python deps ship sdist-only on PyPI:
+    #   - distance  (via g2p-en → piper-plus)
+    #   - jieba     (direct client dep)
+    # Allow those two from sdist; keep --only-binary=:all: for the rest.
     uv_command = [
         "uv",
         "pip",
@@ -217,11 +222,12 @@ def ensure_windows_site_packages(root: Path, cache: Path, requirements: Path, of
         "x86_64-pc-windows-msvc",
         "--only-binary",
         ":all:",
+        "--no-binary",
+        "distance,jieba",
         "--requirements",
         str(requirements),
         "--cache-dir",
         str(cache / "uv"),
-        # Windows wheels must come from PyPI (or mirror); never try to build sdist.
         "--no-compile",
     ]
     print(f"Installing Windows site-packages into cache {stamped}", flush=True)

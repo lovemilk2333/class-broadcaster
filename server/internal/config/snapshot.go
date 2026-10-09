@@ -16,6 +16,11 @@ const (
 	MaxAckTimeout                        = 7 * 24 * time.Hour
 	DefaultDisplayPosition               = "center"
 	DefaultDisplayDurationRatio  float64 = 0.4
+	// DefaultSpeechRate is the offline TTS speed multiplier (1.0 = normal;
+	// higher = faster, lower = slower). Piper length_scale = 1/rate.
+	DefaultSpeechRate            float64 = 0.75
+	MinSpeechRate                float64 = 0.25
+	MaxSpeechRate                float64 = 2.0
 	DefaultListenerProbeInterval         = 1 * time.Minute
 	DefaultListenerProbeDuration         = 12 * time.Hour
 	DefaultListenerProbeReset            = 31 * 24 * time.Hour
@@ -74,6 +79,8 @@ type Snapshot struct {
 	MaxRepeatExpansion    int32         `bson:"max_repeat_expansion"`
 	DisplayPosition       string        `bson:"default_display_position"`
 	DisplayDurationRatio  float64       `bson:"default_display_duration_ratio"`
+	// SpeechRate is the default TTS speed multiplier (1.0 = normal).
+	SpeechRate            float64       `bson:"default_speech_rate"`
 	ListenerProbeInterval time.Duration `bson:"listener_probe_interval"`
 	ListenerProbeDuration time.Duration `bson:"listener_probe_duration"`
 	ListenerProbeReset    time.Duration `bson:"listener_probe_reset"`
@@ -97,6 +104,7 @@ func NewSnapshot(now time.Time) (Snapshot, error) {
 		MaxRepeatExpansion:    100,
 		DisplayPosition:       DefaultDisplayPosition,
 		DisplayDurationRatio:  DefaultDisplayDurationRatio,
+		SpeechRate:            DefaultSpeechRate,
 		ListenerProbeInterval: DefaultListenerProbeInterval,
 		ListenerProbeDuration: DefaultListenerProbeDuration,
 		ListenerProbeReset:    DefaultListenerProbeReset,

@@ -9,6 +9,7 @@ import MultiSelect from 'primevue/multiselect'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 import FilterableDataTable, { type FiltersModel, type FilterFieldDef } from '../components/FilterableDataTable.vue'
+import TargetClientsDialog from '../components/TargetClientsDialog.vue'
 import { useAdminStore } from '../stores/admin'
 import { useSettingsStore } from '../stores/settings'
 import type { UpdateRecord } from '../types'
@@ -37,6 +38,31 @@ const updateTargets = ref<string[]>([])
 const updatePackages = ref<File[]>([])
 const updatePackageDragOver = ref(false)
 const updatePackageInputRef = ref<HTMLInputElement | null>(null)
+
+const targetDialogVisible = ref(false)
+const targetDialogAll = ref(false)
+const targetDialogIds = ref<string[]>([])
+
+function updateTargetIds(record: UpdateRecord): string[] {
+  return (record.target_client_ids ?? []).filter((id) => id && id !== '*')
+}
+
+function updateTargetIsAll(record: UpdateRecord): boolean {
+  // Force publishes expand to all approved; empty targets also mean broadcast-all.
+  return Boolean(record.force) || updateTargetIds(record).length === 0
+}
+
+function updateTargetLabel(record: UpdateRecord): string {
+  if (updateTargetIsAll(record)) return '全部客户端'
+  const n = updateTargetIds(record).length
+  return `${n} 个客户端`
+}
+
+function openUpdateTargets(record: UpdateRecord) {
+  targetDialogAll.value = updateTargetIsAll(record)
+  targetDialogIds.value = updateTargetIds(record)
+  targetDialogVisible.value = true
+}
 
 const filters = ref<FiltersModel>({
   global: textFilter('', CustomFilterMatchMode.UPDATE_SEARCH),
@@ -302,6 +328,15 @@ async function publishUpdate() {
         <Tag v-if="slotProps.data.force" value="强制" severity="danger" title="全部已批准客户端必须更新；离线上线后补推" />
         <span v-else class="text-muted">—</span>
       </template></Column>
+      <Column header="目标" style="width: 10rem"><template #body="slotProps">
+        <Button
+          class="target-clients-button"
+          text
+          size="small"
+          :label="updateTargetLabel(slotProps.data)"
+          @click="openUpdateTargets(slotProps.data)"
+        />
+      </template></Column>
       <Column field="sha256" header="SHA-256"><template #body="slotProps"><code class="update-hash" :title="slotProps.data.sha256">{{ slotProps.data.sha256 }}</code></template></Column>
       <Column field="status" header="状态" style="width: 12rem"><template #body="slotProps">
         <div class="update-status-cell">
@@ -407,4 +442,10 @@ async function publishUpdate() {
       </div>
     </Form>
   </Dialog>
+
+  <TargetClientsDialog
+    v-model:visible="targetDialogVisible"
+    :target-all="targetDialogAll"
+    :target-client-ids="targetDialogIds"
+  />
 </template>

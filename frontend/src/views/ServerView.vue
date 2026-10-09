@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import Button from 'primevue/button'
 import Card from 'primevue/card'
 import Column from 'primevue/column'
@@ -11,6 +11,7 @@ import Select from 'primevue/select'
 import Skeleton from 'primevue/skeleton'
 import Tag from 'primevue/tag'
 import { useConfirm } from 'primevue/useconfirm'
+import SafeInputNumber from '../components/SafeInputNumber.vue'
 import TablePagination from '../components/TablePagination.vue'
 import { useAdminStore } from '../stores/admin'
 import { useSettingsStore } from '../stores/settings'
@@ -19,6 +20,7 @@ import { logLevels, logSeverity, pageSizeOptions } from '../utils/labels'
 const admin = useAdminStore()
 const settings = useSettingsStore()
 const confirm = useConfirm()
+const clientLogPurgeDays = ref<number | null>(30)
 
 function applyLogFilters() {
   admin.applyLogFilters()
@@ -39,6 +41,20 @@ function purgeExpiredHistory() {
     rejectLabel: '取消',
     acceptClass: 'p-button-danger',
     accept: () => void admin.purgeExpiredHistory()
+  })
+}
+
+function purgeClientLogs() {
+  const days = Math.trunc(Number(clientLogPurgeDays.value))
+  if (!Number.isFinite(days) || days < 1) return
+  confirm.require({
+    message: `将删除服务端数据库中创建时间 ≥ ${days} 日的全部客户端上传日志。此操作不可撤销，是否继续？`,
+    header: '清理客户端日志',
+    icon: 'pi pi-exclamation-triangle',
+    acceptLabel: '立即清理',
+    rejectLabel: '取消',
+    acceptClass: 'p-button-danger',
+    accept: () => void admin.purgeClientLogs(days)
   })
 }
 
@@ -78,9 +94,10 @@ onMounted(() => {
     <Card class="maintenance-card">
       <template #title>数据维护</template>
       <template #content>
-        <p class="maintenance-copy">自动任务会周期性清理超过 185 天的消息与客户端记录。也可在此立即执行一次清理。</p>
+        <p class="maintenance-copy">最近消息按「消息保留（小时）× 2」自动删除；另有 185 天硬上限清理消息与空闲客户端。也可在此立即执行一次 185 天清理。</p>
         <ul class="maintenance-list">
-          <li>消息：删除创建时间 ≥ 185 天的全部消息记录（含 pending / sent）</li>
+          <li>最近消息：创建时间 ≥ 消息保留（小时）× 2 的记录由定时任务自动删除</li>
+          <li>硬上限：删除创建时间 ≥ 185 天的全部消息记录（含 pending / sent）</li>
           <li>客户端：删除超过 185 天未活跃的设备记录</li>
         </ul>
         <div class="maintenance-actions">
@@ -91,6 +108,24 @@ onMounted(() => {
             outlined
             :loading="admin.purgeExpiredLoading"
             @click="purgeExpiredHistory"
+          />
+        </div>
+        <hr class="maintenance-divider" />
+        <p class="maintenance-copy">客户端上传的日志保存在服务端数据库；可按天数清理（天数 n ≥ 1，删除创建时间 ≥ n 日的日志）。</p>
+        <div class="maintenance-actions client-log-purge">
+          <label class="client-log-purge-days">
+            <span>清理 ≥</span>
+            <SafeInputNumber v-model="clientLogPurgeDays" :min="1" :max="3650" :step="1" :useGrouping="false" />
+            <span>日的客户端日志</span>
+          </label>
+          <Button
+            label="清理客户端日志"
+            icon="pi pi-trash"
+            severity="danger"
+            outlined
+            :loading="admin.purgeClientLogsLoading"
+            :disabled="clientLogPurgeDays == null || Number(clientLogPurgeDays) < 1"
+            @click="purgeClientLogs"
           />
         </div>
       </template>
@@ -124,7 +159,7 @@ onMounted(() => {
       @update:pageSize="admin.changeLogPageSize"
     />
     <Skeleton v-if="!admin.logsTableReady" height="24rem" class="api-skeleton" />
-    <DataTable v-else :value="admin.visibleServerLogEntries" stripedRows responsiveLayout="scroll" class="queue-table" :loading="admin.logsLoading">
+    <DataTable v-else :value="admin.visibleServerLogEntries" stripedRows scrollable class="queue-table" :loading="admin.logsLoading">
       <template #empty>暂无日志</template>
       <Column field="time" header="时间" style="width: 13rem" />
       <Column field="level" header="级别" style="width: 7rem"><template #body="slotProps">

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"lovemilk-class-broadcaster/server/internal/config"
+	"lovemilk-class-broadcaster/server/internal/fontsize"
 	_ "modernc.org/sqlite"
 )
 
@@ -65,6 +66,9 @@ const UnexpectedDisconnectGrace = 30 * time.Second
 type Device struct {
 	ClientID          string `json:"client_id"`
 	ClientVersion     string `json:"client_version,omitempty"`
+	// ClientBuildDate mirrors the client's stamped build time for admin display
+	// (same format as the server health build_date). Not used for update comparisons.
+	ClientBuildDate   string `json:"client_build_date,omitempty"`
 	Label             string `json:"label"`
 	Status            string `json:"status"`
 	ApprovedAt        int64  `json:"approved_at"`
@@ -89,6 +93,15 @@ type Device struct {
 	SessionEndAt int64 `json:"session_end_at,omitempty"`
 	// SessionEndDetail is an optional short note (e.g. update sha, admin action).
 	SessionEndDetail string `json:"session_end_detail,omitempty"`
+	// AvailableFonts is the last font inventory reported at handshake (JSON array in SQLite).
+	AvailableFonts []string `json:"available_fonts,omitempty"`
+	// PlatformDefaultFont is the client's resolved platform default at last handshake.
+	PlatformDefaultFont string `json:"platform_default_font,omitempty"`
+	// DefaultFontFamily is an admin override pushed on ConnectResp (empty = platform default).
+	DefaultFontFamily string `json:"default_font_family,omitempty"`
+	// DefaultFontSize is an admin expression pushed on ConnectResp (empty = client built-in 25vh).
+	// Examples: "38px", "1.2em", "5vw", "25vh".
+	DefaultFontSize string `json:"default_font_size,omitempty"`
 }
 
 type Registry struct {
@@ -166,6 +179,7 @@ func NewPersistentRegistry(path string) (*Registry, error) {
 		for _, column := range []string{
 			"connection_mode TEXT NOT NULL DEFAULT 'pull'", "requested_mode TEXT NOT NULL DEFAULT 'auto'", "forced_mode TEXT NOT NULL DEFAULT ''",
 			"client_version TEXT NOT NULL DEFAULT ''",
+			"client_build_date TEXT NOT NULL DEFAULT ''",
 			"listener_port INTEGER NOT NULL DEFAULT 0", "listener_address TEXT NOT NULL DEFAULT ''",
 			"probe_started_at INTEGER NOT NULL DEFAULT 0", "probe_until INTEGER NOT NULL DEFAULT 0",
 			"probe_sent INTEGER NOT NULL DEFAULT 0", "probe_received INTEGER NOT NULL DEFAULT 0",
@@ -175,10 +189,14 @@ func NewPersistentRegistry(path string) (*Registry, error) {
 			"session_end_reason TEXT NOT NULL DEFAULT ''",
 			"session_end_at INTEGER NOT NULL DEFAULT 0",
 			"session_end_detail TEXT NOT NULL DEFAULT ''",
+			"available_fonts TEXT NOT NULL DEFAULT '[]'",
+			"platform_default_font TEXT NOT NULL DEFAULT ''",
+			"default_font_family TEXT NOT NULL DEFAULT ''",
+			"default_font_size TEXT NOT NULL DEFAULT ''",
 		} {
 			_, _ = db.Exec(`ALTER TABLE devices ADD COLUMN ` + column)
 		}
-		rows, err := db.Query(`SELECT client_id, label, status, approved_at, last_seen, connection_mode, requested_mode, forced_mode, client_version, listener_port, listener_address, probe_started_at, probe_until, probe_sent, probe_received, probe_min_latency_ms, probe_max_latency_ms, probe_avg_latency_ms, probe_loss_percent, probe_reset_at, session_end_reason, session_end_at, session_end_detail FROM devices`)
+		rows, err := db.Query(`SELECT client_id, label, status, approved_at, last_seen, connection_mode, requested_mode, forced_mode, client_version, COALESCE(client_build_date,''), listener_port, listener_address, probe_started_at, probe_until, probe_sent, probe_received, probe_min_latency_ms, probe_max_latency_ms, probe_avg_latency_ms, probe_loss_percent, probe_reset_at, session_end_reason, session_end_at, session_end_detail, COALESCE(available_fonts,'[]'), COALESCE(platform_default_font,''), COALESCE(default_font_family,''), COALESCE(CAST(default_font_size AS TEXT),'') FROM devices`)
 		if err != nil {
 			_ = db.Close()
 			return nil, err
@@ -186,7 +204,9 @@ func NewPersistentRegistry(path string) (*Registry, error) {
 		defer rows.Close()
 		for rows.Next() {
 			var device Device
-			if err := rows.Scan(&device.ClientID, &device.Label, &device.Status, &device.ApprovedAt, &device.LastSeen, &device.ConnectionMode, &device.RequestedMode, &device.ForcedMode, &device.ClientVersion, &device.ListenerPort, &device.ListenerAddress, &device.ProbeStartedAt, &device.ProbeUntil, &device.ProbeSent, &device.ProbeReceived, &device.ProbeMinLatencyMS, &device.ProbeMaxLatencyMS, &device.ProbeAvgLatencyMS, &device.ProbeLossPercent, &device.ProbeResetAt, &device.SessionEndReason, &device.SessionEndAt, &device.SessionEndDetail); err != nil {
+			var fontsJSON string
+			var fontSizeRaw string
+			if err := rows.Scan(&device.ClientID, &device.Label, &device.Status, &device.ApprovedAt, &device.LastSeen, &device.ConnectionMode, &device.RequestedMode, &device.ForcedMode, &device.ClientVersion, &device.ClientBuildDate, &device.ListenerPort, &device.ListenerAddress, &device.ProbeStartedAt, &device.ProbeUntil, &device.ProbeSent, &device.ProbeReceived, &device.ProbeMinLatencyMS, &device.ProbeMaxLatencyMS, &device.ProbeAvgLatencyMS, &device.ProbeLossPercent, &device.ProbeResetAt, &device.SessionEndReason, &device.SessionEndAt, &device.SessionEndDetail, &fontsJSON, &device.PlatformDefaultFont, &device.DefaultFontFamily, &fontSizeRaw); err != nil {
 				return nil, err
 			}
 			id, err := NormalizeClientID(device.ClientID)
@@ -194,6 +214,10 @@ func NewPersistentRegistry(path string) (*Registry, error) {
 				continue
 			}
 			device.ClientID = id
+			device.AvailableFonts = decodeFontList(fontsJSON)
+			if normalized, normErr := fontsize.Normalize(migrateLegacyFontSize(fontSizeRaw)); normErr == nil {
+				device.DefaultFontSize = normalized
+			}
 			r.devices[id] = device
 		}
 		if err := rows.Err(); err != nil {
@@ -566,10 +590,15 @@ func SessionEndDisplay(device Device, online bool, now time.Time) (reason string
 }
 
 // UpdateClientVersion stores the version reported by an authenticated client handshake.
-func (r *Registry) UpdateClientVersion(publicKey []byte, version string) {
+// buildDate is optional (empty on older clients) and is display-only.
+func (r *Registry) UpdateClientVersion(publicKey []byte, version string, buildDate string) {
 	id, err := ClientID(publicKey)
 	if err != nil || len(version) > 64 {
 		return
+	}
+	buildDate = strings.TrimSpace(buildDate)
+	if len(buildDate) > 64 {
+		buildDate = buildDate[:64]
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -578,8 +607,169 @@ func (r *Registry) UpdateClientVersion(publicKey []byte, version string) {
 		return
 	}
 	device.ClientVersion = version
+	if buildDate != "" {
+		device.ClientBuildDate = buildDate
+	}
 	r.devices[id] = device
 	r.persistLocked()
+}
+
+func decodeFontList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "[]" {
+		return nil
+	}
+	var fonts []string
+	if err := json.Unmarshal([]byte(raw), &fonts); err != nil {
+		return nil
+	}
+	return normalizeFontList(fonts)
+}
+
+func encodeFontList(fonts []string) string {
+	normalized := normalizeFontList(fonts)
+	if len(normalized) == 0 {
+		return "[]"
+	}
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+
+func normalizeFontList(fonts []string) []string {
+	seen := make(map[string]struct{}, len(fonts))
+	out := make([]string, 0, len(fonts))
+	for _, item := range fonts {
+		name := strings.TrimSpace(item)
+		if name == "" || len(name) > 128 {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+		if len(out) >= 200 {
+			break
+		}
+	}
+	return out
+}
+
+// UpdateClientFonts stores handshake-reported font inventory and platform default.
+func (r *Registry) UpdateClientFonts(publicKey []byte, fonts []string, platformDefault string) {
+	id, err := ClientID(publicKey)
+	if err != nil {
+		return
+	}
+	platformDefault = strings.TrimSpace(platformDefault)
+	if len(platformDefault) > 128 {
+		platformDefault = platformDefault[:128]
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	device, ok := r.devices[id]
+	if !ok {
+		return
+	}
+	// Older clients omit available_fonts; do not wipe a previously reported inventory.
+	if normalized := normalizeFontList(fonts); len(normalized) > 0 {
+		device.AvailableFonts = normalized
+	}
+	if platformDefault != "" {
+		device.PlatformDefaultFont = platformDefault
+	}
+	r.devices[id] = device
+	r.persistLocked()
+}
+
+// DefaultFontFamilyFor returns the admin per-device font override (may be empty).
+func (r *Registry) DefaultFontFamilyFor(clientID string) string {
+	normalized, err := NormalizeClientID(clientID)
+	if err != nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	device, ok := r.devices[normalized]
+	if !ok {
+		return ""
+	}
+	return device.DefaultFontFamily
+}
+
+// DefaultFontSizeFor returns the admin per-device font size expression (empty = client default).
+func (r *Registry) DefaultFontSizeFor(clientID string) string {
+	normalized, err := NormalizeClientID(clientID)
+	if err != nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	device, ok := r.devices[normalized]
+	if !ok {
+		return ""
+	}
+	return device.DefaultFontSize
+}
+
+// SetDefaultFontFamily sets an admin override for one client. Empty clears the override.
+func (r *Registry) SetDefaultFontFamily(id, family string) error {
+	normalized, err := NormalizeClientID(id)
+	if err != nil {
+		return err
+	}
+	family = strings.TrimSpace(family)
+	if family == "(默认)" || strings.EqualFold(family, "(default)") || strings.EqualFold(family, "default") {
+		family = ""
+	}
+	if len(family) > 128 {
+		return errors.New("default font family is too long")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	device, ok := r.devices[normalized]
+	if !ok {
+		return errors.New("client is not registered")
+	}
+	device.DefaultFontFamily = family
+	r.devices[normalized] = device
+	r.persistLocked()
+	return nil
+}
+
+// migrateLegacyFontSize maps old integer column values ("38") to expressions.
+func migrateLegacyFontSize(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0" {
+		return ""
+	}
+	return raw
+}
+
+// SetDefaultFontSize sets an admin font-size expression. Empty clears (client uses built-in 25vh).
+func (r *Registry) SetDefaultFontSize(id string, size string) error {
+	normalized, err := NormalizeClientID(id)
+	if err != nil {
+		return err
+	}
+	canonical, err := fontsize.Normalize(migrateLegacyFontSize(size))
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	device, ok := r.devices[normalized]
+	if !ok {
+		return errors.New("client is not registered")
+	}
+	device.DefaultFontSize = canonical
+	r.devices[normalized] = device
+	r.persistLocked()
+	return nil
 }
 
 // UpdateListenerCapability 保存客户端在握手中声明的监听能力和服务端可达地址。
@@ -706,7 +896,7 @@ func (r *Registry) persistLocked() {
 			return
 		}
 		for _, device := range r.devices {
-			if _, err := transaction.Exec(`INSERT INTO devices(client_id, label, status, approved_at, last_seen, connection_mode, requested_mode, forced_mode, client_version, listener_port, listener_address, probe_started_at, probe_until, probe_sent, probe_received, probe_min_latency_ms, probe_max_latency_ms, probe_avg_latency_ms, probe_loss_percent, probe_reset_at, session_end_reason, session_end_at, session_end_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, device.ClientID, device.Label, device.Status, device.ApprovedAt, device.LastSeen, device.ConnectionMode, device.RequestedMode, device.ForcedMode, device.ClientVersion, device.ListenerPort, device.ListenerAddress, device.ProbeStartedAt, device.ProbeUntil, device.ProbeSent, device.ProbeReceived, device.ProbeMinLatencyMS, device.ProbeMaxLatencyMS, device.ProbeAvgLatencyMS, device.ProbeLossPercent, device.ProbeResetAt, device.SessionEndReason, device.SessionEndAt, device.SessionEndDetail); err != nil {
+			if _, err := transaction.Exec(`INSERT INTO devices(client_id, label, status, approved_at, last_seen, connection_mode, requested_mode, forced_mode, client_version, client_build_date, listener_port, listener_address, probe_started_at, probe_until, probe_sent, probe_received, probe_min_latency_ms, probe_max_latency_ms, probe_avg_latency_ms, probe_loss_percent, probe_reset_at, session_end_reason, session_end_at, session_end_detail, available_fonts, platform_default_font, default_font_family, default_font_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, device.ClientID, device.Label, device.Status, device.ApprovedAt, device.LastSeen, device.ConnectionMode, device.RequestedMode, device.ForcedMode, device.ClientVersion, device.ClientBuildDate, device.ListenerPort, device.ListenerAddress, device.ProbeStartedAt, device.ProbeUntil, device.ProbeSent, device.ProbeReceived, device.ProbeMinLatencyMS, device.ProbeMaxLatencyMS, device.ProbeAvgLatencyMS, device.ProbeLossPercent, device.ProbeResetAt, device.SessionEndReason, device.SessionEndAt, device.SessionEndDetail, encodeFontList(device.AvailableFonts), device.PlatformDefaultFont, device.DefaultFontFamily, device.DefaultFontSize); err != nil {
 				_ = transaction.Rollback()
 				return
 			}

@@ -75,6 +75,70 @@ func TestRegistryListenerCapabilityAndForcedMode(t *testing.T) {
 	}
 }
 
+func TestRegistryClientFontsAndAdminDefault(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	if _, err := registry.Approve(publicKey, "screen", time.Unix(1_700_000_000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	registry.UpdateClientFonts(publicKey, []string{"Noto Sans CJK SC", "DejaVu Sans", "Noto Sans CJK SC", ""}, "Noto Sans CJK SC")
+	device := registry.List()[0]
+	if len(device.AvailableFonts) != 2 || device.AvailableFonts[0] != "Noto Sans CJK SC" {
+		t.Fatalf("font inventory not normalized: %#v", device.AvailableFonts)
+	}
+	if device.PlatformDefaultFont != "Noto Sans CJK SC" {
+		t.Fatalf("platform default font not stored: %#v", device)
+	}
+	// Empty report from an older client must not wipe the inventory.
+	registry.UpdateClientFonts(publicKey, nil, "")
+	device = registry.List()[0]
+	if len(device.AvailableFonts) != 2 {
+		t.Fatalf("empty font report wiped inventory: %#v", device.AvailableFonts)
+	}
+	if device.PlatformDefaultFont != "Noto Sans CJK SC" {
+		t.Fatalf("empty platform default wiped previous value: %#v", device)
+	}
+	if got := registry.DefaultFontFamilyFor(device.ClientID); got != "" {
+		t.Fatalf("admin override should start empty, got %q", got)
+	}
+	if err := registry.SetDefaultFontFamily(device.ClientID, "DejaVu Sans"); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.DefaultFontFamilyFor(device.ClientID); got != "DejaVu Sans" {
+		t.Fatalf("admin override not applied: %q", got)
+	}
+	if err := registry.SetDefaultFontSize(device.ClientID, "52"); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.DefaultFontSizeFor(device.ClientID); got != "52px" {
+		t.Fatalf("admin font size not applied: %q", got)
+	}
+	if err := registry.SetDefaultFontSize(device.ClientID, "1.2em"); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.DefaultFontSizeFor(device.ClientID); got != "1.2em" {
+		t.Fatalf("admin em font size not applied: %q", got)
+	}
+	if err := registry.SetDefaultFontSize(device.ClientID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.DefaultFontSizeFor(device.ClientID); got != "" {
+		t.Fatalf("admin font size clear failed: %q", got)
+	}
+	if err := registry.SetDefaultFontSize(device.ClientID, "15px"); err == nil {
+		t.Fatal("expected invalid font size error")
+	}
+	if err := registry.SetDefaultFontFamily(device.ClientID, "(默认)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.DefaultFontFamilyFor(device.ClientID); got != "" {
+		t.Fatalf("admin override clear failed: %q", got)
+	}
+}
+
 // TestRegistryCustomListenerPolicyUsesThresholdAndReset 验证自定义试用窗口、丢包阈值和重测间隔。
 func TestRegistryCustomListenerPolicyUsesThresholdAndReset(t *testing.T) {
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
@@ -324,7 +388,7 @@ func TestRegistryPersistsPendingAndRevokedDevicesAcrossRestart(t *testing.T) {
 	if _, err := registry.Approve(publicKey, "persisted", now); err != nil {
 		t.Fatal(err)
 	}
-	registry.UpdateClientVersion(publicKey, "0.1.1")
+	registry.UpdateClientVersion(publicKey, "0.1.1", "2026-10-06 18:13:47.7583+08:00")
 	if err := registry.RevokeClientID(pending.ClientID); err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +402,7 @@ func TestRegistryPersistsPendingAndRevokedDevicesAcrossRestart(t *testing.T) {
 	}
 	defer registry.db.Close()
 	restored, err = registry.Get(pending.ClientID)
-	if err != nil || restored.Status != "revoked" || restored.Label != "persisted" || restored.ClientVersion != "0.1.1" {
+	if err != nil || restored.Status != "revoked" || restored.Label != "persisted" || restored.ClientVersion != "0.1.1" || restored.ClientBuildDate != "2026-10-06 18:13:47.7583+08:00" {
 		t.Fatalf("revoked client was not restored after restart: %#v %v", restored, err)
 	}
 }

@@ -62,13 +62,17 @@ STOPPED -> DISCOVERING -> CANDIDATE -> TRUST_CONFIRM -> CONNECTING -> ONLINE
 
 服务端消息使用 UUID4 `message_id`。客户端仅在进程内按 `(server_id, message_id)` 保存已观察 ID，重复投递不重复显示或朗读，但仍可重复发送必要回执。去重集合不写入磁盘；客户端重启后允许因服务端重发而再次播报。服务端从最近一次成功发送起计算 `ack_timeout_seconds`，默认值为 300 秒，可在管理端设置为 1 秒至 7 天；每个目标的发送时间和回执状态保存在 SQLite。超时且消息尚未过期时服务端只重发未完成目标；收到 `displayed`/`spoken` 后不再重发，重复或乱序的 `received` 不会回退完成状态或延长重传计时。若消息未启用 TTS，以 `displayed/end` 作为完成回执；启用 TTS 时以 `spoken/end` 或 `failed` 作为终态回执。离线客户端上线后接收有效期内消息；默认超过 24 小时的消息由服务端丢弃并记录 warning，重传不超过消息 TTL。
 
-显示层必须展示内容和服务端发送时间，时间按目标时区格式化为 `YYYY-MM-DD HH:mm:ss+08:00`。默认显示比率为 `0.4`，按 ASCII/标点 1 单位、中文 1.5 单位计算秒数，允许范围为 `0..120`；自动显示时长（包含 TTS 最短时长）封顶 `120` 秒，比率为 0 时只显示整行手动关闭按钮；超长消息保持单行，在窗口内向左自动滚动（`MarqueeLabel`），文字左右各留 `0.25rem`（相对内容字号）边距；消息窗口最大宽度为窗口所在屏幕可用宽度的 **95%**，不得随全文撑破屏幕。实际显示时长至少为 `max(预计 TTS 总时长 / 4, 1)` 秒。优先级数字越小优先程度越高，可中断当前消息；被中断消息按原优先级和服务端时间 FIFO 顺序回队，本地重播完成后再发终态回执（无 TTS 为 `displayed`，有 TTS 为 `spoken`/`failed`）。
+显示层必须展示内容和服务端发送时间，时间按目标时区格式化为 `YYYY-MM-DD HH:mm:ss+08:00`。默认显示比率为 `0.4`，按 **jieba Token** 计单位（每 Token = 1.0），允许范围为 `0..120`；自动显示时长（包含 TTS 最短时长）封顶 `120` 秒，比率为 0 时只显示整行手动关闭按钮；超长消息保持单行，在窗口内按 **prefer 单 Token 停留** 向左滚动（`MarqueeLabel`：开头 padding 停顿 ≥0.5s → 每 Token 滚入边缘 / 停留 / 滚出 → 结尾停顿 ≥0.5s），文字左右各留 `0.25rem`（相对内容字号）边距；消息窗口最大宽度为窗口所在屏幕可用宽度的 **95%**，不得随全文撑破屏幕。启用 TTS 时自动显示时长取 `min(预计 TTS 总时长 + 5s, 120s)`；未启用 TTS 时仍按 Token × 比率计算。优先级数字越小优先程度越高，可中断当前消息；被中断消息按原优先级和服务端时间 FIFO 顺序回队，本地重播完成后再发终态回执（无 TTS 为 `displayed`，有 TTS 为 `spoken`/`failed`）。
 
-收到 `message_withdraw` 时停止该消息尚未完成的显示和 TTS；即使消息已经部分或全部显示，也向用户提示“消息已撤回”并朗读提示。撤回提示沿用该消息的显示比率或服务端默认显示比率，按相同字符权重、TTS 最短时长和 120 秒上限计算，比例为 0 时保留手动关闭按钮；显示与 TTS 均结束后再关闭（手动关闭除外）；记录本地事件并回报 `withdrawn`，服务端保留原始回执和撤回 warning。
+正文字体/字号由管理端按客户端设置：握手上报 `available_fonts`，管理端写入 `default_font_family` / `default_font_size`，经 `ConnectResp` 下发（PATCH 字体后会断开会话以触发重连）。空字体 /「(默认)」→ 平台默认（Windows 微软雅黑 / Linux Noto Sans*）。字号为表达式：空 → 内置 **25vh**；`38px`（16–120）；`1.2em`（相对 38px）；`5vw`/`25vh`（相对消息窗所在屏幕可用宽/高，0.0–100）。单条消息可带 `font_size` 覆盖设备默认。客户端只渲染。侧边距与时间戳字号随正文字号同步。
+
+Linux 教室客户端以 **X11** 为准（启动默认 `QT_QPA_PLATFORM=xcb`），无边框消息窗在映射后多次重定位/置顶，保证九宫格位置可用。Qt 绑定：Linux 优先 **PySide2/Qt5**（Python ≥3.10），Windows 打包仍为 **PySide6**（经 `client/qtcompat.py`）。
+
+收到 `message_withdraw` 时停止该消息尚未完成的显示和 TTS；即使消息已经部分或全部显示，也向用户提示“消息已撤回”并朗读提示。撤回提示沿用该消息的显示比率或服务端默认显示比率，按相同 Token 单位、TTS 最短时长和 120 秒上限计算，比例为 0 时保留手动关闭按钮；显示与 TTS 均结束后再关闭（手动关闭除外）；记录本地事件并回报 `withdrawn`，服务端保留原始回执和撤回 warning。
 
 ## 离线 TTS
 
-不使用 gTTS 或其他网络服务。管理端发送消息时由“朗读消息内容”选项决定是否发送语音文本节点；未勾选时客户端不探测 TTS，并记录 `TTS skipped`。Windows 10 首选 SAPI 5 的 `zh-CN` 语音，安装包提供 Piper 中文模型作为 fallback。第一次尝试和运行时失败都按 `SAPI -> Piper` 探测；成功引擎写入偏好文件，后续优先使用上次成功引擎，fallback 时从当前消息开头重新朗读。每次探测都会记录引擎是否可用；两个引擎都失败时仍显示文字，记录明确错误并回报 `spoken=failed`。
+不使用 gTTS 或其他网络服务。管理端发送消息时由“朗读消息内容”选项决定是否发送语音文本节点；未勾选时客户端不探测 TTS，并记录 `TTS skipped`。**Windows** 首选 **`piper-plus`**（多语言 Tsukuyomi-chan ONNX，jieba 切中/英段后分别用 `language_id` zh=2 / en=1 合成）；**Linux** 仍用 **`piper-tts`** + `zh_CN-huayan-medium` / `en_US-lessac-medium`。直接调用 Python 包 API，不使用 `piper` CLI。模型缓存于 `client/tts/`（打包 `Lib/tts/`；`make clean` 不删）。`speech_rate` 为语速倍率（默认 `0.75`，1.0=正常），Piper 使用 `length_scale = 1/speech_rate`。失败时回退 Windows SAPI 5。成功引擎写入偏好文件，后续优先使用上次成功引擎，fallback 时从当前消息开头重新朗读。每次探测都会记录引擎是否可用；全部引擎都失败时仍显示文字，记录明确错误并回报 `spoken=failed`。
 
 语音编辑器产生结构化 BSON 节点，不解析任意 XML/脚本。首版节点只有 `text`、`repeat(count, children)` 和 `pause(duration_ms)`；服务端限制重复次数和嵌套深度，客户端编译成安全的纯文本片段。
 

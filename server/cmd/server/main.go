@@ -38,6 +38,7 @@ import (
 	"lovemilk-class-broadcaster/server/internal/broadcast"
 	"lovemilk-class-broadcaster/server/internal/config"
 	"lovemilk-class-broadcaster/server/internal/discovery"
+	"lovemilk-class-broadcaster/server/internal/fontsize"
 	"lovemilk-class-broadcaster/server/internal/identity"
 	"lovemilk-class-broadcaster/server/internal/protocol"
 	"lovemilk-class-broadcaster/server/internal/session"
@@ -51,8 +52,9 @@ const (
 	updateDownloadDomain     = "MKCB-UPDATE-DOWNLOAD-v1"
 )
 
-// frontendFiles 在构建时由 Makefile 用 frontend/dist 填充；服务端二进制因此自带管理控制台。
-// 开发环境保留一个最小 index.html，避免直接 go test 时 embed 找不到匹配文件。
+// frontendFiles 在发布构建时由 Makefile 用 frontend/dist 填充；服务端二进制因此自带管理控制台。
+// 仓库提交了最小 web/index.html 占位，使 go test / go run / SKIP_FRONTEND=1 无需 pnpm。
+// 本地 UI 开发用 frontend 的 pnpm dev（:39004 → 代理 /api 到 :39003）。
 //
 //go:embed web/*
 var frontendFiles embed.FS
@@ -241,6 +243,25 @@ func openServerPreferences(path string) (*serverPreferences, error) {
 	if _, err := db.Exec(`UPDATE update_counters SET next_seq = (
 		SELECT COALESCE(MAX(seq), 0) + 1 FROM update_records
 	) WHERE id = 1`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// Client-uploaded JSONL logs (persisted; admin can purge by age from Server page).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS client_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		client_id TEXT NOT NULL,
+		entry TEXT NOT NULL,
+		logged_at INTEGER NOT NULL,
+		created_at INTEGER NOT NULL
+	)`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_client_logs_client_logged ON client_logs(client_id, logged_at DESC, id DESC)`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_client_logs_created ON client_logs(created_at)`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -806,13 +827,15 @@ type logBuffer struct {
 }
 
 // clientLogBuffer stores only logs uploaded by authenticated client sessions.
-// It is deliberately separate from the server process log buffer.
+// When db is set (production), entries are persisted in server.db; otherwise
+// an in-memory ring is used (unit tests). SSE notify coalescing is always in-memory.
 type clientLogBuffer struct {
 	mu         sync.RWMutex
 	max        int
 	maxClients int
 	entries    map[string][]string
 	notifiedAt map[string]time.Time
+	db         *sql.DB
 }
 
 func newClientLogBuffer(max int) *clientLogBuffer {
@@ -822,25 +845,74 @@ func newClientLogBuffer(max int) *clientLogBuffer {
 	return &clientLogBuffer{max: max, maxClients: 1000, entries: make(map[string][]string), notifiedAt: make(map[string]time.Time)}
 }
 
+func (b *clientLogBuffer) attachDB(db *sql.DB) {
+	if b == nil || db == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.db = db
+}
+
+func clientLogEntryTimestamp(entry string, fallback time.Time) time.Time {
+	var value struct {
+		Time string `json:"time"`
+	}
+	if json.Unmarshal([]byte(entry), &value) == nil {
+		if parsed, err := time.Parse(time.RFC3339Nano, value.Time); err == nil {
+			return parsed
+		}
+		if parsed, err := time.Parse(time.RFC3339, value.Time); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
 func (b *clientLogBuffer) append(clientID, entry string) bool {
 	if b == nil || clientID == "" || len(entry) == 0 || len(entry) > 16*1024 || !json.Valid([]byte(entry)) {
 		return false
 	}
+	now := time.Now()
+	loggedAt := clientLogEntryTimestamp(entry, now)
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, exists := b.entries[clientID]; !exists && len(b.entries) >= b.maxClients {
-		for oldest := range b.entries {
-			delete(b.entries, oldest)
-			delete(b.notifiedAt, oldest)
-			break
+	if b.db != nil {
+		if _, err := b.db.Exec(
+			`INSERT INTO client_logs(client_id, entry, logged_at, created_at) VALUES (?, ?, ?, ?)`,
+			clientID, entry, loggedAt.UnixMilli(), now.UnixMilli(),
+		); err != nil {
+			slog.Warn("persist client log", "client_id", clientID, "error", err)
+			return false
 		}
+		// Soft cap per client so a noisy device cannot grow the DB without bound.
+		if b.max > 0 {
+			var count int
+			if err := b.db.QueryRow(`SELECT COUNT(*) FROM client_logs WHERE client_id = ?`, clientID).Scan(&count); err == nil && count > b.max {
+				overflow := count - b.max
+				_, _ = b.db.Exec(
+					`DELETE FROM client_logs WHERE id IN (
+						SELECT id FROM client_logs WHERE client_id = ? ORDER BY logged_at ASC, id ASC LIMIT ?
+					)`,
+					clientID, overflow,
+				)
+			}
+		}
+	} else {
+		if _, exists := b.entries[clientID]; !exists && len(b.entries) >= b.maxClients {
+			for oldest := range b.entries {
+				delete(b.entries, oldest)
+				delete(b.notifiedAt, oldest)
+				break
+			}
+		}
+		entries := append(b.entries[clientID], entry)
+		if len(entries) > b.max {
+			entries = append([]string(nil), entries[len(entries)-b.max:]...)
+		}
+		b.entries[clientID] = entries
 	}
-	entries := append(b.entries[clientID], entry)
-	if len(entries) > b.max {
-		entries = append([]string(nil), entries[len(entries)-b.max:]...)
-	}
-	b.entries[clientID] = entries
-	now := time.Now()
 	if now.Sub(b.notifiedAt[clientID]) >= time.Second {
 		b.notifiedAt[clientID] = now
 		return true
@@ -854,7 +926,109 @@ func (b *clientLogBuffer) snapshot(clientID string) string {
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	if b.db != nil {
+		rows, err := b.db.Query(
+			`SELECT entry FROM client_logs WHERE client_id = ? ORDER BY logged_at ASC, id ASC`,
+			clientID,
+		)
+		if err != nil {
+			return ""
+		}
+		defer rows.Close()
+		var lines []string
+		for rows.Next() {
+			var entry string
+			if rows.Scan(&entry) != nil {
+				continue
+			}
+			lines = append(lines, entry)
+		}
+		return strings.Join(lines, "\n")
+	}
 	return strings.Join(append([]string(nil), b.entries[clientID]...), "\n")
+}
+
+func (b *clientLogBuffer) page(clientID string, page, pageSize int) (string, int) {
+	if b == nil {
+		return "", 0
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 100
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.db != nil {
+		var total int
+		if err := b.db.QueryRow(`SELECT COUNT(*) FROM client_logs WHERE client_id = ?`, clientID).Scan(&total); err != nil {
+			return "", 0
+		}
+		offset := (page - 1) * pageSize
+		if offset >= total {
+			return "", total
+		}
+		rows, err := b.db.Query(
+			`SELECT entry FROM client_logs WHERE client_id = ? ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?`,
+			clientID, pageSize, offset,
+		)
+		if err != nil {
+			return "", total
+		}
+		defer rows.Close()
+		selected := make([]string, 0, pageSize)
+		for rows.Next() {
+			var entry string
+			if rows.Scan(&entry) != nil {
+				continue
+			}
+			selected = append(selected, entry)
+		}
+		return strings.Join(selected, "\n"), total
+	}
+	return readClientLogPage(strings.Join(append([]string(nil), b.entries[clientID]...), "\n"), page, pageSize)
+}
+
+// purgeOlderThanDays deletes client log rows whose created_at is at least minAgeDays old.
+// minAgeDays must be >= 1. Returns the number of deleted rows.
+func (b *clientLogBuffer) purgeOlderThanDays(minAgeDays int, now time.Time) (int64, error) {
+	if b == nil {
+		return 0, nil
+	}
+	if minAgeDays < 1 {
+		return 0, errors.New("min_age_days must be >= 1")
+	}
+	cutoff := now.Add(-time.Duration(minAgeDays) * 24 * time.Hour).UnixMilli()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.db != nil {
+		result, err := b.db.Exec(`DELETE FROM client_logs WHERE created_at <= ?`, cutoff)
+		if err != nil {
+			return 0, err
+		}
+		n, _ := result.RowsAffected()
+		return n, nil
+	}
+	// In-memory path: drop lines whose JSON time (or absence) is older than cutoff.
+	var removed int64
+	for clientID, entries := range b.entries {
+		kept := entries[:0]
+		for _, entry := range entries {
+			ts := clientLogEntryTimestamp(entry, time.UnixMilli(0))
+			if ts.UnixMilli() <= cutoff {
+				removed++
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		if len(kept) == 0 {
+			delete(b.entries, clientID)
+		} else {
+			b.entries[clientID] = kept
+		}
+	}
+	return removed, nil
 }
 
 // readClientLogPage returns client logs newest-first and applies pagination on the server.
@@ -985,7 +1159,8 @@ func main() {
 	}
 	defer logFile.Close()
 	serverLogBuffer := newLogBuffer(maxInMemoryLogLines)
-	clientLogs := newClientLogBuffer(500)
+	// Soft per-client cap in SQLite; admins also purge by age from the Server page.
+	clientLogs := newClientLogBuffer(20000)
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, logEventWriter{writer: logFile, buffer: serverLogBuffer}), &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 	serverIdentity, err := identity.LoadOrCreate(identityPath, "lovemilk-class-broadcaster", time.Now())
@@ -998,6 +1173,7 @@ func main() {
 		logger.Error("load server preferences", "error", err)
 		return
 	}
+	clientLogs.attachDB(serverPreferences.db)
 	persistedSnapshot, err := serverPreferences.loadConfigSnapshot(time.Now())
 	if err != nil {
 		logger.Error("load config snapshot", "error", err)
@@ -1134,6 +1310,7 @@ func main() {
 	go dispatchMessages(ctx, messageStore, sessionHub, configManager, deviceRegistry)
 	go probeClientListeners(ctx, serverIdentity, deviceRegistry, configManager, sessionHub)
 	go runRetentionCleanup(ctx, messageStore, deviceRegistry)
+	go runMessageTTLCleanup(ctx, messageStore, configManager)
 	go runSessionEndWatcher(ctx, deviceRegistry, sessionHub)
 
 	go func() {
@@ -1190,6 +1367,13 @@ type retentionCleanupResult struct {
 	RanAt           int64 `json:"ran_at"`
 }
 
+type messageTTLCleanupResult struct {
+	TTLHours        int   `json:"ttl_hours"`
+	RetentionHours  int   `json:"retention_hours"`
+	MessagesRemoved int   `json:"messages_removed"`
+	RanAt           int64 `json:"ran_at"`
+}
+
 func purgeExpiredHistory(store *broadcast.Store, registry *session.Registry, now time.Time) retentionCleanupResult {
 	result := retentionCleanupResult{MaxAgeDays: 185, RanAt: now.UnixMilli()}
 	if store != nil {
@@ -1203,6 +1387,31 @@ func purgeExpiredHistory(store *broadcast.Store, registry *session.Registry, now
 	}
 	if result.DevicesRemoved > 0 {
 		managementEvents.publish("devices")
+	}
+	return result
+}
+
+// purgeRecentMessagesByTTL deletes every message whose created_at is at least
+// message_ttl_hours×2 old. Delivery expiry (expires_at = created + ttl) still
+// marks pending/sent as expired earlier; this removes the history rows from the
+// admin "最近消息" list. The 185-day job remains as a hard ceiling for messages
+// and idle devices.
+func purgeRecentMessagesByTTL(store *broadcast.Store, ttl time.Duration, now time.Time) messageTTLCleanupResult {
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	retention := ttl * 2
+	result := messageTTLCleanupResult{
+		TTLHours:       int(ttl / time.Hour),
+		RetentionHours: int(retention / time.Hour),
+		RanAt:          now.UnixMilli(),
+	}
+	if store == nil {
+		return result
+	}
+	result.MessagesRemoved = store.PurgeOlderThan(now, retention)
+	if result.MessagesRemoved > 0 {
+		managementEvents.publish("messages")
 	}
 	return result
 }
@@ -1244,6 +1453,38 @@ func runRetentionCleanup(ctx context.Context, store *broadcast.Store, registry *
 	}
 	runOnce(time.Now())
 	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			runOnce(now)
+		}
+	}
+}
+
+// runMessageTTLCleanup deletes messages older than message_ttl_hours×2 so the
+// admin recent-message list stays aligned with the configured retention window.
+// Runs more often than the 185-day job because TTL is typically hours, not months.
+func runMessageTTLCleanup(ctx context.Context, store *broadcast.Store, configManager *config.Manager) {
+	runOnce := func(now time.Time) {
+		ttl := 24 * time.Hour
+		if configManager != nil {
+			if current := configManager.Current().MessageTTL; current > 0 {
+				ttl = current
+			}
+		}
+		result := purgeRecentMessagesByTTL(store, ttl, now)
+		if result.MessagesRemoved > 0 {
+			slog.Info("message TTL cleanup completed",
+				"ttl_hours", result.TTLHours,
+				"retention_hours", result.RetentionHours,
+				"messages_removed", result.MessagesRemoved)
+		}
+	}
+	runOnce(time.Now())
+	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1427,7 +1668,8 @@ func serveTLSConnection(ctx context.Context, raw net.Conn, serverIdentity identi
 		serveUpdateDownloadSession(ctx, conn, clientID, clientIP, clientPort, remoteAddr, preferences, serverIdentity)
 		return
 	}
-	registry.UpdateClientVersion(clientEdKey, request.ClientVersion)
+	registry.UpdateClientVersion(clientEdKey, request.ClientVersion, request.ClientBuildDate)
+	registry.UpdateClientFonts(clientEdKey, request.AvailableFonts, request.PlatformDefaultFont)
 	listenerAddress := ""
 	if host, _, splitErr := net.SplitHostPort(conn.RemoteAddr().String()); splitErr == nil {
 		listenerAddress = host
@@ -1441,6 +1683,8 @@ func serveTLSConnection(ctx context.Context, raw net.Conn, serverIdentity identi
 	}
 	response.ConnectionMode = registry.ConnectionModeFor(clientID)
 	response.ConnectAllowed = session.ReconnectAllowed(response.ConnectionMode, request.ReconnectProbe, request.ManualConnect)
+	response.DefaultFontFamily = registry.DefaultFontFamilyFor(clientID)
+	response.DefaultFontSize = registry.DefaultFontSizeFor(clientID)
 	payload, err := protocol.MarshalBSON(response)
 	if err != nil {
 		return
@@ -1625,9 +1869,12 @@ type messageEnvelope struct {
 	ExpiresAt                   int64                  `bson:"expires_at"`
 	DisplayPosition             *string                `bson:"display_position,omitempty"`
 	DisplayDurationRatio        *float64               `bson:"display_duration_ratio,omitempty"`
+	FontSize                    *string                `bson:"font_size,omitempty"`
+	SpeechRate                  *float64               `bson:"speech_rate,omitempty"`
 	AsDefault                   bool                   `bson:"as_default"`
 	DefaultDisplayPosition      string                 `bson:"default_display_position,omitempty"`
 	DefaultDisplayDurationRatio float64                `bson:"default_display_duration_ratio"`
+	DefaultSpeechRate           float64                `bson:"default_speech_rate"`
 	Speech                      []broadcast.SpeechNode `bson:"speech,omitempty"`
 }
 
@@ -1696,22 +1943,31 @@ func dispatchMessages(ctx context.Context, store *broadcast.Store, hub *session.
 				ExpiresAt: record.ExpiresAt.UnixMilli(), Speech: record.Message.Speech,
 				DisplayPosition:             record.Message.DisplayPosition,
 				DisplayDurationRatio:        record.Message.DisplayDurationRatio,
+				FontSize:                    record.Message.FontSize,
+				SpeechRate:                  record.Message.SpeechRate,
 				AsDefault:                   record.Message.AsDefault,
 				DefaultDisplayPosition:      currentConfig.DisplayPosition,
 				DefaultDisplayDurationRatio: currentConfig.DisplayDurationRatio,
+				DefaultSpeechRate:           currentConfig.SpeechRate,
 			})
 			if err != nil {
+				slog.Error("message envelope marshal failed", "message_id", record.Message.ID.String(), "error", err)
 				_ = store.Retry(record.Message.ID)
 				continue
 			}
 			packet := protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.Message, 0, 0, payload)
-			allSent := true
 			messageChanged := false
 			offlinePending := 0
+			onlineFailed := 0
+			onlineNeeded := 0
+			onlineSent := 0
+			progressedClients := 0 // already past pending, or newly marked sent this round
 			for _, target := range targets {
+				status, hasStatus := record.Deliveries[target]
 				// 已经写入 sent/最终回执的目标无需在下一轮重复发送；只有 pending
 				// 目标在断线恢复后继续补投，避免离线重试造成重复弹窗。
-				if status, ok := record.Deliveries[target]; ok && status != broadcast.DeliveryPending {
+				if hasStatus && status != broadcast.DeliveryPending {
+					progressedClients++
 					if !store.ShouldRedeliver(record.Message.ID, target, now, ackTimeout) {
 						continue
 					}
@@ -1720,39 +1976,55 @@ func dispatchMessages(ctx context.Context, store *broadcast.Store, hub *session.
 				// Offline targets stay pending and are retried later without hub.Send or WARN spam.
 				if !hub.Online(target) {
 					offlinePending++
-					allSent = false
 					continue
 				}
+				onlineNeeded++
 				if err := hub.Send(target, packet); err != nil {
 					// Race: session dropped between Online check and Send.
 					if errors.Is(err, session.ErrClientOffline) {
 						offlinePending++
-						allSent = false
+						onlineNeeded--
 						continue
 					}
 					slog.Warn("message delivery failed", "message_id", record.Message.ID.String(), "client_id", target, "error", err)
-					allSent = false
+					onlineFailed++
 				} else {
-					if record.Deliveries[target] != broadcast.DeliverySent {
-						messageChanged = true
-					}
+					prev := status
 					if !store.MarkSent(record.Message.ID, target, now) {
 						slog.Warn("message delivery bookkeeping failed", "message_id", record.Message.ID.String(), "client_id", target)
-						allSent = false
+						onlineFailed++
+					} else {
+						onlineSent++
+						progressedClients++
+						// Only count a real pending→sent transition as a UI-visible change.
+						// Re-sends after ack timeout must not spam SSE "messages" refresh.
+						if !hasStatus || prev == broadcast.DeliveryPending {
+							messageChanged = true
+						}
 					}
 				}
 			}
-			if allSent {
-				_ = store.Complete(record.Message.ID, now)
-			} else {
+			// Mark the message "sent" once every currently-online attempt succeeded
+			// and at least one client has progressed past pending. Remaining offline
+			// targets keep per-client pending rows and are retried later — do not
+			// leave the admin UI stuck on 待投递 forever when some peers are offline.
+			onlineOK := onlineFailed == 0 && onlineNeeded == onlineSent
+			if onlineOK && progressedClients > 0 {
+				if store.Complete(record.Message.ID, now) {
+					messageChanged = true
+				}
+			}
+			if !onlineOK || offlinePending > 0 {
 				// Back off when waiting on offline clients so the 250ms ticker does not busy-poll hub.Send.
 				delay := 5 * time.Second
-				if offlinePending > 0 && offlinePending == len(targets) {
+				if offlinePending > 0 && onlineNeeded == 0 {
 					delay = 15 * time.Second
 				}
 				_ = store.RetryAfter(record.Message.ID, now.Add(delay))
 			}
-			if messageChanged || allSent {
+			// Publish only when deliveries/status actually changed — offline retries
+			// with no new sends must not flood the management SSE stream.
+			if messageChanged {
 				managementEvents.publish("messages")
 			}
 		}
@@ -1828,6 +2100,8 @@ type createMessageRequest struct {
 	ExpiresAt            *time.Time             `json:"expires_at"`
 	DisplayPosition      *string                `json:"display_position"`
 	DisplayDurationRatio *float64               `json:"display_duration_ratio"`
+	FontSize             *string                `json:"font_size"`
+	SpeechRate           *float64               `json:"speech_rate"`
 }
 
 type messageResponse struct {
@@ -1841,6 +2115,8 @@ type messageResponse struct {
 	ExpiresAt            int64                               `json:"expires_at"`
 	DisplayPosition      *string                             `json:"display_position,omitempty"`
 	DisplayDurationRatio *float64                            `json:"display_duration_ratio,omitempty"`
+	FontSize             *string                             `json:"font_size,omitempty"`
+	SpeechRate           *float64                            `json:"speech_rate,omitempty"`
 	TTSEnabled           bool                                `json:"tts_enabled"`
 	Deliveries           map[string]broadcast.DeliveryStatus `json:"deliveries,omitempty"`
 	DeliveryHistory      map[string]broadcast.DeliveryStatus `json:"delivery_history,omitempty"`
@@ -2919,8 +3195,10 @@ func buildUpdateAvailablePayload(input publishUpdateRequest, record updateRecord
 }
 
 type renameDeviceRequest struct {
-	Label      string  `json:"label"`
-	ForcedMode *string `json:"forced_mode"`
+	Label             string  `json:"label"`
+	ForcedMode        *string `json:"forced_mode"`
+	DefaultFontFamily *string `json:"default_font_family"`
+	DefaultFontSize   *string `json:"default_font_size"`
 }
 
 type deviceResponse struct {
@@ -2941,6 +3219,7 @@ type configUpdateRequest struct {
 	MaxRepeatExpansion           *int32   `json:"max_repeat_expansion"`
 	DisplayPosition              *string  `json:"default_display_position"`
 	DisplayDurationRatio         *float64 `json:"default_display_duration_ratio"`
+	SpeechRate                   *float64 `json:"default_speech_rate"`
 	ListenerProbeIntervalSeconds *int32   `json:"listener_probe_interval_seconds"`
 	ListenerProbeDurationHours   *int32   `json:"listener_probe_duration_hours"`
 	ListenerProbeResetDays       *int32   `json:"listener_probe_reset_days"`
@@ -2960,6 +3239,7 @@ type configResponse struct {
 	MaxRepeatExpansion    int32   `json:"max_repeat_expansion"`
 	DisplayPosition       string  `json:"default_display_position"`
 	DisplayDurationRatio  float64 `json:"display_duration_ratio"`
+	SpeechRate            float64 `json:"default_speech_rate"`
 	ListenerProbeInterval int64   `json:"listener_probe_interval_seconds"`
 	ListenerProbeDuration int64   `json:"listener_probe_duration_hours"`
 	ListenerProbeReset    int64   `json:"listener_probe_reset_days"`
@@ -3058,6 +3338,26 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			"devices_removed", result.DevicesRemoved)
 		c.JSON(http.StatusOK, result)
 	})
+	// Purge persisted client-uploaded logs older than N days (N >= 1).
+	router.POST("/api/v1/maintenance/purge-client-logs", func(c *gin.Context) {
+		var input struct {
+			MinAgeDays int `json:"min_age_days"`
+		}
+		if err := c.ShouldBindJSON(&input); err != nil || input.MinAgeDays < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "min_age_days must be an integer >= 1"})
+			return
+		}
+		removed, err := clientLogs.purgeOlderThanDays(input.MinAgeDays, time.Now())
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		slog.Info("client log retention cleanup completed",
+			"min_age_days", input.MinAgeDays,
+			"logs_removed", removed)
+		managementEvents.publish("all")
+		c.JSON(http.StatusOK, gin.H{"min_age_days": input.MinAgeDays, "logs_removed": removed})
+	})
 	router.GET("/api/v1/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, currentHealth(listenTLSPort, listenHTTPPort, listenUDPPort))
 	})
@@ -3130,6 +3430,7 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 		update := config.Update{
 			MaxSpeechDepth: input.MaxSpeechDepth, MaxRepeatExpansion: input.MaxRepeatExpansion,
 			DisplayPosition: input.DisplayPosition, DisplayDurationRatio: input.DisplayDurationRatio,
+			SpeechRate: input.SpeechRate,
 		}
 		if input.ListenerProbeIntervalSeconds != nil {
 			value := time.Duration(*input.ListenerProbeIntervalSeconds) * time.Second
@@ -3551,6 +3852,34 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			}
 			device, _ = registry.Get(c.Param("client_id"))
 		}
+		fontChanged := false
+		if input.DefaultFontFamily != nil {
+			if err := registry.SetDefaultFontFamily(c.Param("client_id"), *input.DefaultFontFamily); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			device, _ = registry.Get(c.Param("client_id"))
+			fontChanged = true
+		}
+		if input.DefaultFontSize != nil {
+			if err := registry.SetDefaultFontSize(c.Param("client_id"), *input.DefaultFontSize); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			device, _ = registry.Get(c.Param("client_id"))
+			fontChanged = true
+		}
+		// Font family/size are delivered on ConnectResp only — drop the live
+		// session so the client re-handshakes and applies the new defaults.
+		if fontChanged {
+			clientID := c.Param("client_id")
+			if normalized, normErr := session.NormalizeClientID(clientID); normErr == nil {
+				registry.RecordIntentionalSessionEnd(normalized, session.SessionEndAdmin, "font_defaults_updated", time.Now())
+				hub.Disconnect(normalized)
+			} else {
+				hub.Disconnect(clientID)
+			}
+		}
 		managementEvents.publish("devices")
 		c.JSON(http.StatusOK, device)
 	})
@@ -3596,7 +3925,7 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			c.JSON(http.StatusBadRequest, gin.H{"error": "log page size must be one of 10, 15, 20, 25, 30, 50, 100 or 200"})
 			return
 		}
-		content, total := readClientLogPage(clientLogs.snapshot(clientID), page, pageSize)
+		content, total := clientLogs.page(clientID, page, pageSize)
 		c.JSON(http.StatusOK, gin.H{"content": content, "client_id": clientID, "page": page, "page_size": pageSize, "total": total})
 	})
 	router.POST("/api/v1/messages", func(c *gin.Context) {
@@ -3625,9 +3954,24 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			c.JSON(http.StatusBadRequest, gin.H{"error": "display duration ratio must be between 0 and 120"})
 			return
 		}
+		if input.SpeechRate != nil && (*input.SpeechRate < config.MinSpeechRate || *input.SpeechRate > config.MaxSpeechRate) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "speech rate must be between 0.25 and 2.0"})
+			return
+		}
 		if input.DisplayPosition != nil && !config.ValidDisplayPosition(*input.DisplayPosition) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "display position is invalid"})
 			return
+		}
+		var fontSize *string
+		if input.FontSize != nil {
+			canonical, fontErr := fontsize.Normalize(*input.FontSize)
+			if fontErr != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fontErr.Error()})
+				return
+			}
+			if canonical != "" {
+				fontSize = &canonical
+			}
 		}
 		currentConfig := configManager.Current()
 		if err := broadcast.ValidateSpeech(input.Speech, currentConfig.MaxSpeechDepth, currentConfig.MaxRepeatExpansion); err != nil {
@@ -3646,11 +3990,20 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			displayRatio = new(float64)
 			*displayRatio = currentConfig.DisplayDurationRatio
 		}
+		speechRate := input.SpeechRate
+		if speechRate == nil {
+			speechRate = new(float64)
+			*speechRate = currentConfig.SpeechRate
+			if *speechRate <= 0 {
+				*speechRate = config.DefaultSpeechRate
+			}
+		}
 		message := broadcast.Message{
 			ID: id, Priority: priority, PrioritySet: input.Priority != nil,
 			DisplayText: input.Content, Speech: input.Speech,
 			DisplayPosition: displayPosition, DisplayDurationRatio: displayRatio,
-			AsDefault: input.DisplayPosition == nil && input.DisplayDurationRatio == nil,
+			FontSize: fontSize, SpeechRate: speechRate,
+			AsDefault: input.DisplayPosition == nil && input.DisplayDurationRatio == nil && input.SpeechRate == nil,
 		}
 		if input.ExpiresAt != nil {
 			message.ExpiresAt = input.ExpiresAt.UnixMilli()
@@ -3712,6 +4065,10 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 }
 
 func toConfigResponse(snapshot config.Snapshot) configResponse {
+	speechRate := snapshot.SpeechRate
+	if speechRate <= 0 {
+		speechRate = config.DefaultSpeechRate
+	}
 	return configResponse{
 		ConfigID: snapshot.ID, IssuedAt: snapshot.IssuedAt,
 		HeartbeatInterval: int64(snapshot.HeartbeatInterval / time.Second),
@@ -3720,6 +4077,7 @@ func toConfigResponse(snapshot config.Snapshot) configResponse {
 		AckTimeout:         int64(snapshot.AckTimeout / time.Second),
 		MaxRepeatExpansion: snapshot.MaxRepeatExpansion, DisplayPosition: snapshot.DisplayPosition,
 		DisplayDurationRatio:  snapshot.DisplayDurationRatio,
+		SpeechRate:            speechRate,
 		ListenerProbeInterval: int64(snapshot.ListenerProbeInterval / time.Second),
 		ListenerProbeDuration: int64(snapshot.ListenerProbeDuration / time.Hour),
 		ListenerProbeReset:    int64(snapshot.ListenerProbeReset / (24 * time.Hour)),
@@ -3841,6 +4199,8 @@ func toMessageResponse(record broadcast.Record) messageResponse {
 		CreatedAt: record.CreatedAt.UnixMilli(), ExpiresAt: record.ExpiresAt.UnixMilli(),
 		DisplayPosition:      record.Message.DisplayPosition,
 		DisplayDurationRatio: record.Message.DisplayDurationRatio,
+		FontSize:             record.Message.FontSize,
+		SpeechRate:           record.Message.SpeechRate,
 		TTSEnabled:           len(record.Message.Speech) > 0,
 		Deliveries:           cloneDeliveryStatuses(record.Deliveries),
 		DeliveryHistory:      cloneDeliveryStatuses(record.DeliveryHistory),

@@ -41,19 +41,55 @@ export function formatUpdatePackageSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-/** Match client/core/delivery.py display_duration_ms (CJK 1.5 units, ASCII 1.0). */
+/**
+ * Approximate client/core/delivery.py display_duration_ms for the send-dialog hint.
+ * Client uses jieba (1 unit/token); admin preview uses a lightweight CJK-run /
+ * ASCII-word splitter so the estimate stays close without shipping jieba to the browser.
+ */
 export function displayDurationMs(text: string, ratio: number, maximumMs = 120_000): number {
   if (ratio <= 0) return 0
-  let units = 0
-  for (const character of text) {
+  const units = Math.max(1, approximateTokenCount(text))
+  return Math.min(maximumMs, Math.max(1000, Math.trunc(units * ratio * 1000)))
+}
+
+function approximateTokenCount(text: string): number {
+  const value = String(text || '')
+  if (!value.trim()) return 0
+  const tokens: string[] = []
+  let buf = ''
+  let mode = ''
+  const flush = () => {
+    if (buf) tokens.push(buf)
+    buf = ''
+    mode = ''
+  }
+  for (const character of value) {
     const code = character.codePointAt(0) ?? 0
     const isCjk =
       (code >= 0x3400 && code <= 0x4dbf) ||
       (code >= 0x4e00 && code <= 0x9fff) ||
       (code >= 0xf900 && code <= 0xfaff)
-    units += isCjk ? 1.5 : 1.0
+    if (/\s/u.test(character)) {
+      flush()
+      continue
+    }
+    if (isCjk) {
+      if (mode !== 'cjk') flush()
+      mode = 'cjk'
+      buf += character
+      continue
+    }
+    if (/[A-Za-z0-9'’-]/u.test(character)) {
+      if (mode !== 'ascii') flush()
+      mode = 'ascii'
+      buf += character
+      continue
+    }
+    flush()
+    tokens.push(character)
   }
-  return Math.min(maximumMs, Math.max(1000, Math.trunc(units * ratio * 1000)))
+  flush()
+  return tokens.length
 }
 
 export function formatDisplayDurationMs(ms: number): string {

@@ -6,12 +6,20 @@ const sectionTitles: Record<SectionKey, string> = {
   devices: '客户端',
   updates: '更新发布',
   settings: '配置',
-  server: '服务端'
+  server: '服务端',
+  about: '关于'
 }
 
 export function sectionFromRoute(route: RouteLocationNormalized): SectionKey {
   const name = typeof route.name === 'string' ? route.name : ''
-  if (name === 'messages' || name === 'devices' || name === 'updates' || name === 'settings' || name === 'server') {
+  if (
+    name === 'messages' ||
+    name === 'devices' ||
+    name === 'updates' ||
+    name === 'settings' ||
+    name === 'server' ||
+    name === 'about'
+  ) {
     return name
   }
   return 'messages'
@@ -30,7 +38,7 @@ export function normalizeLegacyHash() {
   const raw = window.location.hash.replace(/^#/, '')
   if (!raw || raw.startsWith('/')) return
   const section = raw === 'logs' ? 'server' : raw
-  if (['messages', 'devices', 'updates', 'settings', 'server'].includes(section)) {
+  if (['messages', 'devices', 'updates', 'settings', 'server', 'about'].includes(section)) {
     window.history.replaceState(null, '', `#/${section}`)
   }
 }
@@ -71,6 +79,12 @@ const router = createRouter({
       name: 'server',
       component: () => import('../views/ServerView.vue'),
       meta: { section: 'server' as SectionKey, title: sectionTitles.server }
+    },
+    {
+      path: '/about',
+      name: 'about',
+      component: () => import('../views/AboutView.vue'),
+      meta: { section: 'about' as SectionKey, title: sectionTitles.about }
     },
     { path: '/:pathMatch(.*)*', redirect: '/messages' }
   ]

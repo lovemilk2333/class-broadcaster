@@ -13,18 +13,14 @@ MAX_DISPLAY_DURATION_MS = 120_000
 
 
 def display_duration_ms(text: str, ratio: float, maximum_ms: int = MAX_DISPLAY_DURATION_MS) -> int:
-    """按字符权重计算显示时长，并将自动关闭时间限制在两分钟内。"""
+    """按 jieba Token 数计算显示时长（每 Token = 1.0），上限两分钟。"""
     if ratio <= 0:
         return 0
-    units = 0.0
-    for character in text:
-        codepoint = ord(character)
-        is_cjk = (
-            0x3400 <= codepoint <= 0x4DBF
-            or 0x4E00 <= codepoint <= 0x9FFF
-            or 0xF900 <= codepoint <= 0xFAFF
-        )
-        units += 1.5 if is_cjk else 1.0
+    from .tokenize import token_units
+
+    units = token_units(text)
+    if units <= 0:
+        units = 1.0
     return min(maximum_ms, max(1000, int(units * ratio * 1000)))
 
 
@@ -41,6 +37,8 @@ class ConfigSnapshot(BaseModel):
     ack_timeout_seconds: int = Field(default=300, gt=0)
     display_position: str = Field(default="center", alias="default_display_position")
     display_duration_ratio: float = Field(default=0.4, ge=0, le=120, alias="default_display_duration_ratio")
+    # Default TTS speed multiplier (1.0 = normal). Wire alias matches Go snapshot.
+    speech_rate: float = Field(default=0.75, ge=0.25, le=2.0, alias="default_speech_rate")
     # Listener idle is S->C listen-mode only; default 60s when snapshot omits it.
     listener_idle_timeout_seconds: int = Field(default=60, gt=0, le=3600)
 

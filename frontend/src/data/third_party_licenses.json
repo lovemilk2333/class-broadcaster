@@ -1,0 +1,156 @@
+{
+  "title": "开源软件版权声明",
+  "intro": "本软件使用了下列开源组件与模型。许可证信息仅供参考；完整条款以各项目官方许可证文本为准。",
+  "entries": [
+    {
+      "name": "lovemilk class broadcaster",
+      "license": "BSD-3-Clause",
+      "url": "https://github.com/lovemilk/class-broadcaster",
+      "note": "本项目"
+    },
+    {
+      "name": "gin-gonic/gin",
+      "license": "MIT",
+      "url": "https://github.com/gin-gonic/gin",
+      "note": "Go 服务端"
+    },
+    {
+      "name": "klauspost/compress",
+      "license": "BSD-3-Clause / Apache-2.0 / MIT",
+      "url": "https://github.com/klauspost/compress",
+      "note": "Go 压缩库"
+    },
+    {
+      "name": "go.mongodb.org/mongo-driver",
+      "license": "Apache-2.0",
+      "url": "https://github.com/mongodb/mongo-go-driver",
+      "note": "Go BSON / MongoDB 驱动"
+    },
+    {
+      "name": "Vue",
+      "license": "MIT",
+      "url": "https://github.com/vuejs/core",
+      "note": "管理端前端"
+    },
+    {
+      "name": "Vue Router",
+      "license": "MIT",
+      "url": "https://github.com/vuejs/router",
+      "note": "管理端前端"
+    },
+    {
+      "name": "Pinia",
+      "license": "MIT",
+      "url": "https://github.com/vuejs/pinia",
+      "note": "管理端前端"
+    },
+    {
+      "name": "PrimeVue",
+      "license": "MIT",
+      "url": "https://github.com/primefaces/primevue",
+      "note": "管理端前端"
+    },
+    {
+      "name": "PrimeIcons",
+      "license": "MIT",
+      "url": "https://github.com/primefaces/primeicons",
+      "note": "管理端前端"
+    },
+    {
+      "name": "Vite",
+      "license": "MIT",
+      "url": "https://github.com/vitejs/vite",
+      "note": "管理端构建工具"
+    },
+    {
+      "name": "TypeScript",
+      "license": "Apache-2.0",
+      "url": "https://github.com/microsoft/TypeScript",
+      "note": "管理端前端"
+    },
+    {
+      "name": "cryptography",
+      "license": "Apache-2.0 OR BSD-3-Clause",
+      "url": "https://github.com/pyca/cryptography",
+      "note": "Python 客户端"
+    },
+    {
+      "name": "argon2-cffi",
+      "license": "MIT",
+      "url": "https://github.com/hynek/argon2-cffi",
+      "note": "Python 客户端"
+    },
+    {
+      "name": "loguru",
+      "license": "MIT",
+      "url": "https://github.com/Delgan/loguru",
+      "note": "Python 客户端"
+    },
+    {
+      "name": "pydantic",
+      "license": "MIT",
+      "url": "https://github.com/pydantic/pydantic",
+      "note": "Python 客户端"
+    },
+    {
+      "name": "pymongo",
+      "license": "Apache-2.0",
+      "url": "https://github.com/mongodb/mongo-python-driver",
+      "note": "Python 客户端（BSON）"
+    },
+    {
+      "name": "zstandard",
+      "license": "BSD-3-Clause",
+      "url": "https://github.com/indygreg/python-zstandard",
+      "note": "Python 客户端"
+    },
+    {
+      "name": "jieba",
+      "license": "MIT",
+      "url": "https://github.com/fxsjy/jieba",
+      "note": "Python 客户端（分词 / 显示时长）"
+    },
+    {
+      "name": "onnxruntime",
+      "license": "MIT",
+      "url": "https://github.com/microsoft/onnxruntime",
+      "note": "Python 客户端（TTS 推理）"
+    },
+    {
+      "name": "piper-plus",
+      "license": "MIT",
+      "url": "https://github.com/ayutaz/piper-plus",
+      "note": "Windows 首选离线 TTS"
+    },
+    {
+      "name": "piper-tts",
+      "license": "MIT",
+      "url": "https://github.com/rhasspy/piper",
+      "note": "Linux 首选离线 TTS"
+    },
+    {
+      "name": "PySide6 / PySide2",
+      "license": "LGPL-3.0",
+      "url": "https://code.qt.io/cgit/pyside/pyside-setup.git",
+      "note": "Windows PySide6；Linux/Debian PySide2"
+    },
+    {
+      "name": "pywin32",
+      "license": "PSF / BSD-style",
+      "url": "https://github.com/mhammond/pywin32",
+      "note": "Windows 客户端"
+    },
+    {
+      "name": "piper-plus Tsukuyomi 模型",
+      "license": "tsukuyomi-chan-corpus",
+      "url": "https://huggingface.co/ayousanz/piper-plus-tsukuyomi-chan",
+      "note": "Windows piper-plus 语音模型"
+    },
+    {
+      "name": "rhasspy/piper-voices",
+      "license": "MIT",
+      "url": "https://huggingface.co/rhasspy/piper-voices",
+      "note": "Linux piper-tts 语音模型（zh_CN / en_US）"
+    }
+  ]
+}

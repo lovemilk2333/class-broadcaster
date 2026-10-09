@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -178,7 +179,13 @@ CREATE TABLE IF NOT EXISTS store_warnings (
 	if err := ensureColumn(s.db, "messages", "as_default", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("upgrade messages: %w", err)
 	}
-	rows, err := s.db.Query(`SELECT message_id, queue_seq, priority, priority_set, content, display_position, display_duration_ratio, as_default, speech_json, created_at, expires_at, status FROM messages ORDER BY created_at ASC, message_id ASC`)
+	if err := ensureColumn(s.db, "messages", "font_size", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("upgrade messages font_size: %w", err)
+	}
+	if err := ensureColumn(s.db, "messages", "speech_rate", "REAL"); err != nil {
+		return fmt.Errorf("upgrade messages speech_rate: %w", err)
+	}
+	rows, err := s.db.Query(`SELECT message_id, queue_seq, priority, priority_set, content, display_position, display_duration_ratio, as_default, COALESCE(font_size,''), speech_rate, speech_json, created_at, expires_at, status FROM messages ORDER BY created_at ASC, message_id ASC`)
 	if err != nil {
 		return fmt.Errorf("load messages: %w", err)
 	}
@@ -186,9 +193,9 @@ CREATE TABLE IF NOT EXISTS store_warnings (
 	for rows.Next() {
 		var idText, content, status string
 		var queueSeq, priority, prioritySet, asDefault, createdAt, expiresAt int64
-		var position, speechJSON sql.NullString
-		var ratio sql.NullFloat64
-		if err := rows.Scan(&idText, &queueSeq, &priority, &prioritySet, &content, &position, &ratio, &asDefault, &speechJSON, &createdAt, &expiresAt, &status); err != nil {
+		var position, speechJSON, fontSize sql.NullString
+		var ratio, speechRate sql.NullFloat64
+		if err := rows.Scan(&idText, &queueSeq, &priority, &prioritySet, &content, &position, &ratio, &asDefault, &fontSize, &speechRate, &speechJSON, &createdAt, &expiresAt, &status); err != nil {
 			return fmt.Errorf("scan message: %w", err)
 		}
 		id, err := ParseMessageID(idText)
@@ -203,6 +210,16 @@ CREATE TABLE IF NOT EXISTS store_warnings (
 		if ratio.Valid {
 			value := ratio.Float64
 			message.DisplayDurationRatio = &value
+		}
+		if fontSize.Valid {
+			value := strings.TrimSpace(fontSize.String)
+			if value != "" {
+				message.FontSize = &value
+			}
+		}
+		if speechRate.Valid {
+			value := speechRate.Float64
+			message.SpeechRate = &value
 		}
 		if speechJSON.Valid && speechJSON.String != "" && speechJSON.String != "null" {
 			if err := json.Unmarshal([]byte(speechJSON.String), &message.Speech); err != nil {
@@ -495,7 +512,7 @@ func (s *Store) persistSQLiteLocked() error {
 	if _, err = tx.Exec(`DELETE FROM store_warnings`); err != nil {
 		return rollback(err)
 	}
-	messageStmt, err := tx.Prepare(`INSERT INTO messages(message_id, queue_seq, priority, priority_set, content, display_position, display_duration_ratio, as_default, speech_json, created_at, expires_at, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	messageStmt, err := tx.Prepare(`INSERT INTO messages(message_id, queue_seq, priority, priority_set, content, display_position, display_duration_ratio, as_default, font_size, speech_rate, speech_json, created_at, expires_at, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return rollback(err)
 	}
@@ -547,7 +564,15 @@ func (s *Store) persistSQLiteLocked() error {
 		if record.Message.DisplayDurationRatio != nil {
 			ratio = *record.Message.DisplayDurationRatio
 		}
-		if _, err = messageStmt.Exec(record.Message.ID.String(), int64(record.Message.QueueSeq), record.Message.Priority, boolInt(record.Message.PrioritySet), record.Message.DisplayText, position, ratio, boolInt(record.Message.AsDefault), string(speech), record.Message.CreatedAt, record.Message.ExpiresAt, record.Status, time.Now().UnixMilli()); err != nil {
+		fontSize := ""
+		if record.Message.FontSize != nil {
+			fontSize = strings.TrimSpace(*record.Message.FontSize)
+		}
+		var speechRate any
+		if record.Message.SpeechRate != nil {
+			speechRate = *record.Message.SpeechRate
+		}
+		if _, err = messageStmt.Exec(record.Message.ID.String(), int64(record.Message.QueueSeq), record.Message.Priority, boolInt(record.Message.PrioritySet), record.Message.DisplayText, position, ratio, boolInt(record.Message.AsDefault), fontSize, speechRate, string(speech), record.Message.CreatedAt, record.Message.ExpiresAt, record.Status, time.Now().UnixMilli()); err != nil {
 			return rollback(err)
 		}
 		for _, clientID := range record.TargetClients {

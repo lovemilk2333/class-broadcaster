@@ -30,6 +30,15 @@ type ConnectRequest struct {
 	ReconnectProbe  bool   `bson:"reconnect_probe,omitempty"`
 	ManualConnect   bool   `bson:"manual_connect,omitempty"`
 	ClientVersion   string `bson:"client_version,omitempty"`
+	// ClientBuildDate is the stamped build time "yyyy-mm-dd HH:MM:SS.xxxx±xx:xx"
+	// (or "dev"). Empty on older clients; version comparisons still use ClientVersion only.
+	ClientBuildDate string `bson:"client_build_date,omitempty"`
+	// AvailableFonts is a capped list of UI font families installed on the client
+	// (for admin font pickers / future message-level union). Empty on older clients.
+	AvailableFonts []string `bson:"available_fonts,omitempty"`
+	// PlatformDefaultFont is the client's resolved platform default family
+	// (e.g. Microsoft YaHei / Noto Sans CJK SC). Empty on older clients.
+	PlatformDefaultFont string `bson:"platform_default_font,omitempty"`
 	// UpdateDownload marks a short-lived TLS session used only to fetch an update package.
 	// The server accepts the handshake then serves UpdateDownloadReq/Resp and closes.
 	UpdateDownload bool `bson:"update_download,omitempty"`
@@ -45,6 +54,12 @@ type ConnectResponse struct {
 	Config          *config.Snapshot `bson:"config,omitempty"`
 	ConnectionMode  string           `bson:"connection_mode,omitempty"`
 	ConnectAllowed  bool             `bson:"connect_allowed"`
+	// DefaultFontFamily is an optional per-device admin override. Empty means the
+	// client uses its platform default ("(默认)").
+	DefaultFontFamily string `bson:"default_font_family,omitempty"`
+	// DefaultFontSize is an optional per-device admin expression (empty = client built-in 25vh).
+	// Examples: "38px", "1.2em", "5vw", "25vh". Legacy integer values are accepted by older clients only.
+	DefaultFontSize string `bson:"default_font_size,omitempty"`
 }
 
 func ValidateRequest(request ConnectRequest, certificatePublicKey ed25519.PublicKey) error {

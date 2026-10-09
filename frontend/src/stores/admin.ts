@@ -19,6 +19,7 @@ function defaultConfigForm(settings: ReturnType<typeof useSettingsStore>): Confi
     max_repeat_expansion: 100,
     default_display_position: settings.defaultDisplayPosition,
     display_duration_ratio: settings.defaultDisplayDurationRatio,
+    default_speech_rate: 0.75,
     listener_probe_interval_seconds: 60,
     listener_probe_duration_hours: 12,
     listener_probe_reset_days: 31,
@@ -38,6 +39,7 @@ function configComparable(value: ConfigForm) {
     max_repeat_expansion: value.max_repeat_expansion,
     default_display_position: value.default_display_position,
     display_duration_ratio: value.display_duration_ratio,
+    default_speech_rate: value.default_speech_rate,
     listener_probe_interval_seconds: value.listener_probe_interval_seconds,
     listener_probe_duration_hours: value.listener_probe_duration_hours,
     listener_probe_reset_days: value.listener_probe_reset_days,
@@ -82,6 +84,7 @@ export const useAdminStore = defineStore('admin', () => {
   const shutdownLoading = ref(false)
   const refreshLoading = ref(false)
   const purgeExpiredLoading = ref(false)
+  const purgeClientLogsLoading = ref(false)
   const withdrawingMessageId = ref<string | null>(null)
   const approving = ref(false)
   const sending = ref(false)
@@ -167,32 +170,35 @@ export const useAdminStore = defineStore('admin', () => {
     }
   }
 
-  async function loadMessages() {
-    messagesLoading.value = true
+  async function loadMessages(options: { silent?: boolean } = {}) {
+    const silent = Boolean(options.silent)
+    if (!silent) messagesLoading.value = true
     try {
       const response = await fetch('/api/v1/messages')
       if (!response.ok) throw new Error('加载消息失败')
       const data = await response.json()
       messages.value = data.items ?? []
     } finally {
-      messagesLoading.value = false
+      if (!silent) messagesLoading.value = false
     }
   }
 
-  async function loadDevices() {
-    devicesLoading.value = true
+  async function loadDevices(options: { silent?: boolean } = {}) {
+    const silent = Boolean(options.silent)
+    if (!silent) devicesLoading.value = true
     try {
       const response = await fetch('/api/v1/devices')
       if (!response.ok) throw new Error('加载客户端失败')
       const data = await response.json()
       devices.value = Array.isArray(data.items) ? data.items : []
     } finally {
-      devicesLoading.value = false
+      if (!silent) devicesLoading.value = false
     }
   }
 
-  async function loadUpdates() {
-    updatesLoading.value = true
+  async function loadUpdates(options: { silent?: boolean } = {}) {
+    const silent = Boolean(options.silent)
+    if (!silent) updatesLoading.value = true
     try {
       const response = await fetch('/api/v1/updates')
       if (!response.ok) {
@@ -204,14 +210,16 @@ export const useAdminStore = defineStore('admin', () => {
     } catch (error) {
       toast.add({ severity: 'error', summary: error instanceof Error ? error.message : '加载更新记录失败', life: 3000 })
     } finally {
-      updatesLoading.value = false
+      if (!silent) updatesLoading.value = false
     }
   }
 
-  async function loadConfig(force = false) {
+  async function loadConfig(forceOrOptions: boolean | { force?: boolean; silent?: boolean } = false) {
+    const force = typeof forceOrOptions === 'boolean' ? forceOrOptions : Boolean(forceOrOptions.force)
+    const silent = typeof forceOrOptions === 'boolean' ? false : Boolean(forceOrOptions.silent)
     // SSE 配置事件可能在用户编辑期间到达；保留本地未发布草稿，避免远端刷新覆盖输入。
     if (configDirty.value && !force) return
-    configLoading.value = true
+    if (!silent) configLoading.value = true
     try {
       const response = await fetch('/api/v1/config')
       if (!response.ok) throw new Error('加载配置失败')
@@ -221,7 +229,7 @@ export const useAdminStore = defineStore('admin', () => {
       publishedConfig.value = configComparable(configForm.value)
       settings.setDisplayDefaults(configForm.value.default_display_position, configForm.value.display_duration_ratio)
     } finally {
-      configLoading.value = false
+      if (!silent) configLoading.value = false
     }
   }
 
@@ -240,6 +248,7 @@ export const useAdminStore = defineStore('admin', () => {
           max_repeat_expansion: configForm.value.max_repeat_expansion,
           default_display_position: configForm.value.default_display_position,
           default_display_duration_ratio: configForm.value.display_duration_ratio,
+          default_speech_rate: configForm.value.default_speech_rate,
           listener_probe_interval_seconds: configForm.value.listener_probe_interval_seconds,
           listener_probe_duration_hours: configForm.value.listener_probe_duration_hours,
           listener_probe_reset_days: configForm.value.listener_probe_reset_days,
@@ -314,7 +323,8 @@ export const useAdminStore = defineStore('admin', () => {
     }
   }
 
-  async function loadLogViewPage(page: number, force = false) {
+  async function loadLogViewPage(page: number, force = false, options: { silent?: boolean } = {}) {
+    const silent = Boolean(options.silent)
     const totalPages = serverLogTotalPages.value
     const requestedPage = Math.min(totalPages, Math.max(1, Math.trunc(page) || 1))
     const globalFirst = (requestedPage - 1) * settings.pageSize
@@ -323,7 +333,7 @@ export const useAdminStore = defineStore('admin', () => {
     serverLogJumpPage.value = requestedPage
     const backendLastPage = Math.floor((globalFirst + settings.pageSize - 1) / backendLogPageSize) + 1
     if (force || backendPage !== serverLogPage.value || backendLastPage !== serverLogPage.value || serverLogEntries.value.length === 0) {
-      logsLoading.value = true
+      if (!silent) logsLoading.value = true
       try {
         const pages = Array.from({ length: backendLastPage - backendPage + 1 }, (_, index) => backendPage + index)
         const results = await Promise.all(pages.map((backend) => fetchLogPage(backend)))
@@ -332,7 +342,7 @@ export const useAdminStore = defineStore('admin', () => {
         serverLog.value = results.map((result) => result.content).filter(Boolean).join('\n')
         serverLogEntries.value = results.flatMap((result) => result.entries)
       } finally {
-        logsLoading.value = false
+        if (!silent) logsLoading.value = false
       }
     }
   }
@@ -360,13 +370,15 @@ export const useAdminStore = defineStore('admin', () => {
     await loadLogViewPage(Math.floor(first / value) + 1, true)
   }
 
-  async function openDeviceLogs(device: Device, page = 1) {
+  async function openDeviceLogs(device: Device, page = 1, options: { silent?: boolean } = {}) {
+    const silent = Boolean(options.silent)
+    const refreshingOpen = deviceLogsDialogVisible.value && deviceLogsDevice.value?.client_id === device.client_id
     deviceLogsDevice.value = device
-    deviceLogEntries.value = []
+    if (!silent || !refreshingOpen) deviceLogEntries.value = []
     deviceLogsPage.value = Math.min(deviceLogsTotalPages.value, Math.max(1, Math.trunc(page) || 1))
     deviceLogsJumpPage.value = deviceLogsPage.value
     deviceLogsDialogVisible.value = true
-    deviceLogsLoading.value = true
+    if (!silent) deviceLogsLoading.value = true
     try {
       const params = new URLSearchParams({ page: String(deviceLogsPage.value), page_size: String(settings.pageSize) })
       const response = await fetch(`/api/v1/devices/${encodeURIComponent(device.client_id)}/logs?${params.toString()}`)
@@ -379,7 +391,7 @@ export const useAdminStore = defineStore('admin', () => {
     } catch (error) {
       toast.add({ severity: 'error', summary: error instanceof Error ? error.message : '加载客户端日志失败', life: 3200 })
     } finally {
-      deviceLogsLoading.value = false
+      if (!silent) deviceLogsLoading.value = false
     }
   }
 
@@ -440,6 +452,41 @@ export const useAdminStore = defineStore('admin', () => {
     }
   }
 
+  async function purgeClientLogs(minAgeDays: number) {
+    const days = Math.trunc(Number(minAgeDays))
+    if (!Number.isFinite(days) || days < 1) {
+      toast.add({ severity: 'warn', summary: '请输入 ≥ 1 的天数', life: 2800 })
+      return
+    }
+    purgeClientLogsLoading.value = true
+    try {
+      const response = await fetch('/api/v1/maintenance/purge-client-logs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ min_age_days: days })
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.error ?? '清理客户端日志失败')
+      }
+      const data = await response.json()
+      const removed = Number(data.logs_removed ?? 0)
+      toast.add({
+        severity: 'success',
+        summary: '客户端日志已清理',
+        detail: `已删除 ${removed} 条 ≥ ${days} 日的客户端日志`,
+        life: 4200
+      })
+      if (deviceLogsDialogVisible.value && deviceLogsDevice.value) {
+        await openDeviceLogs(deviceLogsDevice.value, 1)
+      }
+    } catch (error) {
+      toast.add({ severity: 'error', summary: error instanceof Error ? error.message : '清理客户端日志失败', life: 3600 })
+    } finally {
+      purgeClientLogsLoading.value = false
+    }
+  }
+
   function applyLogFiltersAndReload() {
     applyLogFilters()
     void loadLogViewPage(1, true)
@@ -467,6 +514,7 @@ export const useAdminStore = defineStore('admin', () => {
     shutdownLoading,
     refreshLoading,
     purgeExpiredLoading,
+    purgeClientLogsLoading,
     withdrawingMessageId,
     approving,
     sending,
@@ -525,6 +573,7 @@ export const useAdminStore = defineStore('admin', () => {
     withdrawMessage,
     requestServerShutdown,
     purgeExpiredHistory,
+    purgeClientLogs,
     messageOrdinal
   }
 })

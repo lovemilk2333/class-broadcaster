@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import Button from 'primevue/button'
 import Column from 'primevue/column'
 import Dialog from 'primevue/dialog'
@@ -13,6 +13,7 @@ import DataTable from 'primevue/datatable'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import FilterableDataTable, { type FiltersModel, type FilterFieldDef } from '../components/FilterableDataTable.vue'
+import SafeInputNumber from '../components/SafeInputNumber.vue'
 import TablePagination from '../components/TablePagination.vue'
 import { useAdminStore } from '../stores/admin'
 import { useSettingsStore } from '../stores/settings'
@@ -52,10 +53,36 @@ const editingDevice = ref<Device | null>(null)
 const approvingDevice = ref<Device | null>(null)
 const editingLabel = ref('')
 const editingForcedMode = ref('auto')
+const editingDefaultFont = ref('')
+const FONT_SIZE_UNIT_OPTIONS = [
+  { label: 'px（绝对像素）', value: 'px' },
+  { label: 'em（相对 38px）', value: 'em' },
+  { label: 'vw（屏宽比例）', value: 'vw' },
+  { label: 'vh（屏高比例）', value: 'vh' }
+]
+const editingFontSizeValue = ref<number | null>(null)
+const editingFontSizeUnit = ref('px')
 const approvingLabel = ref('')
 const approvingForcedMode = ref('auto')
 const newClientId = ref('')
 const deviceLabel = ref('')
+
+const editingFontOptions = computed(() => {
+  const device = editingDevice.value
+  const platform = String(device?.platform_default_font || '').trim()
+  const defaultLabel = platform
+    ? `(默认) — ${platform}`
+    : '(默认) — 客户端平台默认字体'
+  const families = [...(device?.available_fonts ?? [])]
+  const selected = String(device?.default_font_family || '').trim()
+  if (selected && !families.some((item) => item.toLowerCase() === selected.toLowerCase())) {
+    families.push(selected)
+  }
+  return [
+    { label: defaultLabel, value: '' },
+    ...families.map((name) => ({ label: name, value: name }))
+  ]
+})
 
 const filters = ref<FiltersModel>({
   global: textFilter('', CustomFilterMatchMode.DEVICE_SEARCH),
@@ -135,12 +162,65 @@ function openApproveDevice(device: Device) {
   approveDeviceDialogVisible.value = true
 }
 
+function parseFontSizeExpr(raw: string | number | null | undefined): { value: number | null; unit: string } {
+  const text = String(raw ?? '').trim()
+  if (!text || text === '0') return { value: null, unit: 'px' }
+  if (/^\d+(\.\d+)?$/.test(text)) return { value: Number(text), unit: 'px' }
+  const match = text.match(/^(\d+(?:\.\d+)?)\s*(px|em|vw|vh)$/i)
+  if (!match) return { value: null, unit: 'px' }
+  return { value: Number(match[1]), unit: match[2].toLowerCase() }
+}
+
+function composeFontSizeExpr(value: number | null | undefined, unit: string): string {
+  if (value == null || !Number.isFinite(value) || value <= 0) return ''
+  const u = FONT_SIZE_UNIT_OPTIONS.some((item) => item.value === unit) ? unit : 'px'
+  const n = Number(value)
+  const text = Number.isInteger(n) ? String(n) : String(Number(n.toFixed(4)))
+  return `${text}${u}`
+}
+
+function deviceVersionLabel(device: Device): string {
+  const version = String(device.client_version || '').trim()
+  if (!version) return '未知'
+  const build = String(device.client_build_date || '').trim()
+  if (!build || build.toLowerCase() === 'dev') return `${version} (dev)`
+  return `${version} (${build})`
+}
+
+function deviceFontLabel(device: Device): string {
+  const override = String(device.default_font_family || '').trim()
+  if (override) return override
+  const platform = String(device.platform_default_font || '').trim()
+  return platform ? `(默认) ${platform}` : '(默认)'
+}
+
+function deviceFontTitle(device: Device): string {
+  const override = String(device.default_font_family || '').trim()
+  const platform = String(device.platform_default_font || '').trim()
+  const size = String(device.default_font_size || '').trim()
+  const parts = [
+    override ? `管理端覆盖：${override}` : '管理端覆盖：无（使用平台默认）',
+    platform ? `客户端平台默认：${platform}` : '客户端平台默认：未知（需重新握手上报）',
+    size ? `字号：${size}` : '字号：25vh（内置）'
+  ]
+  return parts.join('\n')
+}
+
 function openEditDevice(device: Device) {
   editingDevice.value = device
   editingLabel.value = device.label ?? ''
   editingForcedMode.value = device.forced_mode || 'auto'
+  editingDefaultFont.value = device.default_font_family || ''
+  const parsed = parseFontSizeExpr(device.default_font_size)
+  editingFontSizeValue.value = parsed.value
+  editingFontSizeUnit.value = parsed.unit
   editDeviceDialogVisible.value = true
 }
+
+// showClear → null; normalize back to "" so the "(默认)" option stays selected.
+watch(editingDefaultFont, (value) => {
+  if (value == null) editingDefaultFont.value = ''
+})
 
 async function approveDevice(event: FormSubmitEvent<Record<string, any>>) {
   if (!event.valid || !event.values.clientId?.trim()) return
@@ -188,6 +268,18 @@ async function approvePendingDevice() {
   }
 }
 
+function clearedFontFamily(): string {
+  // PrimeVue Select showClear sets null; JSON null is treated as "omit" by Go *string
+  // and would leave the previous override in place. Always send "" to clear.
+  const raw = editingDefaultFont.value
+  if (raw == null) return ''
+  const text = String(raw).trim()
+  if (!text || text === '(默认)' || text.toLowerCase() === '(default)' || text.toLowerCase() === 'default') {
+    return ''
+  }
+  return text
+}
+
 async function renameDevice() {
   if (!editingDevice.value) return
   admin.approving = true
@@ -195,14 +287,19 @@ async function renameDevice() {
     const response = await fetch(`/api/v1/devices/${encodeURIComponent(editingDevice.value.client_id)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: editingLabel.value.trim(), forced_mode: editingForcedMode.value })
+      body: JSON.stringify({
+        label: editingLabel.value.trim(),
+        forced_mode: editingForcedMode.value,
+        default_font_family: clearedFontFamily(),
+        default_font_size: composeFontSizeExpr(editingFontSizeValue.value, editingFontSizeUnit.value)
+      })
     })
-    if (!response.ok) throw new Error((await response.json()).error ?? '重命名失败')
+    if (!response.ok) throw new Error((await response.json()).error ?? '保存失败')
     editDeviceDialogVisible.value = false
     await admin.loadDevices()
-    toast.add({ severity: 'success', summary: '客户端名称已更新', life: 2200 })
+    toast.add({ severity: 'success', summary: '客户端已更新', life: 2200 })
   } catch (error) {
-    toast.add({ severity: 'error', summary: error instanceof Error ? error.message : '重命名失败', life: 3200 })
+    toast.add({ severity: 'error', summary: error instanceof Error ? error.message : '保存失败', life: 3200 })
   } finally {
     admin.approving = false
   }
@@ -294,7 +391,9 @@ function changeDeviceLogPage(nextPage: number) {
       </template>
       <Column field="approved_at" header="时间" style="width: 13rem"><template #body="slotProps">{{ formatDateTime(slotProps.data.approved_at) }}</template></Column>
       <Column field="label" header="名称" style="width: 14rem"><template #body="slotProps">{{ slotProps.data.label || '未命名客户端' }}</template></Column>
-      <Column field="client_version" header="当前版本" style="width: 9rem"><template #body="slotProps">{{ slotProps.data.client_version || '未知' }}</template></Column>
+      <Column field="client_version" header="当前版本" style="width: 16rem"><template #body="slotProps">
+        <span :title="deviceVersionLabel(slotProps.data)">{{ deviceVersionLabel(slotProps.data) }}</span>
+      </template></Column>
       <Column field="client_id" header="客户端唯一标识 (公钥 SHA256)"><template #body="slotProps">{{ formatPublicKeyFingerprint(slotProps.data.client_id) }}</template></Column>
       <Column field="status" header="授权状态" style="width: 8rem"><template #body="slotProps">
         <Tag :value="deviceStatusLabel(slotProps.data.status)" :severity="deviceStatusSeverity(slotProps.data.status)" />
@@ -317,8 +416,11 @@ function changeDeviceLogPage(nextPage: number) {
       <Column field="last_seen" header="最近在线" style="width: 13rem"><template #body="slotProps">{{
         slotProps.data.last_seen ? formatDateTime(slotProps.data.last_seen) : '从未连接' }}</template>
       </Column>
-      <Column header="操作" style="width: 18rem"><template #body="slotProps">
-        <div class="device-actions">
+      <Column header="默认字体" style="width: 12rem"><template #body="slotProps">
+        <span :title="deviceFontTitle(slotProps.data)">{{ deviceFontLabel(slotProps.data) }}</span>
+      </template></Column>
+      <Column header="操作" style="width: 18rem; min-width: 18rem" frozen alignFrozen="right"><template #body="slotProps">
+        <div class="device-actions table-actions">
           <Button v-if="slotProps.data.status !== 'approved'" :label="slotProps.data.status === 'revoked' ? '重新授权' : '批准'" icon="pi pi-check" size="small" :loading="admin.approving" @click="openApproveDevice(slotProps.data)" />
           <Button v-else label="编辑" icon="pi pi-pencil" text size="small" @click="openEditDevice(slotProps.data)" />
           <Button label="日志" icon="pi pi-file" text size="small" @click="admin.openDeviceLogs(slotProps.data)" />
@@ -344,12 +446,52 @@ function changeDeviceLogPage(nextPage: number) {
     </Form>
   </Dialog>
 
-  <Dialog v-model:visible="editDeviceDialogVisible" modal closable :showHeader="true" :closeOnEscape="false" :draggable="false" position="center" header="编辑客户端" class="app-dialog" :style="{ width: 'min(30rem, calc(100vw - 2rem))' }">
+  <Dialog v-model:visible="editDeviceDialogVisible" modal closable :showHeader="true" :closeOnEscape="false" :draggable="false" position="center" header="编辑客户端" class="app-dialog" :style="{ width: 'min(34rem, calc(100vw - 2rem))' }">
     <Form class="form" @submit="renameDevice">
       <label>名称<InputText v-model="editingLabel" placeholder="客户端名称" /></label>
       <label>连接模式
         <Select v-model="editingForcedMode" :options="connectionModeOptions" optionLabel="label" optionValue="value" />
       </label>
+      <label>默认正文字体
+        <Select
+          v-model="editingDefaultFont"
+          :options="editingFontOptions"
+          optionLabel="label"
+          optionValue="value"
+          filter
+          showClear
+          placeholder="(默认)"
+        />
+      </label>
+      <label>默认正文字号
+        <div class="form-row" style="gap: 0.5rem; align-items: center;">
+          <SafeInputNumber
+            v-model="editingFontSizeValue"
+            :min="0"
+            :max="editingFontSizeUnit === 'em' ? 4 : editingFontSizeUnit === 'px' ? 120 : 100"
+            :step="0.1"
+            mode="decimal"
+            :minFractionDigits="0"
+            :maxFractionDigits="4"
+            :useGrouping="false"
+            :allowEmpty="true"
+            placeholder="空 = 25vh"
+            style="flex: 1;"
+          />
+          <Select
+            v-model="editingFontSizeUnit"
+            :options="FONT_SIZE_UNIT_OPTIONS"
+            optionLabel="label"
+            optionValue="value"
+            style="width: 10rem;"
+          />
+        </div>
+      </label>
+      <small>
+        空 = 客户端内置 25vh。单位：px（16–120）、em（相对 38px，0.25–4）、vw/vh（相对激活屏幕宽/高，0.0–100）。
+        字体空 = 平台默认{{ editingDevice?.platform_default_font ? `（${editingDevice.platform_default_font}）` : '（Windows 微软雅黑 / Linux Noto Sans*）' }}。
+      </small>
+      <small v-if="!(editingDevice?.available_fonts?.length)">尚未收到该客户端字体列表（需客户端重新握手上报）。</small>
       <div class="dialog-actions"><Button type="submit" label="保存" icon="pi pi-save" :loading="admin.approving" /></div>
     </Form>
   </Dialog>
@@ -392,7 +534,7 @@ function changeDeviceLogPage(nextPage: number) {
       <Button label="刷新" icon="pi pi-refresh" text :loading="admin.deviceLogsLoading" @click="admin.deviceLogsDevice && admin.openDeviceLogs(admin.deviceLogsDevice, admin.deviceLogsPage)" />
     </div>
     <Skeleton v-if="admin.deviceLogsLoading" height="20rem" />
-    <DataTable v-else :value="admin.deviceLogEntries" stripedRows responsiveLayout="scroll" class="queue-table">
+    <DataTable v-else :value="admin.deviceLogEntries" stripedRows scrollable class="queue-table">
       <template #empty>暂无客户端日志</template>
       <Column field="time" header="时间" style="width: 13rem" />
       <Column field="level" header="级别" style="width: 7rem"><template #body="slotProps">

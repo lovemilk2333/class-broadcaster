@@ -175,6 +175,68 @@ func TestClientLogPageSortsNewestTimestampFirst(t *testing.T) {
 	}
 }
 
+func TestPurgeRecentMessagesByTTL(t *testing.T) {
+	store := broadcast.NewStore()
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	oldID, err := broadcast.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshID, err := broadcast.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCreated := now.Add(-50 * time.Hour)
+	freshCreated := now.Add(-10 * time.Hour)
+	if _, err := store.Create(broadcast.Message{
+		ID: oldID, DisplayText: "old", PrioritySet: true, Priority: 1,
+		CreatedAt: oldCreated.UnixMilli(), ExpiresAt: oldCreated.Add(24 * time.Hour).UnixMilli(),
+	}, nil, oldCreated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(broadcast.Message{
+		ID: freshID, DisplayText: "fresh", PrioritySet: true, Priority: 1,
+		CreatedAt: freshCreated.UnixMilli(), ExpiresAt: freshCreated.Add(24 * time.Hour).UnixMilli(),
+	}, nil, freshCreated); err != nil {
+		t.Fatal(err)
+	}
+	// ttl=24h → retention=48h; only the 50h-old message is removed.
+	result := purgeRecentMessagesByTTL(store, 24*time.Hour, now)
+	if result.MessagesRemoved != 1 || result.RetentionHours != 48 {
+		t.Fatalf("result=%#v", result)
+	}
+	ids := map[string]bool{}
+	for _, record := range store.List(now) {
+		ids[record.Message.ID.String()] = true
+	}
+	if ids[oldID.String()] || !ids[freshID.String()] {
+		t.Fatalf("ids after TTL purge=%v", ids)
+	}
+}
+
+func TestClientLogPurgeOlderThanDays(t *testing.T) {
+	buffer := newClientLogBuffer(10)
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	fresh := now.Add(-6 * time.Hour).Format(time.RFC3339Nano)
+	buffer.append("client-a", `{"time":"`+old+`","msg":"old"}`)
+	buffer.append("client-a", `{"time":"`+fresh+`","msg":"fresh"}`)
+	removed, err := buffer.purgeOlderThanDays(1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1", removed)
+	}
+	content, total := buffer.page("client-a", 1, 10)
+	if total != 1 || !strings.Contains(content, `"msg":"fresh"`) || strings.Contains(content, `"msg":"old"`) {
+		t.Fatalf("after purge content=%q total=%d", content, total)
+	}
+	if _, err := buffer.purgeOlderThanDays(0, now); err == nil {
+		t.Fatal("expected error for min_age_days < 1")
+	}
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)

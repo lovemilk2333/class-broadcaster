@@ -98,6 +98,19 @@ def copy_client_sources(source: Path, destination: Path) -> None:
         if isinstance(document, dict) and document.get("version"):
             shutil.copy2(candidate, destination / "version.json")
 
+    # Packaged resources (e.g. third_party_licenses.json for the About dialog).
+    resources = source / "resources"
+    if resources.is_dir():
+        for path in resources.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(source)
+            if any(part in ignored for part in relative.parts):
+                continue
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
 
 def stamp_client_version_json(client_dir: Path, root: Path, build_date: str) -> None:
     """Write stamped version.json beside the packaged client package.
@@ -282,6 +295,21 @@ def main() -> None:
 
     copy_client_sources(root / "client", output / "client")
     stamp_client_version_json(output / "client", root, str(args.build_date).strip())
+    # Piper ONNX voices: source cache client/tts → packaged Lib/tts (make clean keeps client/tts).
+    tts_src = root / "client" / "tts"
+    tts_dst = output / "Lib" / "tts"
+    if tts_src.is_dir() and any(tts_src.glob("*.onnx")):
+        print(f"Copying TTS models from {tts_src} -> {tts_dst}", flush=True)
+        if tts_dst.exists():
+            shutil.rmtree(tts_dst)
+        shutil.copytree(tts_src, tts_dst, ignore=shutil.ignore_patterns("*.partial", ".gitkeep"))
+    else:
+        print(
+            f"WARNING: Piper TTS models missing under {tts_src}; "
+            "run `make download-tts-models` (or python3 scripts/download_tts_models.py). "
+            "Packaged client will fall back to SAPI when available.",
+            flush=True,
+        )
     # 使用相同 minor 版本生成 -O 优化字节码；性能关键依赖来自原生 .pyd wheel。
     # version.json stays as data next to the bytecode package.
     run_cached(

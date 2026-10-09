@@ -56,6 +56,11 @@ type Message struct {
 	DisplayText          string    `bson:"content"`
 	DisplayPosition      *string   `bson:"display_position,omitempty"`
 	DisplayDurationRatio *float64  `bson:"display_duration_ratio,omitempty"`
+	// FontSize is an optional per-message override (px/em/vw/vh). Empty → device/platform default.
+	FontSize *string `bson:"font_size,omitempty"`
+	// SpeechRate is an optional per-message TTS speed multiplier (1.0 = normal).
+	// nil → use the server default_speech_rate from the connection snapshot.
+	SpeechRate *float64 `bson:"speech_rate,omitempty"`
 	// AsDefault 表示缺省显示配置应在客户端按连接快照应用。
 	AsDefault bool         `bson:"as_default,omitempty"`
 	Speech    []SpeechNode `bson:"speech,omitempty"`

@@ -224,7 +224,7 @@ function filterControlValue(key: string) {
     <DataTable
       :value="pagedRows"
       stripedRows
-      responsiveLayout="scroll"
+      scrollable
       :class="tableClass"
       :loading="loading"
     >

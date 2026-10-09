@@ -23,6 +23,12 @@ class StateStore:
         self._state: dict[str, Any] = self._empty_state()
         self.load()
 
+    # Kept for callers that still reference historical constants; rendering uses core.fontsize
+    # (built-in default is 25vh; these are absolute-px fallbacks / admin px band).
+    DEFAULT_MESSAGE_FONT_SIZE = 38
+    MIN_MESSAGE_FONT_SIZE = 16
+    MAX_MESSAGE_FONT_SIZE = 120
+
     @staticmethod
     def _empty_state() -> dict[str, Any]:
         return {
@@ -35,6 +41,12 @@ class StateStore:
             # False until first launch applies the Windows default Run entry.
             "autostart_default_applied": False,
         }
+
+    @classmethod
+    def clamp_message_font_size(cls, value: object) -> int:
+        from .fontsize import clamp_px
+
+        return clamp_px(value)
 
     def load(self) -> dict[str, Any]:
         with self._lock:
@@ -85,6 +97,9 @@ class StateStore:
             self._state["autostart_default_applied"] = bool(
                 self._state.get("autostart_default_applied", False)
             )
+            # Font family/size are admin-pushed only; drop any legacy local prefs.
+            self._state.pop("message_font_family", None)
+            self._state.pop("message_font_size", None)
             return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:

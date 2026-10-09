@@ -9,6 +9,10 @@ export type Message = {
   expires_at: number
   display_position?: string | null
   display_duration_ratio?: number | null
+  /** Per-message override: "38px" | "1.2em" | "5vw" | "25vh"; empty/omitted → device default. */
+  font_size?: string | null
+  /** Per-message TTS speed multiplier (1.0 = normal). null/omitted → server default. */
+  speech_rate?: number | null
   tts_enabled?: boolean
   deliveries?: Record<string, 'pending' | 'sent' | 'received' | 'displayed' | 'spoken' | 'failed' | 'withdrawn'>
   delivery_history?: Record<string, 'received' | 'displayed' | 'spoken' | 'failed'>
@@ -18,6 +22,8 @@ export type Device = {
   client_id: string
   label: string
   client_version?: string
+  /** Stamped build time from handshake; same format as server health build_date. */
+  client_build_date?: string
   status?: 'pending' | 'approved' | 'revoked'
   online?: boolean
   approved_at: number
@@ -37,6 +43,14 @@ export type Device = {
   session_end_label?: string
   session_end_at?: number
   session_end_detail?: string
+  /** Fonts reported by the client at handshake (for picker / future message union). */
+  available_fonts?: string[]
+  /** Resolved platform default family reported at handshake (YaHei / Noto Sans*). */
+  platform_default_font?: string
+  /** Admin override pushed on ConnectResp (empty = client platform default). */
+  default_font_family?: string
+  /** Admin expression pushed on ConnectResp (empty = client built-in 25vh). Examples: 38px, 1.2em, 5vw, 25vh. */
+  default_font_size?: string
 }
 
 export type ConfigForm = {
@@ -50,6 +64,8 @@ export type ConfigForm = {
   max_repeat_expansion: number
   default_display_position: string
   display_duration_ratio: number
+  /** Default TTS speed multiplier (1.0 = normal; higher = faster). Default 0.75. */
+  default_speech_rate: number
   listener_probe_interval_seconds: number
   listener_probe_duration_hours: number
   listener_probe_reset_days: number
@@ -79,6 +95,8 @@ export type UpdateRecord = {
   status: string
   status_detail?: string
   force?: boolean
+  /** Explicit publish targets; empty with force means all approved clients. */
+  target_client_ids?: string[]
   created_at: number
 }
 
@@ -105,6 +123,6 @@ export type DeviceSortKey =
   | 'online_first'
   | 'offline_first'
 
-export type SectionKey = 'messages' | 'devices' | 'updates' | 'settings' | 'server'
+export type SectionKey = 'messages' | 'devices' | 'updates' | 'settings' | 'server' | 'about'
 
 export type SelectOption<T extends string = string> = { label: string; value: T }

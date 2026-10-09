@@ -33,8 +33,22 @@ class DeliveryTest(unittest.TestCase):
         })
         self.assertEqual(snapshot.heartbeat_interval, 15)
         self.assertEqual(snapshot.message_ttl, 86400)
+        self.assertEqual(snapshot.speech_rate, 0.75)
         with self.assertRaises(ValueError):
             ConfigSnapshot.from_wire({"config_id": "bad"})
+
+    def test_config_snapshot_speech_rate_alias(self):
+        snapshot = ConfigSnapshot.from_wire({
+            "config_id": "1791000000000.123",
+            "issued_at": 1791000000000,
+            "heartbeat_interval": 15,
+            "heartbeat_timeout": 45,
+            "message_ttl": 86400,
+            "max_speech_depth": 8,
+            "max_repeat_expansion": 100,
+            "default_speech_rate": 1.25,
+        })
+        self.assertEqual(snapshot.speech_rate, 1.25)
 
     def test_backoff_schedule(self):
         backoff = ReconnectBackoff()

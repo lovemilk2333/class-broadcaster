@@ -91,7 +91,7 @@ make package-client
 | Client (full update) | `lovemilk-class-broadcaster-<ver>-windows-amd64-full.tar.zst` — with `make client-full` / `CLIENT_FULL=1` |
 | Updater only | `lovemilk-class-broadcaster-updater-<ver>-windows-amd64.tar.zst` |
 
-The Windows client is assembled without PyInstaller: official CPython 3.11 embeddable runtime + Windows wheels via `uv` + `-O` bytecode + Go GUI launcher. Site-packages are cached under `build/cache/windows-site-packages/`.
+The Windows client is assembled without PyInstaller: official CPython 3.11 embeddable runtime + Windows wheels via `uv` + `-O` bytecode + Go GUI launcher. Site-packages are cached under `build/cache/windows-site-packages/`. Offline TTS on Windows prefers `piper-plus` (Tsukuyomi-chan multilingual ONNX); Linux keeps `piper-tts` with zh-CN + en-US voices (`make download-tts-models` → `client/tts/`, packaged as `Lib/tts/`; `make clean` keeps that cache). Windows falls back to SAPI.
 
 ### Incremental update packages
 
@@ -139,11 +139,18 @@ Client and updater both write **JSON** log lines (`time` / `level` / `msg` / `lo
 ## Admin frontend (development)
 
 ```bash
+# Terminal A — API only (no pnpm / no full web/ embed required)
+SKIP_FRONTEND=1 make build-server-amd64
+# or: cd server && go run ./cmd/server   # uses committed web/index.html stub
+
+# Terminal B — Vue UI
 cd frontend
-pnpm install   # or npm / yarn — lockfile is pnpm-lock.yaml
+pnpm install   # lockfile is pnpm-lock.yaml
 pnpm dev       # Vite on :39004, proxies /api → :39003
-pnpm build     # vue-tsc + vite; embed into server via make frontend-embed
+pnpm build     # vue-tsc + vite; release embed: make frontend-embed / make server
 ```
+
+`go:embed web/*` always needs at least one file: a stub `server/cmd/server/web/index.html` is committed so `go test` / `go run` work without Node. Release builds (`make server`) still run `pnpm build` and overwrite `web/` with `frontend/dist`. Dev API on `:39003` may show the stub at `/`; use `:39004` for the real admin UI.
 
 Hash router keeps bookmarkable sections. Tables use a shared `FilterableDataTable` (PrimeVue filters + pagination).
 
@@ -152,15 +159,22 @@ Hash router keeps bookmarkable sections. Tables use a shared `FilterableDataTabl
 See [`client/README.md`](client/README.md). Short version:
 
 ```bash
+# Linux / Debian 11 classroom (X11): Python 3.10 + PySide2
 cd client
-uv python install 3.11
-uv venv --python 3.11
+uv python install 3.10
+uv venv --python 3.10
 uv sync
+# ensure an X11 session (or XWayland); client sets QT_QPA_PLATFORM=xcb by default
+
+# Windows packaged builds still use embeddable CPython 3.11 + PySide6
+# (scripts/build_embedded_client.py / make client)
 
 # from repo root
 uv run --project client python -m client
 uv run --project client python -m unittest discover -s client/tests -q
 ```
+
+Message fonts/size: client reports `available_fonts`; admin sets per-device `default_font_family` / `default_font_size` (`38px`/`1.2em`/`5vw`/`25vh`, PATCH / ConnectResp; empty → built-in `25vh`). Per-message `font_size` overrides device default. Client only renders. Future: HTML rich text + font union.
 
 ## Protocol (sketch)
 

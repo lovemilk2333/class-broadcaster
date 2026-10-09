@@ -1,4 +1,7 @@
-"""PySide6 tray application for configuring and connecting the Windows client."""
+"""Tray application for configuring and connecting the class-broadcaster client.
+
+Qt binding: PySide2 on Debian 11 / Linux (Python ≥3.10), PySide6 on Windows packages.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ import math
 import os
 import queue
 import platform
+import signal
 import socket
 import ssl
 import subprocess
@@ -28,31 +32,62 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "client"
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal, QPoint
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import (
+from .qtcompat import (  # noqa: E402
+    AlignCenter,
+    AlignLeft,
+    AlignVCenter,
+    FramelessWindowHint,
+    Key_Escape,
     QAbstractItemView,
+    QAction,
     QApplication,
     QCheckBox,
+    QCloseEvent,
+    QColor,
+    QComboBox,
+    QDialog,
+    QFont,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QIcon,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QPainter,
+    QPixmap,
     QPlainTextEdit,
+    QPoint,
     QPushButton,
     QSizePolicy,
     QSpinBox,
-    QDialog,
     QStackedWidget,
     QSystemTrayIcon,
-    QMenu,
+    Qt,
+    QThread,
+    QTimer,
+    QueuedConnection,
     QVBoxLayout,
     QWidget,
+    ScrollBarAlwaysOff,
+    Signal,
+    TextSelectableByMouse,
+    Tool,
+    UserRole,
+    Window,
+    WindowActive,
+    WindowMinimized,
+    WindowStaysOnTopHint,
+    configure_platform_for_popup,
+    default_message_font_family,
+    list_system_font_families,
+    qt_binding,
+    resolve_message_font_family,
+    text_width,
 )
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -80,19 +115,34 @@ from .core.connection import (
     download_update_package_tls,
     probe_server_fingerprint,
 )
-from .core.delivery import ConfigSnapshot, MessageDeduplicator, PriorityQueue, ReconnectBackoff, display_duration_ms
+from .core.delivery import (
+    ConfigSnapshot,
+    MessageDeduplicator,
+    PriorityQueue,
+    ReconnectBackoff,
+    display_duration_ms,
+)
+from .core.fontsize import DEFAULT_EXPR as FONT_DEFAULT_EXPR
+from .core.fontsize import DEFAULT_FALLBACK_PX as FONT_DEFAULT_PX
+from .core.fontsize import resolve_px as resolve_font_size_px
 from .core.discovery import DiscoveryResponse, discover, parse_scan_destinations
-from .core.identity import decrypt_private_key, encrypt_private_key, generate_identity, public_key_fingerprint
+from .core.identity import (
+    decrypt_private_key,
+    encrypt_private_key,
+    generate_identity,
+    public_key_fingerprint,
+)
 from .core.protocol.bson import decode, encode
 from .core.protocol.packet import Packet, read_packet
 from .core.store import StateStore
 from .core.tts import (
+    DEFAULT_SPEECH_RATE,
     EnginePreference,
-    PiperEngine,
     SAPIEngine,
     SpeechPart,
     compile_speech,
     estimate_duration_ms,
+    normalize_speech_rate,
     speak_with_fallback,
 )
 from .core.updater import (
@@ -256,14 +306,14 @@ class SingleInstanceLock:
 def _application_icon() -> QIcon:
     """绘制不依赖系统主题的托盘和窗口图标，确保 Windows 托盘始终可见。"""
     pixmap = QPixmap(32, 32)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(QColor("#0f172a"))
     painter.setBrush(QColor("#38bdf8"))
     painter.drawRoundedRect(2, 2, 28, 28, 7, 7)
     painter.setPen(QColor("#082f49"))
-    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "M")
+    painter.drawText(pixmap.rect(), AlignCenter, "M")
     painter.end()
     return QIcon(pixmap)
 
@@ -499,7 +549,9 @@ def _run_reg(args: list[str], *, elevate: bool) -> None:
             check=False,
         )
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
+            detail = (
+                completed.stderr or completed.stdout or ""
+            ).strip() or f"exit {completed.returncode}"
             raise OSError(f"reg failed: {detail}")
         return
 
@@ -617,7 +669,17 @@ def _write_run_value_hklm(enabled: bool) -> None:
     if enabled:
         # reg add "HKLM\...\Run" /v MKCBClient /t REG_SZ /d "..." /f
         _run_reg(
-            ["add", _AUTOSTART_REG_HKLM, "/v", _AUTOSTART_VALUE, "/t", "REG_SZ", "/d", command, "/f"],
+            [
+                "add",
+                _AUTOSTART_REG_HKLM,
+                "/v",
+                _AUTOSTART_VALUE,
+                "/t",
+                "REG_SZ",
+                "/d",
+                command,
+                "/f",
+            ],
             elevate=True,
         )
     else:
@@ -776,7 +838,9 @@ class ListenerWorker(QThread):
         self.certificate = certificate
         self.port = int(port)
         self.state_store = state_store
-        self.idle_timeout_seconds = max(1, min(3600, int(idle_timeout_seconds or self.DEFAULT_IDLE_TIMEOUT_SECONDS)))
+        self.idle_timeout_seconds = max(
+            1, min(3600, int(idle_timeout_seconds or self.DEFAULT_IDLE_TIMEOUT_SECONDS))
+        )
         self.keep_running = True
         self.sent = 0
         self.received = 0
@@ -800,7 +864,13 @@ class ListenerWorker(QThread):
                 cert_path = Path(temporary) / "client.pem"
                 key_path = Path(temporary) / "client-key.pem"
                 cert_path.write_bytes(self.certificate)
-                key_path.write_bytes(self.private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+                key_path.write_bytes(
+                    self.private_key.private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.PKCS8,
+                        serialization.NoEncryption(),
+                    )
+                )
                 tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 tls_context.minimum_version = ssl.TLSVersion.TLSv1_3
                 tls_context.maximum_version = ssl.TLSVersion.TLSv1_3
@@ -830,19 +900,29 @@ class ListenerWorker(QThread):
                             challenge = packet.payload
                             nonce = challenge[:32]
                             server_public_key = challenge[32:64]
-                            server_fingerprint = public_key_fingerprint(server_public_key) if len(server_public_key) == 32 else b""
-                            signed_challenge = b"MKCB-listener-probe-v1\x00" + nonce + server_public_key
+                            server_fingerprint = (
+                                public_key_fingerprint(server_public_key)
+                                if len(server_public_key) == 32
+                                else b""
+                            )
+                            signed_challenge = (
+                                b"MKCB-listener-probe-v1\x00" + nonce + server_public_key
+                            )
                             server_signature_valid = False
                             if len(server_public_key) == 32 and len(challenge) == 128:
                                 try:
-                                    Ed25519PublicKey.from_public_bytes(server_public_key).verify(challenge[64:], signed_challenge)
+                                    Ed25519PublicKey.from_public_bytes(server_public_key).verify(
+                                        challenge[64:], signed_challenge
+                                    )
                                     server_signature_valid = True
                                 except InvalidSignature:
                                     pass
                             if (
                                 packet.packet_type != PING
                                 or len(challenge) != 128
-                                or not self.state_store.trusts_server_fingerprint(server_fingerprint)
+                                or not self.state_store.trusts_server_fingerprint(
+                                    server_fingerprint
+                                )
                                 or not server_signature_valid
                             ):
                                 self._log.warning(
@@ -855,7 +935,9 @@ class ListenerWorker(QThread):
                                 serialization.Encoding.Raw, serialization.PublicFormat.Raw
                             )
                             response = client_public_key + self.private_key.sign(signed_challenge)
-                            connection.sendall(Packet(1, 0, PONG, packet.sequence, 0, response).encode())
+                            connection.sendall(
+                                Packet(1, 0, PONG, packet.sequence, 0, response).encode()
+                            )
                             self.sent += 1
                             self.received += 1
                             self.latencies.append((time.monotonic() - started) * 1000)
@@ -864,7 +946,9 @@ class ListenerWorker(QThread):
                                 self.received,
                                 self.latencies[-1],
                             )
-                            self.status.emit("listener mode answered packets={}".format(self.received))
+                            self.status.emit(
+                                "listener mode answered packets={}".format(self.received)
+                            )
                     except Exception as exc:
                         self._log.debug("listener probe failed: {}", exc)
                     finally:
@@ -1042,7 +1126,9 @@ class UpdateApplyWorker(QThread):
                     stem = stem[: -len(suffix)]
                     break
             destination = destination.with_name(stem + ".tar.zst")
-        request = urllib.request.Request(url, method="GET", headers={"User-Agent": f"mkcb-client/{VERSION_STR}"})
+        request = urllib.request.Request(
+            url, method="GET", headers={"User-Agent": f"mkcb-client/{VERSION_STR}"}
+        )
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -1061,7 +1147,9 @@ class UpdateApplyWorker(QThread):
             with temporary.open("rb") as probe:
                 magic = probe.read(4)
             if magic != b"\x28\xb5\x2f\xfd":
-                raise RuntimeError("downloaded update package is not zstd-compressed (.tar.zst expected)")
+                raise RuntimeError(
+                    "downloaded update package is not zstd-compressed (.tar.zst expected)"
+                )
             temporary.replace(destination)
         except Exception:
             try:
@@ -1138,6 +1226,7 @@ class ConnectionWorker(QThread):
     config_updated = Signal(object, object)  # endpoint_key, ConfigSnapshot
     certificate_mismatch = Signal(object)
     update_available = Signal(object)
+    server_font_updated = Signal(object, str, str)  # endpoint_key, family, size_expr
 
     def __init__(
         self,
@@ -1236,14 +1325,23 @@ class ConnectionWorker(QThread):
                     )
                     endpoint_config_id = None
                     for saved in self.state_store.servers():
-                        if (
-                            str(saved.get("host", "")).strip() == str(self.endpoint["host"])
-                            and int(saved.get("tcp_port", 0) or 0) == int(self.endpoint["tcp_port"])
-                        ):
+                        if str(saved.get("host", "")).strip() == str(self.endpoint["host"]) and int(
+                            saved.get("tcp_port", 0) or 0
+                        ) == int(self.endpoint["tcp_port"]):
                             candidate = saved.get("config_id")
                             if isinstance(candidate, str) and candidate:
                                 endpoint_config_id = candidate
                             break
+                    fonts: list[str] = []
+                    platform_font = ""
+                    try:
+                        fonts = list_system_font_families(limit=200)
+                    except Exception:
+                        fonts = []
+                    try:
+                        platform_font = str(default_message_font_family() or "").strip()
+                    except Exception:
+                        platform_font = ""
                     connection, response = connect(
                         self.endpoint["host"],
                         self.endpoint["tcp_port"],
@@ -1253,9 +1351,13 @@ class ConnectionWorker(QThread):
                         config_id=endpoint_config_id,
                         timeout=3,
                         listener_mode=self.listener_mode,
-                        listener_port=self.listener_port if self.listener_mode in ("auto", "listen") else 0,
+                        listener_port=self.listener_port
+                        if self.listener_mode in ("auto", "listen")
+                        else 0,
                         reconnect_probe=reconnect_probe,
                         manual_connect=manual_attempt,
+                        available_fonts=fonts,
+                        platform_default_font=platform_font,
                     )
                 # A successful business handshake means authorization has
                 # completed. Any later disconnect must use ordinary backoff,
@@ -1264,19 +1366,42 @@ class ConnectionWorker(QThread):
                 mode = response.get("connection_mode") if isinstance(response, dict) else None
                 if mode in ("pull", "listen"):
                     self.server_connection_mode = mode
+                if isinstance(response, dict):
+                    raw_size = response.get("default_font_size")
+                    if isinstance(raw_size, (int, float)) and not isinstance(raw_size, bool):
+                        size_expr = f"{int(raw_size)}px" if int(raw_size) > 0 else ""
+                    else:
+                        size_expr = str(raw_size or "").strip()
+                    self.server_font_updated.emit(
+                        self.endpoint_key(),
+                        str(response.get("default_font_family") or "").strip(),
+                        size_expr,
+                    )
                 if isinstance(response, dict) and response.get("connect_allowed") is False:
-                    LOGGER.info("server denied reconnect probe mode={}", self.server_connection_mode)
+                    LOGGER.info(
+                        "server denied reconnect probe mode={}", self.server_connection_mode
+                    )
                     self.status.emit(self.endpoint_key(), "服务端当前不允许连接；5 分钟后再次探测")
                     if connection is not None:
                         connection.close()
                         connection = None
                     raise ConnectionError("server_denied_reconnect_probe")
-                actual_fingerprint = response.get("_server_fingerprint") if isinstance(response, dict) else None
-                server_public_key = response.get("_server_public_key") if isinstance(response, dict) else None
-                if isinstance(server_public_key, (bytes, bytearray)) and len(server_public_key) == 32:
+                actual_fingerprint = (
+                    response.get("_server_fingerprint") if isinstance(response, dict) else None
+                )
+                server_public_key = (
+                    response.get("_server_public_key") if isinstance(response, dict) else None
+                )
+                if (
+                    isinstance(server_public_key, (bytes, bytearray))
+                    and len(server_public_key) == 32
+                ):
                     self.endpoint["server_public_key"] = bytes(server_public_key)
                 if isinstance(actual_fingerprint, bytes) and len(actual_fingerprint) == 32:
-                    if not any(self.server_fingerprint) or self.server_fingerprint != actual_fingerprint:
+                    if (
+                        not any(self.server_fingerprint)
+                        or self.server_fingerprint != actual_fingerprint
+                    ):
                         self.server_fingerprint = actual_fingerprint
                         self.endpoint["fingerprint"] = actual_fingerprint
                         self.state_store.set_server(
@@ -1305,6 +1430,7 @@ class ConnectionWorker(QThread):
                         max_repeat_expansion=100,
                         display_position="center",
                         display_duration_ratio=0.4,
+                        speech_rate=0.75,
                         listener_idle_timeout_seconds=60,
                     )
                 self.last_snapshot = snapshot
@@ -1390,13 +1516,17 @@ class ConnectionWorker(QThread):
                             config_id=snapshot.config_id,
                         )
                         self.config_updated.emit(self.endpoint_key(), snapshot)
-                        self.status.emit(self.endpoint_key(), "配置已更新：{}".format(snapshot.config_id))
+                        self.status.emit(
+                            self.endpoint_key(), "配置已更新：{}".format(snapshot.config_id)
+                        )
                     elif packet.packet_type == UPDATE_AVAILABLE:
                         update = decode_update_available(packet)
                         # Tag the peer that pushed the update so TLS download uses the same host:tcp_port.
                         update["source_host"] = str(self.endpoint.get("host") or "")
                         update["source_tcp_port"] = int(self.endpoint.get("tcp_port") or 0)
-                        fingerprint = self.server_fingerprint or self.endpoint.get("fingerprint") or b""
+                        fingerprint = (
+                            self.server_fingerprint or self.endpoint.get("fingerprint") or b""
+                        )
                         if isinstance(fingerprint, (bytes, bytearray)) and len(fingerprint) == 32:
                             update["source_fingerprint"] = bytes(fingerprint)
                         elif isinstance(fingerprint, str) and fingerprint:
@@ -1421,7 +1551,9 @@ class ConnectionWorker(QThread):
                         self.update_available.emit(update)
                         self.status.emit(
                             self.endpoint_key(),
-                            "update available: {} {}".format(update["component"], update["version"]),
+                            "update available: {} {}".format(
+                                update["component"], update["version"]
+                            ),
                         )
                     elif packet.packet_type == PONG:
                         last_pong = time.monotonic()
@@ -1429,7 +1561,9 @@ class ConnectionWorker(QThread):
                         LOGGER.info("connection closed by server administrator")
                         approval_deadline = None
                         self.admin_disconnected = True
-                        self.status.emit(self.endpoint_key(), "已由管理员断开；正在按服务端连接模式等待")
+                        self.status.emit(
+                            self.endpoint_key(), "已由管理员断开；正在按服务端连接模式等待"
+                        )
                         break
                     elif packet.packet_type == SERVER_SHUTDOWN:
                         normal_shutdown = True
@@ -1440,11 +1574,13 @@ class ConnectionWorker(QThread):
                         raise ConnectionError("server_shutdown")
             except Exception as exc:
                 if isinstance(exc, ServerFingerprintMismatch):
-                    self.certificate_mismatch.emit({
-                        "host": str(self.endpoint["host"]),
-                        "tcp_port": int(self.endpoint["tcp_port"]),
-                        "fingerprint": exc.actual_fingerprint,
-                    })
+                    self.certificate_mismatch.emit(
+                        {
+                            "host": str(self.endpoint["host"]),
+                            "tcp_port": int(self.endpoint["tcp_port"]),
+                            "fingerprint": exc.actual_fingerprint,
+                        }
+                    )
                     self.status.emit(self.endpoint_key(), "服务端证书指纹已变化，等待确认")
                     while self.keep_running:
                         try:
@@ -1480,15 +1616,21 @@ class ConnectionWorker(QThread):
                         self.keep_running = False
                         break
                     LOGGER.warning("client is waiting for server approval; retrying in 15 seconds")
-                    self.status.emit(self.endpoint_key(), "等待服务端批准；每 15 秒重试，最多 3 分钟")
+                    self.status.emit(
+                        self.endpoint_key(), "等待服务端批准；每 15 秒重试，最多 3 分钟"
+                    )
                     self._wait(min(15, remaining))
                     continue
                 # All non-authorization failures, including a connection
                 # closed after approval, belong to the normal retry policy.
                 approval_deadline = None
                 if self.keep_running and self.admin_disconnected:
-                    LOGGER.warning("reconnect attempt failed while administrator-disconnected: {}", exc)
-                    self.status.emit(self.endpoint_key(), "重连未成功；保留原探测计划：{}".format(exc))
+                    LOGGER.warning(
+                        "reconnect attempt failed while administrator-disconnected: {}", exc
+                    )
+                    self.status.emit(
+                        self.endpoint_key(), "重连未成功；保留原探测计划：{}".format(exc)
+                    )
                 elif self.keep_running:
                     LOGGER.exception(
                         "connection failed {}:{}",
@@ -1496,7 +1638,9 @@ class ConnectionWorker(QThread):
                         self.endpoint.get("tcp_port"),
                     )
                     delay = 300 if normal_shutdown else backoff.next_delay()
-                    self.status.emit(self.endpoint_key(), "连接中断：{}；{} 秒后重试".format(exc, delay))
+                    self.status.emit(
+                        self.endpoint_key(), "连接中断：{}；{} 秒后重试".format(exc, delay)
+                    )
                     self._wait(delay)
                     if delay >= 300 and self.keep_running:
                         try:
@@ -1514,13 +1658,20 @@ class ConnectionWorker(QThread):
                 self.connection_state.emit(self.endpoint_key(), False)
             if self.admin_disconnected and self.keep_running:
                 if self.server_connection_mode == "listen":
-                    LOGGER.info("admin disconnected; listen mode will not auto-reconnect (manual connect allowed)")
-                    self.status.emit(self.endpoint_key(), "admin disconnected; listen mode idle until manual connect")
+                    LOGGER.info(
+                        "admin disconnected; listen mode will not auto-reconnect (manual connect allowed)"
+                    )
+                    self.status.emit(
+                        self.endpoint_key(),
+                        "admin disconnected; listen mode idle until manual connect",
+                    )
                     self._manual_reconnect.wait()
                     self._manual_reconnect.clear()
                 else:
                     LOGGER.info("admin disconnected; pull mode will probe handshake in 5 minutes")
-                    self.status.emit(self.endpoint_key(), "admin disconnected; pull mode probe in 5 minutes")
+                    self.status.emit(
+                        self.endpoint_key(), "admin disconnected; pull mode probe in 5 minutes"
+                    )
                     self._manual_reconnect.wait(300)
 
     def _flush_acks(self, connection: Connection) -> None:
@@ -1589,11 +1740,18 @@ class SpeechWorker(QThread):
     finished_playback = Signal(str, bool, str)
     text_part = Signal(str, str)
 
-    def __init__(self, message_id: str, parts: list[Any], data_dir: Path) -> None:
+    def __init__(
+        self,
+        message_id: str,
+        parts: list[Any],
+        data_dir: Path,
+        speech_rate: float = 0.75,
+    ) -> None:
         super().__init__()
         self.message_id = message_id
         self.parts = parts
         self.data_dir = data_dir
+        self.speech_rate = float(speech_rate) if speech_rate else 0.75
         self.stop_event = threading.Event()
         self.cancelled = False
 
@@ -1602,16 +1760,14 @@ class SpeechWorker(QThread):
         self.stop_event.set()
 
     def run(self) -> None:
-        piper_dir = self.data_dir / "piper"
-        model_paths = list(piper_dir.glob("*.onnx")) if piper_dir.is_dir() else []
+        from .core.tts import PiperLibraryEngine, resolve_tts_model_dirs
+
+        model_dirs = resolve_tts_model_dirs(self.data_dir)
+        # Prefer the Python Piper package (piper-plus on Windows / piper-tts on Linux).
+        # No CLI fallback — SAPI remains the only Windows backup when models/lib fail.
         engines = [
+            PiperLibraryEngine(model_dirs),
             SAPIEngine(),
-            PiperEngine(
-                executable=str(piper_dir / "piper.exe")
-                if (piper_dir / "piper.exe").is_file()
-                else None,
-                model=str(model_paths[0]) if model_paths else None,
-            ),
         ]
         try:
             engine_name = speak_with_fallback(
@@ -1620,6 +1776,7 @@ class SpeechWorker(QThread):
                 self.stop_event,
                 EnginePreference(self.data_dir / "tts-engine.json"),
                 lambda text: self.text_part.emit(self.message_id, text),
+                speech_rate=self.speech_rate,
             )
             LOGGER.info(
                 "TTS playback completed message_id={} engine={}", self.message_id, engine_name
@@ -1634,29 +1791,39 @@ class SpeechWorker(QThread):
 
 
 class MarqueeLabel(QLabel):
-    """超长单行消息在可用宽度内向左滚动；含换行时仍居中静态显示（撤回提示应传单行）。
+    """超长单行消息按 Token 停留策略向左滚动；含换行时仍居中静态显示。
 
-    滚动节奏：开头停顿 ≥0.5s → 在剩余显示时间内滚完整段文字 → 结尾停顿 ≥0.5s。
-    若窗口仍可见则循环。显示时长为 0（手动关闭）时使用舒适默认速度，但仍保留首尾停顿。
+    节奏（prefer 单 Token）：开头 padding 停顿 → 每个 Token：滚入边缘 → 停顿 → 滚出窗口
+    → 结尾停顿；窗口仍可见则循环。时长为 0（手动关闭）时用舒适默认速度，仍保留首尾停顿。
     """
 
     _TICK_MS = 40
     _MIN_HOLD_MS = 500
-    # Comfortable fallback when the operator leaves the window open forever.
+    _MIN_ENTER_MS = 125
+    _MIN_EXIT_MS = 125
+    _MIN_TOKEN_DWELL_MS = 250
     _DEFAULT_SCROLL_PX_PER_SEC = 80.0
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._source_text = ""
+        self._tokens: list[str] = []
+        self._token_widths: list[int] = []
+        self._token_offsets: list[float] = []  # left edge of each token in the full string
         self._offset = 0.0
         self._text_width = 0
         self._side_margin_px = 0
         self._display_duration_ms = 0
-        self._phase = "idle"  # idle | hold_start | scroll | hold_end
+        self._phase = "idle"  # idle | hold_start | enter | dwell | exit | hold_end
         self._phase_elapsed_ms = 0
+        self._token_index = 0
         self._hold_start_ms = self._MIN_HOLD_MS
         self._hold_end_ms = self._MIN_HOLD_MS
-        self._scroll_px_per_tick = 2.0
+        self._enter_ms = self._MIN_ENTER_MS
+        self._dwell_ms = self._MIN_TOKEN_DWELL_MS
+        self._exit_ms = self._MIN_EXIT_MS
+        self._scroll_from = 0.0
+        self._scroll_to = 0.0
         self._cycle = 1
         self._timer = QTimer(self)
         self._timer.setInterval(self._TICK_MS)
@@ -1668,9 +1835,11 @@ class MarqueeLabel(QLabel):
         self._offset = 0.0
         self._phase = "idle"
         self._phase_elapsed_ms = 0
+        self._token_index = 0
         # Keep an empty QLabel text so sizeHint is driven by our constraints,
         # not the full unwrapped string (which would expand past the screen).
         QLabel.setText(self, "" if "\n" not in self._source_text else self._source_text)
+        self._rebuild_tokens()
         self._update_marquee()
         self.updateGeometry()
         self.update()
@@ -1712,40 +1881,97 @@ class MarqueeLabel(QLabel):
         return self._text_width > self._content_width()
 
     def _gap(self) -> int:
-        return max(32, self.fontMetrics().horizontalAdvance("    "))
+        return max(32, text_width(self.fontMetrics(), "    "))
+
+    def _rebuild_tokens(self) -> None:
+        from .core.tokenize import tokenize
+
+        metrics = self.fontMetrics()
+        raw = tokenize(self._source_text) if self._source_text and "\n" not in self._source_text else []
+        # Keep visual order: rebuild offsets by walking the original string when possible.
+        self._tokens = raw or ([self._source_text] if self._source_text and "\n" not in self._source_text else [])
+        self._token_widths = [max(1, text_width(metrics, token)) for token in self._tokens]
+        self._token_offsets = []
+        # Prefer measuring cumulative width of joined tokens (jieba drops spaces).
+        cursor = 0.0
+        for width in self._token_widths:
+            self._token_offsets.append(cursor)
+            cursor += float(width)
+        self._text_width = max(1, int(round(cursor))) if self._tokens else text_width(metrics, self._source_text)
 
     def _recompute_scroll_profile(self) -> None:
-        """Pick hold times and px/tick so one full pass fits the display window."""
+        """Allocate start/end holds and per-token enter/dwell/exit within the display window."""
         gap = self._gap()
-        # One full pass: scroll the whole string (+ gap) so every character is seen.
         self._cycle = max(1, self._text_width + gap)
+        token_count = max(1, len(self._tokens))
         duration = self._display_duration_ms
         hold = self._MIN_HOLD_MS
         if duration <= 0:
-            # Manual close: comfortable constant speed, still pause at ends.
             self._hold_start_ms = hold
             self._hold_end_ms = hold
-            px_per_sec = self._DEFAULT_SCROLL_PX_PER_SEC
-        else:
-            # Always pause ≥0.5s at start and end; spend the rest scrolling so
-            # one full pass finishes inside the display window (speed up if needed).
-            self._hold_start_ms = hold
-            self._hold_end_ms = hold
-            scroll_ms = max(self._TICK_MS, duration - 2 * hold)
-            px_per_sec = (self._cycle * 1000.0) / float(scroll_ms)
-        self._scroll_px_per_tick = max(0.5, px_per_sec * (self._TICK_MS / 1000.0))
+            # Comfortable defaults for manual-close windows.
+            self._enter_ms = self._MIN_ENTER_MS
+            self._exit_ms = self._MIN_EXIT_MS
+            self._dwell_ms = max(self._MIN_TOKEN_DWELL_MS, int(1000 * token_count / max(1, self._DEFAULT_SCROLL_PX_PER_SEC / 40)))
+            return
+        # Reserve ≥0.5s padding at both ends; distribute the rest across tokens.
+        # Per token: ~12.5% enter + ~75% dwell + ~12.5% exit (matches the design example).
+        usable = max(self._TICK_MS, duration - 2 * hold)
+        per_token = max(self._MIN_ENTER_MS + self._MIN_TOKEN_DWELL_MS + self._MIN_EXIT_MS, usable // token_count)
+        self._hold_start_ms = hold
+        self._hold_end_ms = hold
+        self._enter_ms = max(self._MIN_ENTER_MS, int(per_token * 0.125))
+        self._exit_ms = max(self._MIN_EXIT_MS, int(per_token * 0.125))
+        self._dwell_ms = max(self._MIN_TOKEN_DWELL_MS, per_token - self._enter_ms - self._exit_ms)
+
+    def _token_focus_offset(self, index: int) -> float:
+        """Offset that places token ``index`` at the left content edge."""
+        if not self._token_offsets:
+            return 0.0
+        index = max(0, min(index, len(self._token_offsets) - 1))
+        return float(self._token_offsets[index])
+
+    def _token_exit_offset(self, index: int) -> float:
+        """Offset that scrolls token ``index`` fully past the left edge."""
+        if not self._token_offsets:
+            return float(self._cycle)
+        index = max(0, min(index, len(self._token_offsets) - 1))
+        return float(self._token_offsets[index] + self._token_widths[index])
 
     def _begin_cycle(self) -> None:
         self._offset = 0.0
         self._phase_elapsed_ms = 0
+        self._token_index = 0
         self._recompute_scroll_profile()
         self._phase = "hold_start"
         if not self._timer.isActive():
             self._timer.start()
         self.update()
 
+    def _start_enter(self) -> None:
+        self._scroll_from = self._offset
+        self._scroll_to = self._token_focus_offset(self._token_index)
+        self._phase = "enter"
+        self._phase_elapsed_ms = 0
+
+    def _start_exit(self) -> None:
+        self._scroll_from = self._offset
+        if self._token_index >= len(self._tokens) - 1:
+            self._scroll_to = float(self._cycle)
+        else:
+            self._scroll_to = self._token_exit_offset(self._token_index)
+        self._phase = "exit"
+        self._phase_elapsed_ms = 0
+
+    def _lerp_offset(self, duration_ms: int) -> None:
+        if duration_ms <= 0:
+            self._offset = self._scroll_to
+            return
+        progress = min(1.0, self._phase_elapsed_ms / float(duration_ms))
+        self._offset = self._scroll_from + (self._scroll_to - self._scroll_from) * progress
+
     def _update_marquee(self) -> None:
-        self._text_width = self.fontMetrics().horizontalAdvance(self._source_text)
+        self._rebuild_tokens()
         if self._needs_marquee():
             self._recompute_scroll_profile()
             if self._phase == "idle":
@@ -1757,6 +1983,7 @@ class MarqueeLabel(QLabel):
             self._offset = 0.0
             self._phase = "idle"
             self._phase_elapsed_ms = 0
+            self._token_index = 0
 
     def _advance(self) -> None:
         if not self._needs_marquee():
@@ -1768,17 +1995,32 @@ class MarqueeLabel(QLabel):
         self._phase_elapsed_ms += self._TICK_MS
         if self._phase == "hold_start":
             if self._phase_elapsed_ms >= self._hold_start_ms:
-                self._phase = "scroll"
+                if self._tokens:
+                    self._start_enter()
+                else:
+                    self._phase = "hold_end"
+                    self._phase_elapsed_ms = 0
+        elif self._phase == "enter":
+            self._lerp_offset(self._enter_ms)
+            if self._phase_elapsed_ms >= self._enter_ms:
+                self._offset = self._scroll_to
+                self._phase = "dwell"
                 self._phase_elapsed_ms = 0
-        elif self._phase == "scroll":
-            self._offset += self._scroll_px_per_tick
-            if self._offset >= self._cycle:
-                self._offset = float(self._cycle)
-                self._phase = "hold_end"
-                self._phase_elapsed_ms = 0
+        elif self._phase == "dwell":
+            if self._phase_elapsed_ms >= self._dwell_ms:
+                self._start_exit()
+        elif self._phase == "exit":
+            self._lerp_offset(self._exit_ms)
+            if self._phase_elapsed_ms >= self._exit_ms:
+                self._offset = self._scroll_to
+                self._token_index += 1
+                if self._token_index < len(self._tokens):
+                    self._start_enter()
+                else:
+                    self._phase = "hold_end"
+                    self._phase_elapsed_ms = 0
         elif self._phase == "hold_end":
             if self._phase_elapsed_ms >= self._hold_end_ms:
-                # Loop while the window stays open (TTS / long ratio / manual).
                 self._begin_cycle()
                 return
         self.update()
@@ -1790,7 +2032,7 @@ class MarqueeLabel(QLabel):
                 painter.setPen(self.palette().color(self.foregroundRole()))
                 painter.setFont(self.font())
                 rect = self.rect().adjusted(self._side_margin_px, 0, -self._side_margin_px, 0)
-                painter.drawText(rect, int(Qt.AlignCenter | Qt.AlignVCenter), self._source_text)
+                painter.drawText(rect, int(AlignCenter | AlignVCenter), self._source_text)
                 painter.end()
                 return
             super().paintEvent(event)
@@ -1800,13 +2042,100 @@ class MarqueeLabel(QLabel):
         painter.setFont(self.font())
         painter.setClipRect(self.rect().adjusted(self._side_margin_px, 0, -self._side_margin_px, 0))
         baseline = (self.height() + self.fontMetrics().ascent() - self.fontMetrics().descent()) // 2
-        cycle = max(1, self._cycle)
-        x = self._side_margin_px - int(self._offset)
-        right = self.width() - self._side_margin_px
-        while x < right:
-            painter.drawText(x, baseline, self._source_text)
-            x += cycle
+        # Draw tokens at measured offsets so jieba splits stay visually contiguous.
+        x0 = self._side_margin_px - int(self._offset)
+        if self._tokens and self._token_offsets:
+            for index, token in enumerate(self._tokens):
+                x = x0 + int(self._token_offsets[index])
+                painter.drawText(x, baseline, token)
+            # Optional trailing copy after the gap so the loop feels continuous.
+            trail = x0 + self._cycle
+            if trail < self.width() - self._side_margin_px:
+                for index, token in enumerate(self._tokens):
+                    painter.drawText(trail + int(self._token_offsets[index]), baseline, token)
+        else:
+            painter.drawText(x0, baseline, self._source_text)
         painter.end()
+
+
+_FALLBACK_THIRD_PARTY_LICENSES = {
+    "title": "开源软件版权声明",
+    "intro": "未能加载完整许可证列表。本项目采用 BSD-3-Clause；依赖组件许可证详见仓库 THIRD_PARTY_LICENSES.md。",
+    "entries": [
+        {
+            "name": "lovemilk class broadcaster",
+            "license": "BSD-3-Clause",
+            "url": "https://github.com/lovemilk/class-broadcaster",
+            "note": "本项目",
+        }
+    ],
+}
+
+
+def _third_party_licenses_candidates() -> list[Path]:
+    """Resolve packaged / source paths for third_party_licenses.json."""
+    here = Path(__file__).resolve().parent
+    candidates: list[Path] = [
+        # Prefer next to the client package (dev tree and packaged Lib/client/).
+        here / "resources" / "third_party_licenses.json",
+        # Fallback when imported from a different layout.
+        here.parent / "client" / "resources" / "third_party_licenses.json",
+    ]
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = None
+    if cwd is not None:
+        candidates.append(cwd / "client" / "resources" / "third_party_licenses.json")
+        candidates.append(cwd / "resources" / "third_party_licenses.json")
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _load_third_party_licenses() -> dict[str, Any]:
+    for path in _third_party_licenses_candidates():
+        try:
+            if not path.is_file():
+                continue
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, UnicodeError):
+            continue
+        if isinstance(document, dict) and isinstance(document.get("entries"), list):
+            return document
+    return dict(_FALLBACK_THIRD_PARTY_LICENSES)
+
+
+def _format_third_party_licenses(document: dict[str, Any]) -> str:
+    title = str(document.get("title") or "开源软件版权声明")
+    intro = str(document.get("intro") or "").strip()
+    lines = [title, ""]
+    if intro:
+        lines.extend([intro, ""])
+    entries = document.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    for index, raw in enumerate(entries, start=1):
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip() or f"条目 {index}"
+        license_name = str(raw.get("license") or "").strip() or "未知"
+        url = str(raw.get("url") or "").strip()
+        note = str(raw.get("note") or "").strip()
+        lines.append(f"{index}. {name}")
+        lines.append(f"   许可证：{license_name}")
+        if url:
+            lines.append(f"   地址：{url}")
+        if note:
+            lines.append(f"   说明：{note}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 class MessageDisplayDialog(QDialog):
@@ -1814,7 +2143,7 @@ class MessageDisplayDialog(QDialog):
         event.ignore()
 
     def keyPressEvent(self, event: Any) -> None:
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Key_Escape:
             event.ignore()
             return
         super().keyPressEvent(event)
@@ -1846,8 +2175,10 @@ class ClientWindow(QMainWindow):
         self.current_speech_success = False
         self._config_snapshot: Optional[ConfigSnapshot] = None
         # Per-server runtime state so multi-server configs do not clobber each other.
-        self._server_display_defaults: dict[tuple[str, int], tuple[str, float]] = {}
+        # (display_position, display_duration_ratio, speech_rate)
+        self._server_display_defaults: dict[tuple[str, int], tuple[str, float, float]] = {}
         self._server_config_ids: dict[tuple[str, int], str] = {}
+        self.speech_rate = 0.75
         # Deduplicate concurrent UPDATE_AVAILABLE pushes for the same package digest.
         # Seed from disk so a force catch-up after restart cannot re-apply the same sha.
         self._update_apply_in_progress: set[str] = set()
@@ -1904,8 +2235,8 @@ class ClientWindow(QMainWindow):
         settings_layout.setSpacing(16)
         self.settings_categories = QListWidget()
         self.settings_categories.setFixedWidth(150)
-        self.settings_categories.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.settings_categories.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.settings_categories.setHorizontalScrollBarPolicy(ScrollBarAlwaysOff)
+        self.settings_categories.setVerticalScrollBarPolicy(ScrollBarAlwaysOff)
         self.settings_categories.addItems(["连接与服务端", "客户端身份", "系统", "关于"])
         self.settings_categories.currentRowChanged.connect(self.settings_pages_index_changed)
         settings_layout.addWidget(self.settings_categories)
@@ -1919,7 +2250,7 @@ class ClientWindow(QMainWindow):
         )
         self.client_fingerprint = _public_key_fingerprint(identity)
         self.identity_label = QLabel("客户端公钥指纹：\n{}".format(self.client_fingerprint))
-        self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.identity_label.setTextInteractionFlags(TextSelectableByMouse)
 
         connection_page = QWidget()
         connection_layout = QVBoxLayout(connection_page)
@@ -1928,7 +2259,9 @@ class ClientWindow(QMainWindow):
         connection_group_layout = QVBoxLayout(connection_group)
         form = QFormLayout()
         self.destination = QLineEdit("255.255.255.255")
-        self.destination.setPlaceholderText("例如 255.255.255.255、192.168.1.0/24、192.168.1.10 或 auto")
+        self.destination.setPlaceholderText(
+            "例如 255.255.255.255、192.168.1.0/24、192.168.1.10 或 auto"
+        )
         self.destination.returnPressed.connect(self.scan_servers)
         scan_address_row = QWidget()
         scan_address_layout = QHBoxLayout(scan_address_row)
@@ -1962,7 +2295,9 @@ class ClientWindow(QMainWindow):
         scanned_column.addWidget(QLabel("扫描到的服务端"))
         self.scanned_list = QListWidget()
         self.scanned_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.scanned_list.currentRowChanged.connect(lambda _row: self._on_scanned_selection_changed())
+        self.scanned_list.currentRowChanged.connect(
+            lambda _row: self._on_scanned_selection_changed()
+        )
         self.scanned_list.itemDoubleClicked.connect(lambda _item: self.connect_selected())
         scanned_column.addWidget(self.scanned_list, 1)
         scanned_actions = QHBoxLayout()
@@ -2063,9 +2398,7 @@ class ClientWindow(QMainWindow):
         about_group_layout.addWidget(QLabel("客户端配置与叫号接收程序"))
         about_version_text = display_version()
         self.about_version_button = QPushButton(f"版本 {about_version_text}（复制）")
-        self.about_version_button.setToolTip(
-            "点击复制版本与构建时间；连续点击 7 次打开开发者面板"
-        )
+        self.about_version_button.setToolTip("点击复制版本与构建时间；连续点击 7 次打开开发者面板")
         self.about_version_button.clicked.connect(self.about_version_clicked)
         about_group_layout.addWidget(self.about_version_button)
         build_label = QLabel(
@@ -2073,6 +2406,10 @@ class ClientWindow(QMainWindow):
         )
         build_label.setStyleSheet("color: #666;")
         about_group_layout.addWidget(build_label)
+        self.about_licenses_button = QPushButton("开源软件版权声明")
+        self.about_licenses_button.setToolTip("查看本软件使用的开源组件与许可证")
+        self.about_licenses_button.clicked.connect(self.show_third_party_licenses)
+        about_group_layout.addWidget(self.about_licenses_button)
         about_group_layout.addStretch(1)
         about_layout.addWidget(about_group, 1)
         self.settings_pages.addWidget(about_page)
@@ -2171,6 +2508,24 @@ class ClientWindow(QMainWindow):
             clipboard.setText(display_version())
             self.status_label.setText("已复制版本信息：{}".format(display_version()))
 
+    def show_third_party_licenses(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("开源软件版权声明")
+        dialog.setModal(True)
+        dialog.resize(640, 480)
+        layout = QVBoxLayout(dialog)
+        text = QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText(_format_third_party_licenses(_load_third_party_licenses()))
+        layout.addWidget(text, 1)
+        close_btn = QPushButton("关闭", dialog)
+        close_btn.clicked.connect(dialog.accept)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(close_btn)
+        layout.addLayout(actions)
+        dialog.exec_()
+
     def _show_developer_panel(self) -> None:
         if not hasattr(self, "developer_dialog"):
             dialog = QDialog(self)
@@ -2220,29 +2575,18 @@ class ClientWindow(QMainWindow):
         # prevents showing a notification from activating the settings page.
         self.display = MessageDisplayDialog()
         self.display.setWindowTitle("lovemilk class broadcaster")
-        self.display.setWindowFlags(
-            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        )
+        self.display.setWindowFlags(Window | FramelessWindowHint | WindowStaysOnTopHint | Tool)
         self.display.resize(900, 360)
-        layout = QVBoxLayout(self.display)
-        # Side text margin 0.25rem relative to content font size (1rem = font px).
-        content_font_px = 38
-        side_margin_px = max(1, int(round(content_font_px * 0.25)))
-        layout.setContentsMargins(side_margin_px, 12, side_margin_px, 12)
-        layout.setSpacing(8)
+        self._display_layout = QVBoxLayout(self.display)
+        self._display_layout.setSpacing(8)
         self.display_time = QLabel()
-        self.display_time.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.display_time.setStyleSheet("font-size: 18px; font-weight: 600;")
-        layout.addWidget(self.display_time)
+        self.display_time.setAlignment(AlignLeft | AlignVCenter)
+        self._display_layout.addWidget(self.display_time)
         self.display_content = MarqueeLabel()
-        self.display_content.setAlignment(Qt.AlignCenter)
+        self.display_content.setAlignment(AlignCenter)
         self.display_content.setWordWrap(False)
         self.display_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.display_content.setStyleSheet(
-            "font-size: {}px; font-weight: 600;".format(content_font_px)
-        )
-        self.display_content.set_side_margin_px(side_margin_px)
-        layout.addWidget(self.display_content, 1)
+        self._display_layout.addWidget(self.display_content, 1)
         close_row = QHBoxLayout()
         self.display_close_button = QPushButton("关闭")
         self.display_close_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -2250,7 +2594,7 @@ class ClientWindow(QMainWindow):
         self.display_close_button.clicked.connect(self._dismiss_current)
         self.display_close_button.hide()
         close_row.addWidget(self.display_close_button)
-        layout.addLayout(close_row)
+        self._display_layout.addLayout(close_row)
         self.display_timer = QTimer(self)
         self.display_timer.setSingleShot(True)
         self.display_timer.timeout.connect(self._display_minimum_elapsed)
@@ -2262,27 +2606,147 @@ class ClientWindow(QMainWindow):
         self.withdrawal_speech_done = True
         self.withdrawal_speech: Optional[SpeechWorker] = None
         self._withdrawal_speech_id = "withdrawal-notice"
+        # Admin-pushed from ConnectResp; empty family / size → platform defaults (render only).
+        self._server_default_font_family = ""
+        self._server_default_font_size = ""  # expression; empty → built-in 25vh
+        self._apply_message_font()
+
+    def _active_screen_size(self) -> tuple[int, int]:
+        """Width/height of the screen that hosts the message popup (for vw/vh)."""
+        try:
+            widget = getattr(self, "display", None)
+            if widget is not None:
+                screen = widget.screen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    return int(geo.width()), int(geo.height())
+            app = QApplication.instance()
+            if app is not None:
+                screen = app.primaryScreen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    return int(geo.width()), int(geo.height())
+        except Exception:
+            pass
+        return 0, 0
+
+    def _effective_message_font_family(self) -> str:
+        """Admin per-device family when set; otherwise platform default."""
+        server_family = str(getattr(self, "_server_default_font_family", "") or "").strip()
+        return resolve_message_font_family(server_family)
+
+    def _resolve_font_size_expr(self, expr: object) -> int:
+        width, height = self._active_screen_size()
+        return resolve_font_size_px(
+            expr,
+            screen_width=width,
+            screen_height=height,
+            default_px=FONT_DEFAULT_PX,
+        )
+
+    def _effective_message_font_size(self, override: Optional[str] = None) -> int:
+        """Message override → device default expression → built-in 25vh."""
+        if override is not None and str(override).strip():
+            return self._resolve_font_size_expr(override)
+        return self._resolve_font_size_expr(getattr(self, "_server_default_font_size", "") or "")
+
+    def _apply_message_font(
+        self, size_px: Optional[int] = None, family: Optional[str] = None
+    ) -> None:
+        """Update broadcast body/time styles, family, and 0.25em side margins."""
+        from .core.fontsize import clamp_px as clamp_font_px
+
+        content_font_px = (
+            int(size_px)
+            if size_px is not None
+            else self._effective_message_font_size()
+        )
+        # Already resolved to pixels — only clamp for Qt, do NOT re-validate as "Npx"
+        # (admin px max is 120; 25vh on a tall screen is often larger).
+        content_font_px = clamp_font_px(content_font_px)
+        family_name = family if family is not None else self._effective_message_font_family()
+        family_name = resolve_message_font_family(family_name)
+        side_margin_px = max(1, int(round(content_font_px * 0.25)))
+        time_font_px = max(12, min(36, int(round(content_font_px * 0.47))))
+        if hasattr(self, "_display_layout") and self._display_layout is not None:
+            self._display_layout.setContentsMargins(side_margin_px, 12, side_margin_px, 12)
+        family_css = family_name.replace("\\", "\\\\").replace('"', '\\"')
+        if hasattr(self, "display_time") and self.display_time is not None:
+            self.display_time.setStyleSheet(
+                'font-family: "{}"; font-size: {}px; font-weight: 600;'.format(
+                    family_css, time_font_px
+                )
+            )
+        if hasattr(self, "display_content") and self.display_content is not None:
+            self.display_content.setStyleSheet(
+                'font-family: "{}"; font-size: {}px; font-weight: 600;'.format(
+                    family_css, content_font_px
+                )
+            )
+            try:
+                font = QFont(family_name, content_font_px)
+                font.setBold(True)
+                self.display_content.setFont(font)
+            except Exception:
+                pass
+            self.display_content.set_side_margin_px(side_margin_px)
+            try:
+                self.display_content.updateGeometry()
+                self.display_content.update()
+            except Exception:
+                pass
+        if getattr(self, "display", None) is not None and self.display.isVisible():
+            self._position_display()
+
+    def _server_font_updated(
+        self, endpoint_key: object, family: str, size_expr: str = ""
+    ) -> None:
+        """Apply admin per-device font family/size expression from ConnectResp."""
+        _ = endpoint_key
+        cleaned = str(family or "").strip()
+        if cleaned in ("(默认)", "(default)", "default"):
+            cleaned = ""
+        size = str(size_expr or "").strip()
+        if size in ("0", "(默认)", "(default)", "default"):
+            size = ""
+        previous_family = str(getattr(self, "_server_default_font_family", "") or "")
+        previous_size = str(getattr(self, "_server_default_font_size", "") or "")
+        self._server_default_font_family = cleaned
+        self._server_default_font_size = size
+        if cleaned != previous_family or size != previous_size:
+            LOGGER.info(
+                "server default font applied family={!r} size={!r}",
+                cleaned or "(platform)",
+                size or FONT_DEFAULT_EXPR,
+            )
+            self._apply_message_font()
 
     def _config_updated(self, endpoint_key: object, snapshot: ConfigSnapshot) -> None:
         # Keep per-server defaults; only apply global UI defaults when this endpoint
         # is the currently selected server (or no selection yet).
+        if not isinstance(snapshot, ConfigSnapshot):
+            return
         key: Optional[tuple[str, int]] = None
         if isinstance(endpoint_key, tuple) and len(endpoint_key) == 2:
             key = (str(endpoint_key[0]), int(endpoint_key[1]))
             self._server_display_defaults[key] = (
                 snapshot.display_position,
                 float(snapshot.display_duration_ratio),
+                float(getattr(snapshot, "speech_rate", DEFAULT_SPEECH_RATE) or DEFAULT_SPEECH_RATE),
             )
             self._server_config_ids[key] = snapshot.config_id
             self.state_store.set_server_config_id(
                 host=key[0], tcp_port=key[1], config_id=snapshot.config_id
             )
         selected = self._selected_list_item()
-        selected_key = self._endpoint_key(selected.data(Qt.UserRole)) if selected is not None else None
+        selected_key = self._endpoint_key(selected.data(UserRole)) if selected is not None else None
         if key is None or selected_key is None or selected_key == key:
             self._config_snapshot = snapshot
             self.display_position = snapshot.display_position
             self.display_duration_ratio = snapshot.display_duration_ratio
+            self.speech_rate = float(
+                getattr(snapshot, "speech_rate", DEFAULT_SPEECH_RATE) or DEFAULT_SPEECH_RATE
+            )
         self._refresh_selection_details()
         if self.listener_worker is not None:
             self.listener_worker.idle_timeout_seconds = self._listener_idle_timeout_seconds()
@@ -2307,11 +2771,17 @@ class ClientWindow(QMainWindow):
         text = getattr(self.display_content, "_source_text", "") or ""
         metrics = self.display_content.fontMetrics()
         side = max(0, int(getattr(self.display_content, "_side_margin_px", 0)))
-        layout_margins = self.display.layout().contentsMargins() if self.display.layout() is not None else None
-        outer_side = (layout_margins.left() + layout_margins.right()) if layout_margins is not None else 0
-        text_width = metrics.horizontalAdvance(text.split("\n", 1)[0]) if text else 0
-        needed = text_width + 2 * side + outer_side + 8
-        width = min(max_width, max(320, needed if "\n" not in text else natural_width, natural_width))
+        layout_margins = (
+            self.display.layout().contentsMargins() if self.display.layout() is not None else None
+        )
+        outer_side = (
+            (layout_margins.left() + layout_margins.right()) if layout_margins is not None else 0
+        )
+        measured = text_width(metrics, text.split("\n", 1)[0]) if text else 0
+        needed = measured + 2 * side + outer_side + 8
+        width = min(
+            max_width, max(320, needed if "\n" not in text else natural_width, natural_width)
+        )
         width = min(width, max_width)
         height = min(max(self.display.sizeHint().height(), 160), max(1, area.height() - margin * 2))
         self.display.resize(width, height)
@@ -2358,31 +2828,58 @@ class ClientWindow(QMainWindow):
             "bottom": ("center", "bottom"),
             "bottom-right": ("right", "bottom"),
         }[position]
-        x = max(area.left() + margin, min(horizontal[column], area.left() + area.width() - width - margin))
-        y = max(area.top() + margin, min(vertical[row], area.top() + area.height() - height - margin))
+        x = max(
+            area.left() + margin,
+            min(horizontal[column], area.left() + area.width() - width - margin),
+        )
+        y = max(
+            area.top() + margin, min(vertical[row], area.top() + area.height() - height - margin)
+        )
         point = QPoint(x, y)
+        # X11 (Debian classroom): move + setGeometry + QWindow.setPosition; re-assert after map.
         self.display.move(point)
+        try:
+            self.display.setGeometry(x, y, width, height)
+        except Exception:
+            pass
         window_handle = self.display.windowHandle()
         if window_handle is not None:
-            window_handle.setPosition(point)
+            try:
+                window_handle.setPosition(point)
+            except Exception:
+                pass
+        self._last_display_position = position
+        self._last_display_point = point
 
     def _raise_display(self) -> None:
         """每次消息显示时重新声明顶层窗口，兼容 Linux 窗口管理器。"""
-        self.display.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.display.setWindowFlag(WindowStaysOnTopHint, True)
+        # setWindowFlag can hide the widget on some Qt5 builds — ensure visible again.
+        if not self.display.isVisible():
+            self.display.show()
         self.display.raise_()
         self.display.activateWindow()
         window_handle = self.display.windowHandle()
         if window_handle is not None:
-            window_handle.setFlag(Qt.WindowStaysOnTopHint, True)
-            window_handle.raise_()
+            try:
+                window_handle.setFlag(WindowStaysOnTopHint, True)
+                window_handle.raise_()
+            except Exception:
+                pass
 
     def _show_display(self, position: Optional[str] = None) -> None:
-        """显示无边框消息窗并在窗口管理器完成映射后再次定位和置顶。"""
-        self.display.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        """显示无边框消息窗并在窗口管理器完成映射后再次定位和置顶。
+
+        Linux/X11: deferred re-position (0ms / 50ms / 200ms) so WMs that ignore the
+        first move() still land on the nine-grid slot after map.
+        """
+        self.display.setWindowFlag(WindowStaysOnTopHint, True)
         self.display.show()
         self._raise_display()
-        QTimer.singleShot(0, lambda: self._position_display(position))
-        QTimer.singleShot(0, self._raise_display)
+        self._position_display(position)
+        for delay_ms in (0, 50, 200):
+            QTimer.singleShot(delay_ms, lambda pos=position: self._position_display(pos))
+            QTimer.singleShot(delay_ms, self._raise_display)
 
     def _start_connection(self, endpoint: dict[str, Any]) -> None:
         endpoint_key = (str(endpoint["host"]), int(endpoint["tcp_port"]))
@@ -2394,24 +2891,31 @@ class ClientWindow(QMainWindow):
             return
         if existing is not None:
             self.connection_workers.pop(endpoint_key, None)
-        worker = ConnectionWorker(endpoint, self.private_key, self.certificate, self.state_store, self.data_dir)
+        worker = ConnectionWorker(
+            endpoint, self.private_key, self.certificate, self.state_store, self.data_dir
+        )
         LOGGER.info("starting connection {}:{}", endpoint.get("host"), endpoint.get("tcp_port"))
         self.connection_workers[endpoint_key] = worker
         self._connection_attempts.add(endpoint_key)
         self._update_remove_button()
         worker.status.connect(self._connection_status_changed)
         worker.connection_state.connect(self._connection_state_changed)
-        worker.finished.connect(lambda key=endpoint_key, w=worker: self._connection_worker_finished(key, w))
+        worker.finished.connect(
+            lambda key=endpoint_key, w=worker: self._connection_worker_finished(key, w)
+        )
         worker.config_updated.connect(self._config_updated)
         worker.certificate_mismatch.connect(self._confirm_server_fingerprint_change)
         worker.received.connect(self._message_received)
         worker.withdrawn.connect(self._message_withdrawn)
+        worker.server_font_updated.connect(self._server_font_updated, QueuedConnection)
         # QueuedConnection keeps the connection thread free while UI schedules the apply worker.
-        worker.update_available.connect(self._update_available, Qt.ConnectionType.QueuedConnection)
+        worker.update_available.connect(self._update_available, QueuedConnection)
         worker.start()
         self._update_connect_button()
 
-    def _connection_worker_finished(self, endpoint_key: tuple[str, int], worker: ConnectionWorker) -> None:
+    def _connection_worker_finished(
+        self, endpoint_key: tuple[str, int], worker: ConnectionWorker
+    ) -> None:
         current = self.connection_workers.get(endpoint_key)
         if current is worker:
             self.connection_workers.pop(endpoint_key, None)
@@ -2422,7 +2926,9 @@ class ClientWindow(QMainWindow):
     def _update_available(self, update: dict[str, Any]) -> None:
         """Schedule download/verify/apply on a background thread (never block the UI loop)."""
         if not isinstance(update, dict):
-            LOGGER.error("update available ignored: payload is not a dict type={}", type(update).__name__)
+            LOGGER.error(
+                "update available ignored: payload is not a dict type={}", type(update).__name__
+            )
             return
         digest = str(update.get("sha256") or "").lower()
         target_client_version = str(update.get("client_version") or "").strip()
@@ -2468,7 +2974,11 @@ class ClientWindow(QMainWindow):
                 if host and port > 0:
                     update["source_host"] = host
                     update["source_tcp_port"] = port
-                    fp = getattr(worker, "server_fingerprint", None) or endpoint.get("fingerprint") or b""
+                    fp = (
+                        getattr(worker, "server_fingerprint", None)
+                        or endpoint.get("fingerprint")
+                        or b""
+                    )
                     if isinstance(fp, (bytes, bytearray)) and len(fp) == 32:
                         update["source_fingerprint"] = bytes(fp)
                     break
@@ -2501,9 +3011,9 @@ class ClientWindow(QMainWindow):
                 pass
             LOGGER.error("update apply worker finished error sha256={} error={}", sha, error)
 
-        apply_worker.finished_ok.connect(_on_ok, Qt.ConnectionType.QueuedConnection)
-        apply_worker.finished_error.connect(_on_err, Qt.ConnectionType.QueuedConnection)
-        apply_worker.quit_for_update.connect(self._quit_for_update, Qt.ConnectionType.QueuedConnection)
+        apply_worker.finished_ok.connect(_on_ok, QueuedConnection)
+        apply_worker.finished_error.connect(_on_err, QueuedConnection)
+        apply_worker.quit_for_update.connect(self._quit_for_update, QueuedConnection)
         apply_worker.start()
         LOGGER.info("update apply worker started sha256={}", digest)
 
@@ -2576,7 +3086,9 @@ class ClientWindow(QMainWindow):
                 legacy.replace(canonical)
                 LOGGER.info("migrated legacy update package {} -> {}", legacy, canonical)
             except OSError as exc:
-                LOGGER.warning("could not rename legacy update package {} -> {}: {}", legacy, canonical, exc)
+                LOGGER.warning(
+                    "could not rename legacy update package {} -> {}: {}", legacy, canonical, exc
+                )
                 return legacy
         return canonical
 
@@ -2607,17 +3119,32 @@ class ClientWindow(QMainWindow):
         menu.addAction(show_action)
         # Exit is only available from the developer panel (version click), not the tray.
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(
-            lambda reason: (
-                self.show_window() if reason == QSystemTrayIcon.ActivationReason.Trigger else None
-            )
-        )
+        self.tray.activated.connect(self._tray_activated)
         # Some Windows environments report tray as unavailable until the shell is ready.
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
             self.tray.setToolTip("lovemilk class broadcaster")
         else:
             LOGGER.warning("system tray unavailable; settings window will stay visible")
+
+    def _tray_activated(self, reason: object) -> None:
+        """Open settings on left-click; ignore other activation reasons.
+
+        PySide2 exposes ``QSystemTrayIcon.Trigger``; PySide6 nests it under
+        ``ActivationReason``. Guard against mid-shutdown clicks after Ctrl+C.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        trigger = getattr(QSystemTrayIcon, "Trigger", None)
+        nested = getattr(QSystemTrayIcon, "ActivationReason", None)
+        if nested is not None:
+            trigger = getattr(nested, "Trigger", trigger)
+        if trigger is None or reason != trigger:
+            return
+        try:
+            self.show_window()
+        except Exception:
+            LOGGER.exception("tray activation failed to show settings window")
 
     def _selected_list_item(self) -> Optional[QListWidgetItem]:
         """Active selection prefers the side the user last clicked."""
@@ -2656,7 +3183,7 @@ class ClientWindow(QMainWindow):
         """Show fingerprint/config/status for the active selection only."""
         item = self._selected_list_item()
         self._show_fingerprint_for_item(item)
-        key = self._endpoint_key(item.data(Qt.UserRole)) if item is not None else None
+        key = self._endpoint_key(item.data(UserRole)) if item is not None else None
         if key is None:
             self.config_status_label.setText("配置：—")
             if not self._server_status_text:
@@ -2677,15 +3204,19 @@ class ClientWindow(QMainWindow):
             self._server_config_ids[key] = config_id
             defaults = self._server_display_defaults.get(key)
             if defaults is None:
+                snap = worker.last_snapshot
                 self._server_display_defaults[key] = (
-                    worker.last_snapshot.display_position,
-                    float(worker.last_snapshot.display_duration_ratio),
+                    snap.display_position,
+                    float(snap.display_duration_ratio),
+                    float(getattr(snap, "speech_rate", DEFAULT_SPEECH_RATE) or DEFAULT_SPEECH_RATE),
                 )
         if config_id:
             defaults = self._server_display_defaults.get(key)
             if defaults:
                 self.config_status_label.setText(
-                    "配置：{}（显示 {} / 比率 {}）".format(config_id, defaults[0], defaults[1])
+                    "配置：{}（显示 {} / 比率 {} / 语速 {}）".format(
+                        config_id, defaults[0], defaults[1], defaults[2]
+                    )
                 )
             else:
                 self.config_status_label.setText("配置：{}".format(config_id))
@@ -2718,7 +3249,7 @@ class ClientWindow(QMainWindow):
         previous_key = None
         current = self.saved_list.currentItem()
         if current is not None:
-            previous_key = self._endpoint_key(current.data(Qt.UserRole))
+            previous_key = self._endpoint_key(current.data(UserRole))
         self.saved_list.clear()
         select_row = 0
         for index, saved in enumerate(self.state_store.servers()):
@@ -2728,8 +3259,8 @@ class ClientWindow(QMainWindow):
             endpoint_key = self._endpoint_key(saved)
             state = self._connection_state_label(endpoint_key)
             item = QListWidgetItem("{}  [{}]".format(base, state))
-            item.setData(Qt.UserRole, saved)
-            item.setData(Qt.UserRole + 1, base)
+            item.setData(UserRole, saved)
+            item.setData(UserRole + 1, base)
             self.saved_list.addItem(item)
             if previous_key is not None and endpoint_key == previous_key:
                 select_row = index
@@ -2753,7 +3284,7 @@ class ClientWindow(QMainWindow):
         previous_key = None
         current = self.scanned_list.currentItem()
         if current is not None:
-            previous_key = self._endpoint_key(current.data(Qt.UserRole))
+            previous_key = self._endpoint_key(current.data(UserRole))
         self.scanned_list.clear()
         saved_keys = self._saved_endpoint_keys()
         select_row = 0
@@ -2766,8 +3297,8 @@ class ClientWindow(QMainWindow):
             base = "{}  {}:{}".format(server.service_name, server.address[0], server.tcp_port)
             state = self._connection_state_label(endpoint_key)
             list_item = QListWidgetItem("{}  [{}]".format(base, state))
-            list_item.setData(Qt.UserRole, server)
-            list_item.setData(Qt.UserRole + 1, base)
+            list_item.setData(UserRole, server)
+            list_item.setData(UserRole + 1, base)
             self.scanned_list.addItem(list_item)
             if previous_key is not None and endpoint_key == previous_key:
                 select_row = visible_index
@@ -2789,8 +3320,12 @@ class ClientWindow(QMainWindow):
         self.scan_worker.start()
 
     def _servers_found(self, servers: list[DiscoveryResponse]) -> None:
-        scanned_keys = {key for key in (self._endpoint_key(server) for server in servers) if key is not None}
-        self._connection_attempts.intersection_update(scanned_keys | set(self._connected_endpoint_keys))
+        scanned_keys = {
+            key for key in (self._endpoint_key(server) for server in servers) if key is not None
+        }
+        self._connection_attempts.intersection_update(
+            scanned_keys | set(self._connected_endpoint_keys)
+        )
         # Refresh saved first so left-side filtering sees the latest right column.
         self._load_saved_server()
         self._load_scanned_servers(servers)
@@ -2819,7 +3354,7 @@ class ClientWindow(QMainWindow):
         if item is None:
             self.status_label.setText("请在右侧选择要删除的已保存服务端")
             return
-        value = item.data(Qt.UserRole)
+        value = item.data(UserRole)
         endpoint_key = self._endpoint_key(value)
         if endpoint_key is None:
             self._update_remove_button()
@@ -2860,7 +3395,8 @@ class ClientWindow(QMainWindow):
             (
                 item
                 for item in self.state_store.servers()
-                if str(item.get("host", "")).strip() == host and int(item.get("tcp_port", 0)) == port
+                if str(item.get("host", "")).strip() == host
+                and int(item.get("tcp_port", 0)) == port
             ),
             None,
         )
@@ -2881,7 +3417,7 @@ class ClientWindow(QMainWindow):
     def _select_saved_endpoint(self, host: str, tcp_port: int) -> None:
         target = (str(host), int(tcp_port))
         for row in range(self.saved_list.count()):
-            if self._endpoint_key(self.saved_list.item(row).data(Qt.UserRole)) == target:
+            if self._endpoint_key(self.saved_list.item(row).data(UserRole)) == target:
                 self._selection_source = "saved"
                 self.saved_list.setCurrentRow(row)
                 self._on_saved_selection_changed()
@@ -2902,12 +3438,12 @@ class ClientWindow(QMainWindow):
         item = self.saved_list.currentItem() if self._selection_source == "saved" else None
         if item is None:
             item = self.saved_list.currentItem()
-        key = self._endpoint_key(item.data(Qt.UserRole)) if item is not None else None
+        key = self._endpoint_key(item.data(UserRole)) if item is not None else None
         self.remove_server_button.setEnabled(item is not None and key is not None)
 
     def _refresh_list_item_state(self, item: QListWidgetItem) -> None:
-        key = self._endpoint_key(item.data(Qt.UserRole))
-        base = item.data(Qt.UserRole + 1) or item.text()
+        key = self._endpoint_key(item.data(UserRole))
+        base = item.data(UserRole + 1) or item.text()
         if key is None:
             return
         state = self._connection_state_label(key)
@@ -2932,11 +3468,11 @@ class ClientWindow(QMainWindow):
         for list_widget in (self.scanned_list, self.saved_list):
             for row in range(list_widget.count()):
                 item = list_widget.item(row)
-                if self._endpoint_key(item.data(Qt.UserRole)) == key:
-                    base = item.data(Qt.UserRole + 1) or item.text()
+                if self._endpoint_key(item.data(UserRole)) == key:
+                    base = item.data(UserRole + 1) or item.text()
                     item.setText("{}  [{}]".format(base, status))
         selected = self._selected_list_item()
-        selected_key = self._endpoint_key(selected.data(Qt.UserRole)) if selected is not None else None
+        selected_key = self._endpoint_key(selected.data(UserRole)) if selected is not None else None
         if selected_key == key or selected_key is None:
             self.status_label.setText("{}:{} — {}".format(key[0], key[1], status))
         self._update_connect_button()
@@ -2959,7 +3495,7 @@ class ClientWindow(QMainWindow):
 
     def _update_connect_button(self) -> None:
         item = self._selected_list_item()
-        selected_key = self._endpoint_key(item.data(Qt.UserRole)) if item is not None else None
+        selected_key = self._endpoint_key(item.data(UserRole)) if item is not None else None
         has_selection = selected_key is not None
         # Only "连接" and "删除". No save / reconnect labels.
         self.connect_button.setText("连接")
@@ -2973,7 +3509,7 @@ class ClientWindow(QMainWindow):
                 "左侧仅显示尚未保存的扫描结果；已保存的只在右侧。连接 = 保存 + 连接 + 自动连接。"
             )
             return
-        server = item.data(Qt.UserRole)
+        server = item.data(UserRole)
         try:
             fingerprint = (
                 server.fingerprint
@@ -2983,7 +3519,9 @@ class ClientWindow(QMainWindow):
         except (TypeError, ValueError, KeyError):
             fingerprint = b""
         if not fingerprint or not any(fingerprint):
-            self.fingerprint_label.setText("服务端公钥 SHA-256：\n尚未获取，连接时将先确认服务端证书。")
+            self.fingerprint_label.setText(
+                "服务端公钥 SHA-256：\n尚未获取，连接时将先确认服务端证书。"
+            )
             return
         self.fingerprint_label.setText(
             "服务端公钥 SHA-256：\n{}".format(
@@ -2996,7 +3534,7 @@ class ClientWindow(QMainWindow):
         if item is None:
             QMessageBox.information(self, "选择服务端", "请先在左侧或右侧选择一个服务端。")
             return
-        value = item.data(Qt.UserRole)
+        value = item.data(UserRole)
         if isinstance(value, DiscoveryResponse):
             host, tcp_port, http_port, fingerprint = (
                 value.address[0],
@@ -3007,13 +3545,21 @@ class ClientWindow(QMainWindow):
         else:
             host, tcp_port, http_port = value["host"], value["tcp_port"], value["http_port"]
             fingerprint = base64.b64decode(value["fingerprint"])
-        self._connect_endpoint(str(host), int(tcp_port), int(http_port or 39003), bytes(fingerprint))
+        self._connect_endpoint(
+            str(host), int(tcp_port), int(http_port or 39003), bytes(fingerprint)
+        )
 
-    def _connect_endpoint(self, host: str, tcp_port: int, http_port: int, fingerprint: bytes) -> None:
+    def _connect_endpoint(
+        self, host: str, tcp_port: int, http_port: int, fingerprint: bytes
+    ) -> None:
         """Connect = save + connect + enable auto_connect for this endpoint."""
         endpoint_key = (str(host), int(tcp_port))
         existing_worker = self.connection_workers.get(endpoint_key)
-        if endpoint_key in self._connected_endpoint_keys and existing_worker is not None and existing_worker.isRunning():
+        if (
+            endpoint_key in self._connected_endpoint_keys
+            and existing_worker is not None
+            and existing_worker.isRunning()
+        ):
             # Already online: keep other servers; just nudge this one.
             self.state_store.set_server(
                 host=host,
@@ -3032,7 +3578,9 @@ class ClientWindow(QMainWindow):
                 fingerprint = probe_server_fingerprint(str(host), int(tcp_port), timeout=3)
             except Exception as exc:
                 self.status_label.setText("无法读取服务端证书：{}".format(exc))
-                QMessageBox.warning(self, "读取服务端证书失败", "{}:{}\n{}".format(host, tcp_port, exc))
+                QMessageBox.warning(
+                    self, "读取服务端证书失败", "{}:{}\n{}".format(host, tcp_port, exc)
+                )
                 return
         saved_for_ip = [
             candidate for candidate in self.state_store.servers() if candidate.get("host") == host
@@ -3090,7 +3638,9 @@ class ClientWindow(QMainWindow):
                 server_id = bytes(worker.server_fingerprint)
         if not server_id and message.source_host:
             for saved in self.state_store.servers():
-                if str(saved.get("host")) == message.source_host and int(saved.get("tcp_port", 0)) == int(message.source_tcp_port or 0):
+                if str(saved.get("host")) == message.source_host and int(
+                    saved.get("tcp_port", 0)
+                ) == int(message.source_tcp_port or 0):
                     try:
                         server_id = base64.b64decode(saved.get("fingerprint", ""), validate=True)
                     except (TypeError, ValueError):
@@ -3141,6 +3691,11 @@ class ClientWindow(QMainWindow):
         server_defaults = self._server_display_defaults.get(source_key) if source_key else None
         base_position = server_defaults[0] if server_defaults else self.display_position
         base_ratio = server_defaults[1] if server_defaults else self.display_duration_ratio
+        base_speech_rate = (
+            server_defaults[2]
+            if server_defaults and len(server_defaults) >= 3
+            else self.speech_rate
+        )
         # as_default carries deferred default config when "立即更新" is false:
         # apply it as this server's defaults before resolving this message.
         if message.as_default:
@@ -3148,20 +3703,41 @@ class ClientWindow(QMainWindow):
                 base_position = message.default_display_position
             if message.default_display_duration_ratio is not None:
                 base_ratio = message.default_display_duration_ratio
+            if message.default_speech_rate is not None:
+                base_speech_rate = float(message.default_speech_rate)
             if source_key is not None:
-                self._server_display_defaults[source_key] = (base_position, float(base_ratio))
+                self._server_display_defaults[source_key] = (
+                    base_position,
+                    float(base_ratio),
+                    float(base_speech_rate),
+                )
+        speech_rate = normalize_speech_rate(
+            message.speech_rate
+            if message.speech_rate is not None
+            else (
+                message.default_speech_rate
+                if message.default_speech_rate is not None
+                else base_speech_rate
+            ),
+            default=DEFAULT_SPEECH_RATE,
+        )
         sent_time = self._format_sent_time(message.created_at_ms)
         self.display.setWindowTitle("{} | lovemilk class broadcaster".format(sent_time))
         self.display_content.setText(message.content)
         self.display_time.setText(sent_time)
-        position = base_position if message.as_default else (message.display_position or base_position)
+        # Per-message font_size overrides device default for this playback only.
+        self._apply_message_font(size_px=self._effective_message_font_size(message.font_size))
+        position = (
+            base_position if message.as_default else (message.display_position or base_position)
+        )
         _play_notification_sound()
         self._show_display(position)
         LOGGER.info(
-            "message playback started message_id={} tts_requested={} speech_nodes={}",
+            "message playback started message_id={} tts_requested={} speech_nodes={} speech_rate={}",
             message.message_id,
             message.tts_enabled,
             len(message.speech),
+            speech_rate,
         )
         try:
             parts = compile_speech(message.speech) if message.tts_enabled else []
@@ -3172,25 +3748,38 @@ class ClientWindow(QMainWindow):
             LOGGER.error(
                 "TTS speech payload invalid message_id={} error={}", message.message_id, exc
             )
-        minimum_duration_ms = max(1000, estimate_duration_ms(parts) // 4)
-        display_ratio = base_ratio if message.as_default else (
-            base_ratio if message.display_duration_ratio is None else message.display_duration_ratio
+        display_ratio = (
+            base_ratio
+            if message.as_default
+            else (
+                base_ratio
+                if message.display_duration_ratio is None
+                else message.display_duration_ratio
+            )
         )
         self.display_close_button.setVisible(display_ratio == 0)
         if display_ratio == 0:
             self.display_timer.stop()
             # Manual close: marquee uses comfortable default speed with end holds.
             self.display_content.set_display_duration_ms(0)
+        elif message.tts_enabled and parts:
+            # TTS path: estimated speech duration + 5s headroom (capped at 120s).
+            total_ms = min(120_000, estimate_duration_ms(parts, speech_rate) + 5000)
+            self.display_timer.start(total_ms)
+            self.display_content.set_display_duration_ms(total_ms)
         else:
             configured_duration_ms = display_duration_ms(message.content, display_ratio)
-            total_ms = min(120_000, max(minimum_duration_ms, configured_duration_ms))
+            total_ms = min(120_000, max(1000, configured_duration_ms))
             self.display_timer.start(total_ms)
             # Drive marquee so one full pass (+ ≥0.5s holds) fits this window.
             self.display_content.set_display_duration_ms(total_ms)
         if message.tts_enabled and parts:
-            self.current_speech = SpeechWorker(message.message_id, parts, self.data_dir)
+            self.current_speech = SpeechWorker(
+                message.message_id, parts, self.data_dir, speech_rate=speech_rate
+            )
             self.current_speech.finished_playback.connect(self._speech_finished)
-            self.current_speech.text_part.connect(self._speech_part_started)
+            # Do not connect text_part: speech text is sanitized (symbols like
+            # <= stripped) while the popup must keep message.content verbatim.
             self.current_speech.start()
         elif not message.tts_enabled:
             # Displayed is the final receipt when speech is disabled.
@@ -3205,10 +3794,6 @@ class ClientWindow(QMainWindow):
     def _display_minimum_elapsed(self) -> None:
         self.current_displayed = True
         self._finish_current_if_ready()
-
-    def _speech_part_started(self, message_id: str, text: str) -> None:
-        if self.current_message is not None and self.current_message.message_id == message_id:
-            self.display_content.setText(text)
 
     def _speech_finished(self, message_id: str, success: bool, error: str) -> None:
         if self.current_message is None or self.current_message.message_id != message_id:
@@ -3311,13 +3896,18 @@ class ClientWindow(QMainWindow):
         # Resolve display ratio from the withdrawn message when it is on screen;
         # otherwise use the withdrawal payload / global default.
         ratio = self.display_duration_ratio
-        if self.current_message is not None and self.current_message.message_id == withdrawal.message_id:
+        if (
+            self.current_message is not None
+            and self.current_message.message_id == withdrawal.message_id
+        ):
             message = self.current_message
             if message.as_default or message.display_duration_ratio is None:
                 source_key = None
                 if message.source_host and message.source_tcp_port:
                     source_key = (str(message.source_host), int(message.source_tcp_port))
-                server_defaults = self._server_display_defaults.get(source_key) if source_key else None
+                server_defaults = (
+                    self._server_display_defaults.get(source_key) if source_key else None
+                )
                 ratio = server_defaults[1] if server_defaults else self.display_duration_ratio
             else:
                 ratio = message.display_duration_ratio
@@ -3335,7 +3925,9 @@ class ClientWindow(QMainWindow):
             self.display.setWindowTitle("{} | lovemilk class broadcaster".format(sent_time))
             self.display_time.setText(sent_time)
         withdrawn_text = self._format_withdrawal_text(withdrawal)
-        self._show_withdrawal_notice(withdrawn_text, float(ratio) if ratio is not None else self.display_duration_ratio)
+        self._show_withdrawal_notice(
+            withdrawn_text, float(ratio) if ratio is not None else self.display_duration_ratio
+        )
         self._ack(withdrawal, "withdrawn")
 
     def _show_withdrawal_notice(self, text: str, ratio: float) -> None:
@@ -3344,8 +3936,10 @@ class ClientWindow(QMainWindow):
         self.withdrawal_notice_active = True
         self.withdrawal_displayed = False
         self.withdrawal_speech_done = False
-        display_text = str(text or "消息已撤回").replace("\r", " ").replace("\n", " ").strip() or "消息已撤回"
-        self.display_content.setAlignment(Qt.AlignCenter)
+        display_text = (
+            str(text or "消息已撤回").replace("\r", " ").replace("\n", " ").strip() or "消息已撤回"
+        )
+        self.display_content.setAlignment(AlignCenter)
         self.display_content.setText(display_text)
         self.display.adjustSize()
         self.display_close_button.setVisible(ratio <= 0)
@@ -3353,24 +3947,28 @@ class ClientWindow(QMainWindow):
         self._show_display("center")
 
         parts = [SpeechPart("text", text=display_text)]
-        minimum_duration_ms = max(1000, estimate_duration_ms(parts) // 4)
+        speech_rate = normalize_speech_rate(self.speech_rate, default=DEFAULT_SPEECH_RATE)
         if ratio <= 0:
             self.withdrawal_timer.stop()
             self.display_content.set_display_duration_ms(0)
             # Manual close: display is "done" for finish gating; speech may still run.
             self.withdrawal_displayed = True
         else:
-            duration = min(120_000, max(minimum_duration_ms, display_duration_ms(display_text, ratio)))
+            # Withdrawal always speaks; window = TTS estimate + 5s (cap 120s).
+            duration = min(120_000, estimate_duration_ms(parts, speech_rate) + 5000)
             self.withdrawal_timer.start(duration)
             self.display_content.set_display_duration_ms(duration)
 
         LOGGER.info(
-            "withdrawal notice shown tts=True chars={} ratio={} manual_close={}",
+            "withdrawal notice shown tts=True chars={} ratio={} speech_rate={} manual_close={}",
             len(display_text),
             ratio,
+            speech_rate,
             ratio <= 0,
         )
-        self.withdrawal_speech = SpeechWorker(self._withdrawal_speech_id, parts, self.data_dir)
+        self.withdrawal_speech = SpeechWorker(
+            self._withdrawal_speech_id, parts, self.data_dir, speech_rate=speech_rate
+        )
         self.withdrawal_speech.finished_playback.connect(self._withdrawal_speech_finished)
         # Do not connect text_part: keep the full notice visible while speaking.
         self.withdrawal_speech.start()
@@ -3471,6 +4069,8 @@ class ClientWindow(QMainWindow):
 
     def show_window(self) -> None:
         """Force the settings window onto a visible desktop (Windows-safe)."""
+        if getattr(self, "_shutting_down", False):
+            return
         try:
             self._refresh_autostart_ui()
         except Exception:
@@ -3479,14 +4079,14 @@ class ClientWindow(QMainWindow):
             self.showNormal()
         else:
             self.show()
-        self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+        self.setWindowState(self.windowState() & ~WindowMinimized | WindowActive)
         self.raise_()
         self.activateWindow()
         # Windows sometimes needs a brief topmost pulse to bring a hidden window forward.
         if sys.platform == "win32":
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.setWindowFlag(WindowStaysOnTopHint, True)
             self.show()
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            self.setWindowFlag(WindowStaysOnTopHint, False)
             self.show()
             self.raise_()
             self.activateWindow()
@@ -3496,13 +4096,28 @@ class ClientWindow(QMainWindow):
         event.ignore()
         self.hide()
 
-    def quit_application(self) -> None:
-        """Developer-panel Exit: report user_exit then stop (人为终止 on server)."""
-        LOGGER.info("controlled shutdown requested reason=user_exit")
+    def quit_application(self, *, detail: str = "developer_exit") -> None:
+        """Controlled exit: report user_exit then stop (人为终止 on server).
+
+        Used by the developer panel and by SIGINT/SIGTERM during local ``uv run``.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+        LOGGER.info("controlled shutdown requested reason=user_exit detail={}", detail)
         if getattr(self, "tray", None) is not None:
-            self.tray.hide()
-        self._report_session_end_all("user_exit", "developer_exit")
-        self.shutdown()
+            try:
+                self.tray.hide()
+            except Exception:
+                pass
+        try:
+            self._report_session_end_all("user_exit", detail)
+        except Exception:
+            LOGGER.exception("session-end report during quit failed")
+        try:
+            self.shutdown()
+        except Exception:
+            LOGGER.exception("shutdown during quit failed")
         application = QApplication.instance()
         if application is not None:
             application.quit()
@@ -3526,7 +4141,14 @@ class ClientWindow(QMainWindow):
             time.sleep(0.05)
 
     def shutdown(self) -> None:
-        self.display_timer.stop()
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        self._shutting_down = True
+        try:
+            self.display_timer.stop()
+        except Exception:
+            pass
         self._stop_current_speech()
         try:
             self._stop_withdrawal_speech()
@@ -3563,51 +4185,95 @@ class ClientWindow(QMainWindow):
 
 
 def _configure_qt_plugin_path() -> None:
-    """Point Qt at bundled PySide6 plugins so Windows can create a GUI.
+    """Point Qt at bundled PySide2/PySide6 plugins so the GUI can start.
 
-    Packaged builds keep plugins under Lib/site-packages/PySide6/plugins. Without
-    QT_QPA_PLATFORM_PLUGIN_PATH, QApplication may start headless or fail silently
-    under pythonw.exe and the settings window never appears.
+    Windows packaged builds keep plugins under Lib/site-packages/PySide6/plugins.
+    Linux/Debian 11 uses system or venv PySide2. Without QT_QPA_PLATFORM_PLUGIN_PATH,
+    QApplication may start headless or fail silently (especially under pythonw.exe).
     """
     if os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
         return
     candidates: list[Path] = []
     install_dir = os.environ.get("MKCB_INSTALL_DIR")
+    binding = qt_binding() or "PySide6"
+    package_names = (
+        (binding, "PySide2", "PySide6") if binding == "PySide2" else (binding, "PySide6", "PySide2")
+    )
     if install_dir:
-        candidates.append(Path(install_dir) / "Lib" / "site-packages" / "PySide6" / "plugins")
-        candidates.append(Path(install_dir) / "Lib" / "site-packages" / "PySide6" / "plugins" / "platforms")
-    # Source / editable installs.
-    try:
-        import PySide6
-
-        package_dir = Path(PySide6.__file__).resolve().parent
-        candidates.append(package_dir / "plugins")
-        candidates.append(package_dir / "plugins" / "platforms")
-    except Exception:
-        pass
+        for name in package_names:
+            root = Path(install_dir) / "Lib" / "site-packages" / name / "plugins"
+            candidates.append(root)
+            candidates.append(root / "platforms")
+    # Source / editable / venv installs — prefer the binding already loaded by qtcompat.
+    for module_name in package_names:
+        try:
+            module = __import__(module_name)
+            package_dir = Path(module.__file__).resolve().parent
+            candidates.append(package_dir / "plugins")
+            candidates.append(package_dir / "plugins" / "platforms")
+        except Exception:
+            continue
     for path in candidates:
-        if path.is_dir() and (path / "platforms").is_dir() or path.name == "platforms" and path.is_dir():
-            plugin_root = path if path.name == "plugins" else path.parent
-            platforms = plugin_root / "platforms"
-            if not platforms.is_dir():
-                continue
-            os.environ["QT_PLUGIN_PATH"] = str(plugin_root)
-            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
-            # Help Windows locate Qt/PySide DLLs next to the plugins package.
-            if sys.platform == "win32":
-                bin_dir = plugin_root.parent
-                path_env = os.environ.get("PATH", "")
-                prefix = str(bin_dir)
-                if prefix and prefix.lower() not in path_env.lower():
-                    os.environ["PATH"] = prefix + os.pathsep + path_env
-                try:
-                    os.add_dll_directory(str(bin_dir))
-                except (AttributeError, FileNotFoundError, OSError):
-                    pass
-            return
+        is_platforms = path.name == "platforms" and path.is_dir()
+        is_plugins = path.is_dir() and (path / "platforms").is_dir()
+        if not (is_platforms or is_plugins):
+            continue
+        plugin_root = path if path.name == "plugins" else path.parent
+        platforms = plugin_root / "platforms"
+        if not platforms.is_dir():
+            continue
+        os.environ["QT_PLUGIN_PATH"] = str(plugin_root)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
+        # Help Windows locate Qt/PySide DLLs next to the plugins package.
+        if sys.platform == "win32":
+            bin_dir = plugin_root.parent
+            path_env = os.environ.get("PATH", "")
+            prefix = str(bin_dir)
+            if prefix and prefix.lower() not in path_env.lower():
+                os.environ["PATH"] = prefix + os.pathsep + path_env
+            try:
+                os.add_dll_directory(str(bin_dir))
+            except (AttributeError, FileNotFoundError, OSError):
+                pass
+        return
+
+
+def _install_posix_signal_quit(app: QApplication, window: "ClientWindow") -> None:
+    """Make Ctrl+C / SIGTERM quit a tray app cleanly.
+
+    Qt's event loop does not interrupt on SIGINT by itself. Install handlers that
+    call ``quit_application``, plus a short QTimer so Python can run the handler
+    while the GUI is idle (otherwise Ctrl+C only surfaces on the next Qt event,
+    e.g. a tray click — which is what produced the KeyboardInterrupt traceback).
+    """
+    if not hasattr(signal, "SIGINT"):
+        return
+
+    def _request_quit(signum: int, _frame: object) -> None:
+        name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+        LOGGER.info("POSIX signal received; quitting signum={}", name)
+        # Defer into the Qt event loop — signal handlers must stay short.
+        QTimer.singleShot(0, lambda: window.quit_application(detail=f"signal:{name.lower()}"))
+
+    try:
+        signal.signal(signal.SIGINT, _request_quit)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _request_quit)
+    except (ValueError, OSError) as exc:
+        # Signals can only be set from the main thread; ignore in odd hosts.
+        LOGGER.warning("could not install SIGINT/SIGTERM handlers error={}", exc)
+        return
+    # Wake the interpreter periodically so pending signal handlers run.
+    wakeup = QTimer(app)
+    wakeup.setInterval(200)
+    wakeup.timeout.connect(lambda: None)
+    wakeup.start()
+    app._mkcb_signal_wakeup_timer = wakeup  # type: ignore[attr-defined]
 
 
 def main() -> None:
+    # Linux classrooms: prefer X11 so nine-grid popup positioning works.
+    configure_platform_for_popup()
     # 在创建主窗口前取得安装目录锁，避免两个进程同时消费同一状态文件。
     _configure_qt_plugin_path()
     data_dir = _data_dir()
@@ -3635,9 +4301,15 @@ def main() -> None:
         QMessageBox.critical(None, "客户端启动失败", str(exc))
         return
     window.instance_lock = instance_lock
+    window._shutting_down = False
+    window._shutdown_done = False
     # Open settings when there is no data/state or no usable saved server.
     # Closing the window only hides it to the tray; it does not exit.
-    if (not had_existing_state) or window.needs_setup_ui() or not QSystemTrayIcon.isSystemTrayAvailable():
+    if (
+        (not had_existing_state)
+        or window.needs_setup_ui()
+        or not QSystemTrayIcon.isSystemTrayAvailable()
+    ):
         window.show_window()
         LOGGER.info(
             "opened settings on launch reason={}",
@@ -3648,7 +4320,8 @@ def main() -> None:
     else:
         LOGGER.info("running in tray; open settings from the tray icon")
     app.aboutToQuit.connect(window.shutdown)
-    sys.exit(app.exec())
+    _install_posix_signal_quit(app, window)
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":

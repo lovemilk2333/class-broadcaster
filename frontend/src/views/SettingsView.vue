@@ -43,6 +43,7 @@ const admin = useAdminStore()
         <template #content>
           <label>消息保留（小时）
             <SafeInputNumber name="message_ttl_hours" v-model="admin.configForm.message_ttl_hours" :min="1" :max="168" :useGrouping="false" :allowEmpty="false" :emptyValue="1" />
+            <small>投递有效期为该时长；管理端「最近消息」在保留时长 × 2 后自动删除（另有 185 天硬上限）。</small>
           </label>
           <label>语音节点最大递归解析深度
             <SafeInputNumber name="max_speech_depth" v-model="admin.configForm.max_speech_depth" :min="1" :max="64" :useGrouping="false" :allowEmpty="false" :emptyValue="1" />
@@ -55,7 +56,11 @@ const admin = useAdminStore()
           </label>
           <label>默认显示比率
             <SafeInputNumber name="default_display_duration_ratio" v-model="admin.configForm.display_duration_ratio" :min="0" :max="120" :step="0.1" mode="decimal" :minFractionDigits="0" :maxFractionDigits="2" :useGrouping="false" :allowEmpty="false" :emptyValue="0" />
-            <small>按字符权重计算显示时长；设为 0 时消息不会自动关闭。</small>
+            <small>无朗读时按 jieba Token 数计算显示时长（每 Token = 1）；设为 0 时消息不会自动关闭。开启朗读时窗口时长 = TTS 总时长 + 5 秒。</small>
+          </label>
+          <label>默认 TTS 语速
+            <SafeInputNumber name="default_speech_rate" v-model="admin.configForm.default_speech_rate" :min="0.25" :max="2" :step="0.05" mode="decimal" :minFractionDigits="0" :maxFractionDigits="2" :useGrouping="false" :allowEmpty="false" :emptyValue="0.75" />
+            <small>1.0 = 正常语速；大于 1 更快，小于 1 更慢。默认 0.75。单条消息可覆盖。</small>
           </label>
         </template>
       </Card>

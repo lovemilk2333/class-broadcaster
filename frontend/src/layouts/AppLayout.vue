@@ -44,7 +44,8 @@ const navigationItems = computed(() => [
     class: [active.value === 'updates' ? 'nav-active' : '', 'nav-beta'].filter(Boolean).join(' ')
   },
   { key: 'settings', label: '配置', icon: 'pi pi-sliders-h', to: '/settings', class: active.value === 'settings' ? 'nav-active' : '' },
-  { key: 'server', label: '服务端', icon: 'pi pi-server', to: '/server', class: active.value === 'server' ? 'nav-active' : '' }
+  { key: 'server', label: '服务端', icon: 'pi pi-server', to: '/server', class: active.value === 'server' ? 'nav-active' : '' },
+  { key: 'about', label: '关于', icon: 'pi pi-info-circle', to: '/about', class: active.value === 'about' ? 'nav-active' : '' }
 ])
 
 function navigateTo(section: SectionKey) {
@@ -78,6 +79,7 @@ async function refreshActive() {
     else if (active.value === 'updates') { await admin.loadDevices(); await admin.loadUpdates() }
     else if (active.value === 'settings') await admin.loadConfig()
     else if (active.value === 'server') await admin.loadLogViewPage(admin.serverLogViewPage, true)
+    else if (active.value === 'about') { /* static page */ }
     else await admin.loadMessages()
   } catch (error) {
     toast.add({ severity: 'error', summary: error instanceof Error ? error.message : '刷新失败', life: 3200 })
@@ -103,7 +105,7 @@ function loadSectionData(section: SectionKey) {
   if (section === 'updates') { void admin.loadDevices(); void admin.loadUpdates() }
   if (section === 'settings') void admin.loadConfig()
   if (section === 'messages') void admin.loadMessages()
-  // ServerView mounts its own log loader.
+  // ServerView mounts its own log loader; about is static.
 }
 
 const removeBeforeEach = router.beforeEach((to, from, next) => {
@@ -190,25 +192,27 @@ onMounted(() => {
 
   eventSource = new EventSource('/api/v1/events')
   eventSource.addEventListener('refresh', (event) => {
+    // SSE-driven refreshes must stay silent: no table/skeleton loading flicker.
+    const silent = { silent: true as const }
     try {
       const section = JSON.parse((event as MessageEvent).data).section
       if (section === 'all') {
         void Promise.all([
-          admin.loadMessages(),
-          admin.loadDevices(),
-          admin.loadConfig(),
-          active.value === 'updates' ? admin.loadUpdates() : Promise.resolve(),
-          active.value === 'server' ? admin.loadLogViewPage(admin.serverLogViewPage, true) : Promise.resolve()
+          admin.loadMessages(silent),
+          admin.loadDevices(silent),
+          admin.loadConfig({ silent: true }),
+          active.value === 'updates' ? admin.loadUpdates(silent) : Promise.resolve(),
+          active.value === 'server' ? admin.loadLogViewPage(admin.serverLogViewPage, true, silent) : Promise.resolve()
         ])
-      } else if (section === 'messages') void admin.loadMessages()
-      else if (section === 'devices') void admin.loadDevices()
-      else if (section === 'updates') { void admin.loadDevices(); void admin.loadUpdates() }
-      else if (section === 'config') void admin.loadConfig()
-      else if (section === 'server' && active.value === 'server') window.requestAnimationFrame(() => { void admin.loadLogViewPage(admin.serverLogViewPage, true) })
+      } else if (section === 'messages') void admin.loadMessages(silent)
+      else if (section === 'devices') void admin.loadDevices(silent)
+      else if (section === 'updates') { void admin.loadDevices(silent); void admin.loadUpdates(silent) }
+      else if (section === 'config') void admin.loadConfig({ silent: true })
+      else if (section === 'server' && active.value === 'server') window.requestAnimationFrame(() => { void admin.loadLogViewPage(admin.serverLogViewPage, true, silent) })
       else if (typeof section === 'string' && section.startsWith('client_logs:')) {
         const clientId = section.slice('client_logs:'.length)
         if (admin.deviceLogsDialogVisible && admin.deviceLogsDevice?.client_id === clientId) {
-          void admin.openDeviceLogs(admin.deviceLogsDevice, admin.deviceLogsPage)
+          void admin.openDeviceLogs(admin.deviceLogsDevice, admin.deviceLogsPage, silent)
         }
       }
     } catch {

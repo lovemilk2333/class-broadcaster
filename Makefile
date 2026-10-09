@@ -34,13 +34,17 @@ NATIVE_SERVER_ARCH := $(shell u=$$(uname -m); if [ "$$u" = x86_64 ] || [ "$$u" =
 #   make package-server / package-client → bin/ archives only (expects build/ already present)
 #   make client-full / package-client-full → client packages + an extra full .tar.zst
 #   make package / make all       → server + client release packages
+# SKIP_FRONTEND=1 → compile server without running pnpm / overwriting web/ stub
+# (use with `pnpm dev` on :39004). Release `make server` still embeds full UI.
+SKIP_FRONTEND ?= 0
+
 .PHONY: all package \
 	server client client-full build-server build-client \
 	package-server package-client package-client-full \
 	build-server-amd64 build-server-arm64 \
 	server-amd64 server-arm64 \
-	frontend-embed frontend-embed-force sync-version \
-	updater windows-icon \
+	frontend-embed frontend-embed-force ensure-web-stub sync-version \
+	updater windows-icon download-tts-models \
 	install-server-user-service uninstall-server-user-service clean
 
 all: package
@@ -66,12 +70,18 @@ client: build-client
 client-full:
 	@$(MAKE) --no-print-directory build-client CLIENT_FULL=1
 
-build-client: updater
+build-client: updater download-tts-models
 	# Windows wheels/site-packages are cached under build/cache/windows-site-packages
 	# (keyed by client/requirements.txt). Pass --refresh-site-packages to force reinstall.
 	# Launcher/updater PE icons come from assets/icons/mkcb.ico via windows-icon.
+	# Piper voices are cached under client/tts (not removed by `make clean`).
 	BUILD_DATE='$(BUILD_DATE)' python3 $(ROOT)/scripts/build_embedded_client.py --root $(ROOT) --output $(BUILD_DIR)/client/lovemilk-class-broadcaster --build-date '$(BUILD_DATE)'
 	@$(MAKE) --no-print-directory package-client CLIENT_FULL='$(CLIENT_FULL)' PACKAGE_FULL='$(PACKAGE_FULL)'
+
+# Download TTS ONNX voices into client/tts (gitignored; survives `make clean`):
+# piper-plus Tsukuyomi-chan (Windows) + rhasspy zh/en (Linux piper-tts).
+download-tts-models:
+	python3 $(ROOT)/scripts/download_tts_models.py --out $(CLIENT_DIR)/tts
 
 # -----------------------------------------------------------------------------
 # Version stamp
@@ -105,6 +115,17 @@ frontend-embed: $(FRONTEND_EMBED_STAMP)
 frontend-embed-force:
 	@rm -f $(FRONTEND_EMBED_STAMP)
 	@$(MAKE) --no-print-directory frontend-embed
+
+# Ensure go:embed always has ≥1 file (committed stub). Safe no-op when present.
+ensure-web-stub:
+	@mkdir -p $(SERVER_DIR)/cmd/server/web
+	@if [ ! -f $(SERVER_DIR)/cmd/server/web/index.html ]; then \
+		printf '%s\n' \
+			'<!DOCTYPE html><html><head><meta charset="utf-8"><title>mkcb API</title></head>' \
+			'<body><p>Dev stub — use <code>pnpm dev</code> on :39004. Release: <code>make frontend-embed</code>.</p></body></html>' \
+			> $(SERVER_DIR)/cmd/server/web/index.html; \
+		echo "wrote stub $(SERVER_DIR)/cmd/server/web/index.html"; \
+	fi
 
 $(FRONTEND_EMBED_STAMP): $(FRONTEND_SOURCES)
 	@echo "building embedded frontend (sources changed or embed missing)"
@@ -141,13 +162,22 @@ define strip-server-binary
 	fi
 endef
 
-build-server-amd64: $(FRONTEND_EMBED_STAMP) sync-version
+# Release builds depend on $(FRONTEND_EMBED_STAMP); SKIP_FRONTEND=1 only needs the stub.
+ifeq ($(SKIP_FRONTEND),1)
+SERVER_FRONTEND_DEP := ensure-web-stub
+else
+SERVER_FRONTEND_DEP := $(FRONTEND_EMBED_STAMP)
+endif
+
+build-server-amd64: $(SERVER_FRONTEND_DEP) sync-version
+	@if [ '$(SKIP_FRONTEND)' = '1' ]; then echo 'SKIP_FRONTEND=1 → using stub/existing web/ (no pnpm build)'; fi
 	@mkdir -p $(BUILD_DIR)/server/amd64
 	@echo "server version=$(SERVER_VERSION) build_date=$(BUILD_DATE)"
 	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$(SERVER_LDFLAGS)" -o $(BUILD_DIR)/server/amd64/lovemilk-class-broadcaster-server ./cmd/server
 	$(call strip-server-binary,$(BUILD_DIR)/server/amd64/lovemilk-class-broadcaster-server,amd64)
 
-build-server-arm64: $(FRONTEND_EMBED_STAMP) sync-version
+build-server-arm64: $(SERVER_FRONTEND_DEP) sync-version
+	@if [ '$(SKIP_FRONTEND)' = '1' ]; then echo 'SKIP_FRONTEND=1 → using stub/existing web/ (no pnpm build)'; fi
 	@mkdir -p $(BUILD_DIR)/server/arm64
 	@echo "server version=$(SERVER_VERSION) build_date=$(BUILD_DATE)"
 	@if [ -x "$(ZIG)" ] || command -v "$(ZIG)" >/dev/null 2>&1; then \
@@ -257,6 +287,7 @@ uninstall-server-user-service:
 	systemctl --user daemon-reload
 
 clean:
+	# Keep client/tts (Piper ONNX voice cache) — re-downloading ~120 MiB is slow.
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
 	rm -f $(ROOT)/cmd/client-launcher/rsrc_windows_*.syso $(ROOT)/updater/rsrc_windows_*.syso
 	rm -rf $(ROOT)/cmd/client-launcher/winres $(ROOT)/updater/winres

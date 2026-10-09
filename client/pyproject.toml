@@ -1,15 +1,23 @@
 [project]
 name = "mkcb-client"
 version = "0.1.0"
-description = "MKCB Windows client"
-requires-python = ">=3.11,<3.12"
+description = "MKCB class-broadcaster client (Windows package + Linux/Debian 11)"
+# Windows embeddable package stays on 3.11 + PySide6; Linux/Debian 11 uses 3.10 + PySide2.
+requires-python = ">=3.10,<3.12"
 dependencies = [
   "argon2-cffi>=23.1,<24",
   "cryptography>=43,<45",
+  "jieba>=0.42,<0.43",
   "loguru>=0.7.3,<0.8",
+  # PySide2/shiboken2 on Linux was built against NumPy 1.x; onnxruntime/piper pull NumPy 2.
+  "numpy>=1.26,<2; sys_platform == 'linux'",
+  # piper-plus requires CPython ≥3.11 (Windows embeddable). Marker keeps 3.10 Linux resolution happy.
+  "piper-plus>=2,<3; sys_platform == 'win32' and python_full_version >= '3.11'",
+  "piper-tts>=1.3,<2; sys_platform == 'linux'",
   "pydantic>=2.7,<3",
   "pymongo>=4.6,<4.10",
-  "PySide6-Essentials>=6.6,<6.7",
+  "PySide6-Essentials>=6.6,<6.7; sys_platform == 'win32'",
+  "PySide2>=5.15,<5.16; sys_platform == 'linux'",
   "pywin32>=306,<309; sys_platform == 'win32'",
   "zstandard>=0.22,<0.23",
 ]

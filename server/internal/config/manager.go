@@ -29,6 +29,9 @@ func NewManagerFromSnapshot(snapshot Snapshot) (*Manager, error) {
 	if snapshot.AckTimeout <= 0 {
 		snapshot.AckTimeout = DefaultAckTimeout
 	}
+	if snapshot.SpeechRate <= 0 {
+		snapshot.SpeechRate = DefaultSpeechRate
+	}
 	if snapshot.ListenerProbeInterval <= 0 {
 		snapshot.ListenerProbeInterval = DefaultListenerProbeInterval
 	}
@@ -69,6 +72,7 @@ type Update struct {
 	MaxRepeatExpansion    *int32
 	DisplayPosition       *string
 	DisplayDurationRatio  *float64
+	SpeechRate            *float64
 	ListenerProbeInterval *time.Duration
 	ListenerProbeDuration *time.Duration
 	ListenerProbeReset    *time.Duration
@@ -134,6 +138,13 @@ func (m *Manager) Update(update Update, now time.Time) (Snapshot, error) {
 			return Snapshot{}, errors.New("display duration ratio must be between 0 and 120")
 		}
 		next.DisplayDurationRatio = *update.DisplayDurationRatio
+	}
+	if update.SpeechRate != nil {
+		if *update.SpeechRate < MinSpeechRate || *update.SpeechRate > MaxSpeechRate {
+			m.mu.Unlock()
+			return Snapshot{}, errors.New("speech rate must be between 0.25 and 2.0")
+		}
+		next.SpeechRate = *update.SpeechRate
 	}
 	if update.ListenerProbeInterval != nil {
 		if *update.ListenerProbeInterval < time.Second || *update.ListenerProbeInterval > time.Hour {

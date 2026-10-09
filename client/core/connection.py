@@ -21,7 +21,7 @@ from .protocol.bson import decode, encode
 from .protocol.packet import Packet, read_packet
 from .store import StateStore
 from .update_progress import format_speed_mib_s, next_progress_milestone
-from ..version import VERSION_STR
+from ..version import BUILD_DATE, VERSION_STR
 
 
 LOGGER = logger.bind(name="mkcb.client.connection")
@@ -64,11 +64,17 @@ class IncomingMessage(BaseModel):
     expires_at_ms: Optional[int]
     display_position: Optional[str] = None
     display_duration_ratio: Optional[float] = None
+    # Per-message override: "38px" / "1.2em" / "5vw" / "25vh"; empty → device default.
+    font_size: Optional[str] = None
     as_default: bool = False
     default_display_position: Optional[str] = None
     default_display_duration_ratio: Optional[float] = None
     speech: List[Dict[str, Any]]
     tts_enabled: bool = False
+    # Per-message TTS speed override (1.0 = normal). None → use default_speech_rate.
+    speech_rate: Optional[float] = None
+    # Server snapshot default carried on each message for offline-safe resolution.
+    default_speech_rate: Optional[float] = None
     # Multi-server clients route acks back to the connection that delivered this message.
     source_host: Optional[str] = None
     source_tcp_port: Optional[int] = None
@@ -167,11 +173,14 @@ def decode_message(packet: Packet) -> IncomingMessage:
         expires_at_ms=_optional_int(document.get("expires_at")),
         display_position=(str(document["display_position"]) if document.get("display_position") else None),
         display_duration_ratio=_optional_float(document.get("display_duration_ratio")),
+        font_size=_optional_font_size(document.get("font_size")),
         as_default=bool(document.get("as_default", False)),
         default_display_position=(str(document["default_display_position"]) if document.get("default_display_position") else None),
         default_display_duration_ratio=_optional_float(document.get("default_display_duration_ratio")),
         speech=list(document.get("speech", [])),
         tts_enabled=bool(document.get("tts_enabled", bool(document.get("speech")))),
+        speech_rate=_optional_float(document.get("speech_rate")),
+        default_speech_rate=_optional_float(document.get("default_speech_rate")),
     )
 
 
@@ -261,6 +270,21 @@ def _optional_float(value: object) -> Optional[float]:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _optional_font_size(value: object) -> Optional[str]:
+    """Accept string expressions or legacy integer px from older servers."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        size = int(value)
+        if size <= 0:
+            return None
+        return f"{size}px"
+    text = str(value).strip()
+    return text or None
+
+
 def decode_withdrawal(packet: Packet) -> IncomingWithdrawal:
     if packet.packet_type != MESSAGE_WITHDRAW:
         raise ValueError("packet is not a message withdrawal")
@@ -327,6 +351,9 @@ def connect(
     reconnect_probe: bool = False,
     manual_connect: bool = False,
     update_download: bool = False,
+    *,
+    available_fonts: Optional[list[str]] = None,
+    platform_default_font: str = "",
 ) -> tuple[Connection, dict]:
     if isinstance(expected_server_fingerprint, str):
         expected_server_fingerprint = _fingerprint_bytes(expected_server_fingerprint)
@@ -378,12 +405,21 @@ def connect(
             "protocol_major": 1,
             "protocol_minor": 0,
             "client_version": VERSION_STR,
+            "client_build_date": (BUILD_DATE or "dev")[:64],
             "listener_mode": listener_mode,
             "reconnect_probe": reconnect_probe,
             "manual_connect": manual_connect,
         }
         if update_download:
             request["update_download"] = True
+        else:
+            # Font inventory for admin per-device default + future message-level union.
+            fonts = [str(item).strip() for item in (available_fonts or []) if str(item).strip()]
+            if fonts:
+                request["available_fonts"] = fonts[:200]
+            platform = str(platform_default_font or "").strip()
+            if platform:
+                request["platform_default_font"] = platform[:128]
         if listener_port > 0:
             request["listener_port"] = int(listener_port)
         if config_id is not None:

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	"lovemilk-class-broadcaster/server/internal/protocol"
 )
@@ -20,6 +21,11 @@ type Connection struct {
 	conn     net.Conn
 	mu       sync.Mutex
 }
+
+// DefaultSendWriteTimeout bounds hub.Send so a half-dead TCP peer cannot stall
+// the single-threaded message dispatcher (withdrawals use a separate goroutine
+// and would still appear to "work" while broadcasts freeze).
+const DefaultSendWriteTimeout = 5 * time.Second
 
 func NewHub() *Hub { return &Hub{sessions: make(map[string]*Connection)} }
 
@@ -53,7 +59,15 @@ func (h *Hub) Send(clientID string, packet protocol.Packet) error {
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return packet.WritePacket(session.conn)
+	_ = session.conn.SetWriteDeadline(time.Now().Add(DefaultSendWriteTimeout))
+	err := packet.WritePacket(session.conn)
+	_ = session.conn.SetWriteDeadline(time.Time{}) // clear
+	if err != nil {
+		// Drop the stuck session so the dispatcher can move on; the client will reconnect.
+		go h.Disconnect(clientID)
+		return err
+	}
+	return nil
 }
 
 func (h *Hub) Online(clientID string) bool {

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import subprocess
 import tempfile
@@ -36,16 +35,20 @@ def main() -> None:
     args = parser.parse_args()
     if not args.input.is_file():
         raise SystemExit(f"input does not exist: {args.input}")
+    try:
+        import blake3
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit("blake3 package is required; install with: pip install blake3") from exc
     data = args.input.read_bytes()
-    manifest = [{"path": args.input.name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}]
-    digest = hashlib.sha256(
+    manifest = [{"path": args.input.name, "size": len(data), "blake3": blake3.blake3(data).hexdigest()}]
+    digest = blake3.blake3(
         json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     ).hexdigest()
     metadata = {
         "component": args.component,
         "version": args.version,
         "platform": args.platform,
-        "sha256": digest,
+        "blake3": digest,
         "payload_format": "files-v1",
     }
     key = Ed25519PrivateKey.from_private_bytes(args.private_key.read_bytes())

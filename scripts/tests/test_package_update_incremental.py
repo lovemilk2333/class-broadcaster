@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -106,17 +105,20 @@ class IncrementalPackageTests(unittest.TestCase):
             self.assertTrue(meta.get("incremental"))
             self.assertEqual(meta["payload_format"], "files-v1")
             self.assertEqual(meta["file_count"], 1)
-            # Manifest digest must match the single changed file only.
+            # Manifest digest must match the single changed file only (BLAKE3).
+            import blake3
+
             changed = new_tree / "client" / "app.pyc"
             entries = [{
                 "path": "client/app.pyc",
                 "size": changed.stat().st_size,
-                "sha256": hashlib.sha256(changed.read_bytes()).hexdigest(),
+                "blake3": blake3.blake3(changed.read_bytes()).hexdigest(),
             }]
-            expected = hashlib.sha256(
+            expected = blake3.blake3(
                 json.dumps(entries, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
             ).hexdigest()
-            self.assertEqual(meta["sha256"], expected)
+            self.assertEqual(meta["blake3"], expected)
+            self.assertNotIn("sha256", meta)
 
 
 class ProgressMilestoneTests(unittest.TestCase):

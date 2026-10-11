@@ -43,6 +43,13 @@ export type Device = {
   session_end_label?: string
   session_end_at?: number
   session_end_detail?: string
+  /** Ephemeral online activity from ClientActivity (e.g. processing = TTS prefetch wait). */
+  activity_state?: string
+  activity_message_id?: string
+  activity_detail?: string
+  activity_elapsed_ms?: number
+  /** Unix ms when the current processing episode began (prefer over elapsed snapshot). */
+  activity_started_at?: number
   /** Fonts reported by the client at handshake (for picker / future message union). */
   available_fonts?: string[]
   /** Resolved platform default family reported at handshake (YaHei / Noto Sans*). */
@@ -51,6 +58,9 @@ export type Device = {
   default_font_family?: string
   /** Admin expression pushed on ConnectResp (empty = client built-in 25vh). Examples: 38px, 1.2em, 5vw, 25vh. */
   default_font_size?: string
+  /** Last package digest the client reported via UpdateApplied (not merely offered). */
+  applied_digest?: string
+  applied_seq?: number
 }
 
 export type ConfigForm = {

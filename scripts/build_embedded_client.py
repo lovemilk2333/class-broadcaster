@@ -149,6 +149,117 @@ def stamp_client_version_json(client_dir: Path, root: Path, build_date: str) -> 
     )
 
 
+def _pe_file_version(path: Path) -> tuple[int, int, int, int]:
+    """Best-effort PE FileVersion from a Windows DLL (works on Linux build hosts)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return (0, 0, 0, 0)
+    # Locate VS_VERSION_INFO via UTF-16LE marker, then VS_FIXEDFILEINFO (sig 0xFEEF04BD).
+    marker = "VS_VERSION_INFO".encode("utf-16le")
+    idx = data.find(marker)
+    if idx < 0:
+        return (0, 0, 0, 0)
+    sig = b"\xbd\x04\xef\xfe"
+    sig_at = data.find(sig, idx, idx + 512)
+    if sig_at < 0:
+        return (0, 0, 0, 0)
+    # dwFileVersionMS / dwFileVersionLS follow dwStrucVersion at +8/+12 from signature.
+    try:
+        import struct
+
+        ms, ls = struct.unpack_from("<II", data, sig_at + 8)
+        return ((ms >> 16) & 0xFFFF, ms & 0xFFFF, (ls >> 16) & 0xFFFF, ls & 0xFFFF)
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+# onnxruntime 1.3x needs a recent VC++ 2015–2022 CRT. PySide6 often ships 14.29
+# (VS2019); placing that *next to* onnxruntime.dll makes Windows prefer it over a
+# newer System32 copy and yields ACCESS_VIOLATION (0xC0000005) on import.
+_MIN_MSVC_RUNTIME_VERSION = (14, 40, 0, 0)
+
+
+def stage_onnxruntime_msvc_runtime(site_packages: Path, runtime_dir: Path | None = None) -> None:
+    """Stage VC++ runtime next to onnxruntime.dll only when new enough (≥14.40).
+
+    Older donor copies (typical PySide6 14.29) are **removed** from ``capi/`` so
+    LoadLibrary can fall through to a system VC++ redistributable. Classroom PCs
+    without that redistributable get a client popup pointing at the Microsoft
+    download — we intentionally do not embed ``vc_redist.x64.exe`` here.
+    """
+    capi = site_packages / "onnxruntime" / "capi"
+    if not capi.is_dir():
+        print("WARNING: onnxruntime/capi missing; skipping MSVC runtime staging", flush=True)
+        return
+    patterns = (
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "concrt140.dll",
+        "vcomp140.dll",
+        "msvcp140-*.dll",
+    )
+    best: dict[str, tuple[tuple[int, int, int, int], Path]] = {}
+    for donor_name in ("PySide6", "shiboken6", "pyopenjtalk_plus.libs"):
+        donor = site_packages / donor_name
+        if not donor.is_dir():
+            continue
+        for pattern in patterns:
+            for source in donor.glob(pattern):
+                key = source.name.lower()
+                version = _pe_file_version(source)
+                previous = best.get(key)
+                if previous is None or version > previous[0]:
+                    best[key] = (version, source)
+
+    # Drop stale CRT already sitting beside onnxruntime.dll (from older builds).
+    removed = 0
+    for pattern in patterns:
+        for stale in capi.glob(pattern):
+            version = _pe_file_version(stale)
+            if version < _MIN_MSVC_RUNTIME_VERSION:
+                try:
+                    stale.unlink()
+                    removed += 1
+                    ver = ".".join(str(part) for part in version)
+                    print(f"  removed outdated {stale.name} v{ver} from capi/", flush=True)
+                except OSError as exc:
+                    print(f"  WARNING: could not remove {stale}: {exc}", flush=True)
+    if removed:
+        print(f"Removed {removed} outdated MSVC DLL(s) from onnxruntime/capi", flush=True)
+
+    copied = 0
+    destinations = [capi]
+    if runtime_dir is not None and runtime_dir.is_dir():
+        destinations.append(runtime_dir)
+    skipped_old = 0
+    for key, (version, source) in sorted(best.items()):
+        if version < _MIN_MSVC_RUNTIME_VERSION:
+            skipped_old += 1
+            continue
+        for destination_dir in destinations:
+            destination = destination_dir / source.name
+            if destination.is_file():
+                existing = _pe_file_version(destination)
+                if existing >= version and destination.stat().st_size == source.stat().st_size:
+                    continue
+            shutil.copy2(source, destination)
+            copied += 1
+            ver = ".".join(str(part) for part in version)
+            print(f"  staged {source.name} v{ver} → {destination_dir.name}/", flush=True)
+    if skipped_old:
+        print(
+            f"Skipped {skipped_old} donor MSVC DLL(s) older than "
+            f"{'.'.join(str(p) for p in _MIN_MSVC_RUNTIME_VERSION)} "
+            "(rely on system VC++ redistributable; client will prompt if missing)",
+            flush=True,
+        )
+    print(f"Staged {copied} MSVC runtime DLL(s) for onnxruntime", flush=True)
+
+
 def write_runtime_path(runtime: Path) -> None:
     """限制模块搜索路径到安装包内部，避免读取系统 Python 环境。"""
     content = "\n".join(
@@ -206,10 +317,8 @@ def ensure_windows_site_packages(root: Path, cache: Path, requirements: Path, of
         shutil.rmtree(stamped)
     stamped.mkdir(parents=True, exist_ok=True)
     # Prefer wheels for everything (cross-install from Linux cannot compile native
-    # extensions). A few pure-Python deps ship sdist-only on PyPI:
-    #   - distance  (via g2p-en → piper-plus)
-    #   - jieba     (direct client dep)
-    # Allow those two from sdist; keep --only-binary=:all: for the rest.
+    # extensions). jieba ships sdist-only on PyPI — allow that one from sdist;
+    # keep --only-binary=:all: for the rest.
     uv_command = [
         "uv",
         "pip",
@@ -223,7 +332,7 @@ def ensure_windows_site_packages(root: Path, cache: Path, requirements: Path, of
         "--only-binary",
         ":all:",
         "--no-binary",
-        "distance,jieba",
+        "jieba",
         "--requirements",
         str(requirements),
         "--cache-dir",
@@ -298,6 +407,11 @@ def main() -> None:
         ignore=shutil.ignore_patterns(".mkcb-site-packages.ok"),
         dirs_exist_ok=False,
     )
+    # onnxruntime.dll needs MSVC runtime next to it on machines without a system
+    # VC++ redist. Prefer the newest PE FileVersion among PySide6 / shiboken /
+    # openjtalk donors into onnxruntime/capi (and runtime/) so PATH order cannot
+    # bind an older Qt CRT ahead of onnxruntime 1.3x.
+    stage_onnxruntime_msvc_runtime(site_packages, runtime_dir=runtime)
 
     copy_client_sources(root / "client", output / "client")
     stamp_client_version_json(output / "client", root, str(args.build_date).strip())
@@ -316,6 +430,15 @@ def main() -> None:
             "Packaged client will fall back to SAPI when available.",
             flush=True,
         )
+    # NLTK was only required by piper-plus/g2p_en (removed). If an older cache
+    # still exists under client/nltk_data, copy it harmlessly; do not warn.
+    nltk_src = root / "client" / "nltk_data"
+    nltk_dst = output / "Lib" / "nltk_data"
+    if nltk_src.is_dir() and any(nltk_src.rglob("*.zip")):
+        print(f"Copying optional NLTK data from {nltk_src} -> {nltk_dst}", flush=True)
+        if nltk_dst.exists():
+            shutil.rmtree(nltk_dst)
+        shutil.copytree(nltk_src, nltk_dst, ignore=shutil.ignore_patterns("*.partial", ".gitkeep"))
     # 使用相同 minor 版本生成 -O 优化字节码；性能关键依赖来自原生 .pyd wheel。
     # version.json stays as data next to the bytecode package.
     run_cached(

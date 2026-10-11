@@ -750,27 +750,47 @@ func (s *Store) Warnings() []string {
 
 func (s *Store) NextPending(now time.Time) *Record {
 	s.Expire(now)
-	message := s.queue.Pop()
-	if message == nil {
-		return nil
-	}
-	s.mu.Lock()
-	delete(s.queued, message.ID)
-	record, ok := s.records[message.ID]
-	if !ok || (record.Status != DeliveryPending && record.Status != DeliverySent) {
+	nowMS := now.UnixMilli()
+	// Hold not-yet-due items aside so a backoff head cannot starve later ready work,
+	// and so we never drop them from the queue (old bug: Pop + return nil).
+	var deferred []Message
+	defer func() {
+		if len(deferred) == 0 {
+			return
+		}
+		s.mu.Lock()
+		for i := range deferred {
+			msg := deferred[i]
+			if err := s.queue.Requeue(msg); err == nil {
+				s.queued[msg.ID] = true
+			}
+		}
 		s.mu.Unlock()
-		return nil
-	}
-	if dueAt := s.retryAt[message.ID]; dueAt > now.UnixMilli() {
+	}()
+	for {
+		message := s.queue.Pop()
+		if message == nil {
+			return nil
+		}
+		s.mu.Lock()
+		delete(s.queued, message.ID)
+		record, ok := s.records[message.ID]
+		if !ok || (record.Status != DeliveryPending && record.Status != DeliverySent) {
+			s.mu.Unlock()
+			continue
+		}
+		if dueAt := s.retryAt[message.ID]; dueAt > nowMS {
+			deferred = append(deferred, *message)
+			s.mu.Unlock()
+			continue
+		}
+		delete(s.retryAt, message.ID)
+		record.TargetClients = append([]string(nil), record.TargetClients...)
+		record.Deliveries = cloneDeliveries(record.Deliveries)
+		record.DeliveryUpdatedAt = cloneUpdatedAt(record.DeliveryUpdatedAt)
 		s.mu.Unlock()
-		return nil
+		return &record
 	}
-	delete(s.retryAt, message.ID)
-	record.TargetClients = append([]string(nil), record.TargetClients...)
-	record.Deliveries = cloneDeliveries(record.Deliveries)
-	record.DeliveryUpdatedAt = cloneUpdatedAt(record.DeliveryUpdatedAt)
-	s.mu.Unlock()
-	return &record
 }
 
 func (s *Store) Retry(messageID MessageID) bool {
@@ -829,9 +849,14 @@ func (s *Store) QueueDueRetries(now time.Time, ackTimeout time.Duration) int {
 				}
 			}
 		}
-		// Wildcard-only broadcasts wait for AddClientToBroadcasts; do not spin.
+		// Wildcard-only broadcasts wait for approved clients. Still requeue once
+		// retryAt has elapsed so dispatch can re-expand; otherwise a create-time
+		// empty approval set + RetryAfter left the message stuck forever.
 		if !due && !hasRealDelivery && containsClient(record.TargetClients, "*") {
-			continue
+			if _, hadBackoff := s.retryAt[id]; !hadBackoff || s.retryAt[id] > nowMS {
+				continue
+			}
+			due = true
 		}
 		if !due {
 			continue

@@ -6,6 +6,8 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/klauspost/compress v1.17.11
 	go.mongodb.org/mongo-driver v1.17.10
+	lukechampine.com/blake3 v1.4.1
+	modernc.org/sqlite v1.60.1
 )
 
 require (
@@ -45,5 +47,4 @@ require (
 	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.60.1 // indirect
 )

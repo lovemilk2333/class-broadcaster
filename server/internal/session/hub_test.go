@@ -8,6 +8,38 @@ import (
 	"lovemilk-class-broadcaster/server/internal/protocol"
 )
 
+func TestClientActivityClearedOnIdleAndDisconnect(t *testing.T) {
+	hub := NewHub()
+	serverConn, clientConn := net.Pipe()
+	unregister := hub.Register("client", serverConn)
+	defer func() {
+		unregister()
+		_ = clientConn.Close()
+	}()
+
+	hub.SetActivity("client", ClientActivity{State: "processing", MessageID: "m1", Detail: "hello"})
+	got := hub.Activity("client")
+	if got.State != "processing" || got.MessageID != "m1" || got.StartedAt == 0 {
+		t.Fatalf("activity=%+v", got)
+	}
+	started := got.StartedAt
+	hub.SetActivity("client", ClientActivity{State: "processing", MessageID: "m1", ElapsedMS: 1200})
+	got = hub.Activity("client")
+	if got.StartedAt != started {
+		t.Fatalf("StartedAt reset on same-message refresh: %d → %d", started, got.StartedAt)
+	}
+	hub.SetActivity("client", ClientActivity{State: "idle"})
+	if hub.Activity("client").State != "" {
+		t.Fatal("idle did not clear activity")
+	}
+
+	hub.SetActivity("client", ClientActivity{State: "processing", MessageID: "m2"})
+	hub.Disconnect("client")
+	if hub.Activity("client").State != "" {
+		t.Fatal("disconnect did not clear activity")
+	}
+}
+
 func TestSuspendClientSendsDisconnectBeforeClosingSession(t *testing.T) {
 	hub := NewHub()
 	serverConn, clientConn := net.Pipe()

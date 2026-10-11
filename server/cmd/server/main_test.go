@@ -467,12 +467,19 @@ func TestUpdateTargetsClientAndCatchUpSelection(t *testing.T) {
 	if _, ok := prefs.latestPublishedUpdateForClient(clientA, "0.1.1"); ok {
 		t.Fatal("client A already on 0.1.1 must not catch up to older/same package")
 	}
-	// Client B was only in seq 1 targets; after marking seq 1 offered, no catch-up.
+	// Client B was only in seq 1 targets; offering alone must NOT stop catch-up.
 	if err := prefs.markClientUpdateOffered(clientB, older); err != nil {
 		t.Fatal(err)
 	}
+	if pending, ok := prefs.latestPublishedUpdateForClient(clientB, "0.0.9"); !ok || pending.Seq != 1 {
+		t.Fatalf("offer alone must still catch up seq=%d ok=%v want 1", pending.Seq, ok)
+	}
+	// After UpdateApplied, client B has applied seq 1 → no catch-up to A-only seq 2.
+	if err := prefs.markClientUpdateApplied(clientB, older.SHA256, older.Version, older.Seq); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := prefs.latestPublishedUpdateForClient(clientB, "0.1.0"); ok {
-		t.Fatal("client B should not catch up to A-only seq 2")
+		t.Fatal("client B should not catch up to A-only seq 2 after applied")
 	}
 	// Client B never offered → catch up to seq 1.
 	prefs2, err := openServerPreferences(filepath.Join(dir, "prefs2.db"))
@@ -492,7 +499,7 @@ func TestUpdateTargetsClientAndCatchUpSelection(t *testing.T) {
 		t.Fatalf("client B catch-up seq=%d ok=%v want 1", gotB.Seq, ok)
 	}
 
-	// Force same-version must not restart-loop after last_seq is marked / version met.
+	// Force same-version must not restart-loop after applied / version met.
 	forceSame := updateRecord{
 		UpdateID: "upd-force", Component: "client", Components: []string{"client"},
 		Version: "0.1.1", Platform: "windows-amd64", ClientVersion: "0.1.1",
@@ -507,16 +514,87 @@ func TestUpdateTargetsClientAndCatchUpSelection(t *testing.T) {
 	if err := prefs.saveUpdateFile(forceSame, metaForce, ""); err != nil {
 		t.Fatal(err)
 	}
+	// Offer alone does not stop catch-up for a behind client (client_version still old).
 	if err := prefs.markClientUpdateOffered(clientA, forceSame); err != nil {
 		t.Fatal(err)
 	}
+	// Version-met fallback still suppresses force same-version loop.
 	if pending, ok := prefs.latestPublishedUpdateForClient(clientA, "0.1.1"); ok {
-		t.Fatalf("force same-version must not catch up after offer seq=%d", pending.Seq)
+		t.Fatalf("force same-version must not catch up when version met seq=%d", pending.Seq)
 	}
-	// Client B still on 0.1.0 with last_seq=1 → force catch-up to seq 3.
+	// Client B still on 0.1.0 with applied_seq=1 → force catch-up to seq 3.
 	gotForce, ok := prefs.latestPublishedUpdateForClient(clientB, "0.1.0")
 	if !ok || gotForce.Seq != 3 {
 		t.Fatalf("force catch-up for behind client seq=%d ok=%v want 3", gotForce.Seq, ok)
+	}
+}
+
+func TestMarkClientUpdateAppliedAdvancesAppliedSeq(t *testing.T) {
+	clientID := strings.Repeat("c", 64)
+	dir := t.TempDir()
+	prefs, err := openServerPreferences(filepath.Join(dir, "prefs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prefs.db.Close()
+	prefs.updatesDir = filepath.Join(dir, "updates")
+	_ = os.MkdirAll(prefs.updatesDir, 0o700)
+
+	record := updateRecord{
+		UpdateID: "upd-applied", Component: "client", Components: []string{"client"},
+		Version: "0.2.0", Platform: "windows-amd64", ClientVersion: "0.2.0",
+		SHA256: strings.Repeat("a", 64), Status: "published", Seq: 5, CreatedAt: 5,
+		Targets: []string{clientID},
+	}
+	meta, _ := json.Marshal(publishUpdateRequest{
+		Component: "client", Components: []string{"client"}, Version: "0.2.0",
+		ClientVersion: "0.2.0", Platform: "windows-amd64", PayloadFormat: "files-v1",
+		SHA256: record.SHA256, Targets: record.Targets,
+	})
+	if err := prefs.saveUpdateFile(record, meta, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := prefs.markClientUpdateOffered(clientID, record); err != nil {
+		t.Fatal(err)
+	}
+	if prefs.clientUpdateAppliedSeq(clientID) != 0 {
+		t.Fatalf("offer must not advance applied_seq, got %d", prefs.clientUpdateAppliedSeq(clientID))
+	}
+	if pending, ok := prefs.latestPublishedUpdateForClient(clientID, "0.1.0"); !ok || pending.Seq != 5 {
+		t.Fatalf("catch-up after offer only seq=%d ok=%v want 5", pending.Seq, ok)
+	}
+	if err := prefs.markClientUpdateApplied(clientID, record.SHA256, record.Version, record.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if got := prefs.clientUpdateAppliedSeq(clientID); got != 5 {
+		t.Fatalf("applied_seq=%d want 5", got)
+	}
+	if got := prefs.clientAppliedDigest(clientID); got != record.SHA256 {
+		t.Fatalf("applied_digest=%q want %q", got, record.SHA256)
+	}
+	if _, ok := prefs.latestPublishedUpdateForClient(clientID, "0.1.0"); ok {
+		t.Fatal("after UpdateApplied catch-up must stop even if client_version still old")
+	}
+	// Stale lower seq must not rewind applied_seq.
+	older := updateRecord{
+		UpdateID: "upd-older", Component: "client", Components: []string{"client"},
+		Version: "0.1.9", Platform: "windows-amd64", ClientVersion: "0.1.9",
+		SHA256: strings.Repeat("b", 64), Status: "published", Seq: 4, CreatedAt: 4,
+		Targets: []string{clientID},
+	}
+	metaOlder, _ := json.Marshal(publishUpdateRequest{
+		Component: "client", Components: []string{"client"}, Version: "0.1.9",
+		ClientVersion: "0.1.9", Platform: "windows-amd64", PayloadFormat: "files-v1",
+		SHA256: older.SHA256, Targets: older.Targets,
+	})
+	if err := prefs.saveUpdateFile(older, metaOlder, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := prefs.markClientUpdateApplied(clientID, older.SHA256, older.Version, older.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if got := prefs.clientUpdateAppliedSeq(clientID); got != 5 {
+		t.Fatalf("stale apply must keep applied_seq=5, got %d", got)
 	}
 }
 
@@ -567,19 +645,31 @@ func TestNormalizeUpdateComponentsBundleOrder(t *testing.T) {
 }
 
 func TestFilesV1ManifestMatchesPythonSortKeysOrder(t *testing.T) {
-	// path/sha256/size key order must match Python sort_keys=True.
-	entries := []updateManifestEntry{
-		{Path: "b/file.bin", SHA256: strings.Repeat("b", 64), Size: 2},
-		{Path: "a-file.bin", SHA256: strings.Repeat("a", 64), Size: 1},
+	// Legacy sha256 key order must match Python sort_keys=True (path,sha256,size).
+	legacy := []updateManifestEntry{
+		{Path: "b/file.bin", Digest: strings.Repeat("b", 64), Size: 2},
+		{Path: "a-file.bin", Digest: strings.Repeat("a", 64), Size: 1},
 	}
-	manifest, err := marshalFilesV1Manifest(entries)
+	manifest, err := marshalFilesV1Manifest(legacy, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// a-file before b/file (string order), keys alphabetically path,sha256,size.
-	want := `[{"path":"a-file.bin","sha256":"` + strings.Repeat("a", 64) + `","size":1},{"path":"b/file.bin","sha256":"` + strings.Repeat("b", 64) + `","size":2}]`
-	if string(manifest) != want {
-		t.Fatalf("manifest=%s want=%s", manifest, want)
+	wantLegacy := `[{"path":"a-file.bin","sha256":"` + strings.Repeat("a", 64) + `","size":1},{"path":"b/file.bin","sha256":"` + strings.Repeat("b", 64) + `","size":2}]`
+	if string(manifest) != wantLegacy {
+		t.Fatalf("legacy manifest=%s want=%s", manifest, wantLegacy)
+	}
+	// BLAKE3 packages use key "blake3" (sorts before path).
+	blakeEntries := []updateManifestEntry{
+		{Path: "b/file.bin", Digest: strings.Repeat("b", 64), Size: 2},
+		{Path: "a-file.bin", Digest: strings.Repeat("a", 64), Size: 1},
+	}
+	blakeManifest, err := marshalFilesV1Manifest(blakeEntries, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBlake := `[{"blake3":"` + strings.Repeat("a", 64) + `","path":"a-file.bin","size":1},{"blake3":"` + strings.Repeat("b", 64) + `","path":"b/file.bin","size":2}]`
+	if string(blakeManifest) != wantBlake {
+		t.Fatalf("blake3 manifest=%s want=%s", blakeManifest, wantBlake)
 	}
 }
 
@@ -610,7 +700,7 @@ func TestUpdateDownloadTokenRoundTrip(t *testing.T) {
 func TestParseUpdatePackageDerivesMetadataFromUploadedArchive(t *testing.T) {
 	content := []byte("client payload")
 	entryHash := sha256.Sum256(content)
-	manifest, err := marshalFilesV1Manifest([]updateManifestEntry{{Path: "client.exe", SHA256: hex.EncodeToString(entryHash[:]), Size: len(content)}})
+	manifest, err := marshalFilesV1Manifest([]updateManifestEntry{{Path: "client.exe", Digest: hex.EncodeToString(entryHash[:]), Size: len(content)}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,9 +947,9 @@ func TestParseUpdatePackageAcceptsNestedPathOrdering(t *testing.T) {
 	hashA := sha256.Sum256(contentA)
 	hashB := sha256.Sum256(contentB)
 	manifest, err := marshalFilesV1Manifest([]updateManifestEntry{
-		{Path: "a-b/f.bin", SHA256: hex.EncodeToString(hashA[:]), Size: len(contentA)},
-		{Path: "a/x/f.bin", SHA256: hex.EncodeToString(hashB[:]), Size: len(contentB)},
-	})
+		{Path: "a-b/f.bin", Digest: hex.EncodeToString(hashA[:]), Size: len(contentA)},
+		{Path: "a/x/f.bin", Digest: hex.EncodeToString(hashB[:]), Size: len(contentB)},
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

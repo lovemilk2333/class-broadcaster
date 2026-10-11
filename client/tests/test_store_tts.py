@@ -1,5 +1,7 @@
+import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -8,8 +10,13 @@ from client.core.delivery import display_duration_ms
 from client.core.store import StateStore
 from client.core.tts import (
     EnginePreference,
+    SpeechPart,
+    _WAV_STDOUT_MAGIC,
+    _synthesize_wav_bytes,
+    _wav_duration_seconds,
     compile_speech,
     estimate_duration_ms,
+    play_cached_speech_plan,
     sanitize_speech_text,
     speak_with_fallback,
 )
@@ -125,12 +132,150 @@ class StoreAndTtsTest(unittest.TestCase):
         self.assertEqual(base, 10000)
         self.assertEqual(half, 20000)
 
+    def test_in_memory_wav_helpers(self):
+        import io
+        import struct
+        import wave
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(22050)
+            handle.writeframes(b"\x00\x00" * 2205)  # 0.1s silence
+        wav = buffer.getvalue()
+        self.assertGreaterEqual(wav[:4], b"RIFF")
+        self.assertAlmostEqual(_wav_duration_seconds(wav), 0.1, delta=0.02)
+
+        def _write(wav_file):
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 1600)
+
+        produced = _synthesize_wav_bytes(_write)
+        self.assertTrue(produced.startswith(b"RIFF"))
+        self.assertAlmostEqual(_wav_duration_seconds(produced), 0.1, delta=0.02)
+        # Subprocess framing used by Windows classic piper-tts path.
+        framed = _WAV_STDOUT_MAGIC + struct.pack(">I", len(wav)) + wav
+        self.assertEqual(framed[8:12], struct.pack(">I", len(wav)))
+        self.assertEqual(framed[12:], wav)
+
+    def test_play_cached_speech_plan_honours_stop_and_pauses(self):
+        import io
+        import wave
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(22050)
+            handle.writeframes(b"\x00\x00" * 220)  # ~10ms
+        wav = buffer.getvalue()
+        stop = threading.Event()
+        stop.set()
+        # Already cancelled: must return without raising.
+        play_cached_speech_plan([("pause", 50), ("wav", wav)], stop)
+        self.assertTrue(stop.is_set())
+        # Empty / truncated wav entries are skipped.
+        stop.clear()
+        play_cached_speech_plan([("wav", b"nope"), ("pause", 1)], stop)
+
+    def test_synthesize_subprocess_pumps_large_stdout(self):
+        """Parent must read stdout while the child writes or large WAVs deadlock.
+
+        Regression for classroom hang: poll()-only wait left the child blocked on
+        a full pipe (~64KiB) with no audio until withdraw.
+        """
+        import struct
+        import subprocess
+        import sys
+
+        from client.core.tts import _WAV_STDOUT_MAGIC, _windows_hidden_subprocess_kwargs
+
+        payload_size = 200 * 1024
+        # Child builds a large framed payload itself (avoid ARG_MAX) and writes
+        # slowly so a non-pumping parent would stall on a full pipe.
+        magic_repr = repr(_WAV_STDOUT_MAGIC)
+        child = (
+            "import struct, sys, time\n"
+            f"magic = {magic_repr}\n"
+            f"n = {payload_size}\n"
+            "payload = b'R' * n\n"
+            "header = magic + struct.pack('>I', n)\n"
+            "out = sys.stdout.buffer\n"
+            "out.write(header); out.flush()\n"
+            "for i in range(0, n, 4096):\n"
+            "  out.write(payload[i:i+4096]); out.flush(); time.sleep(0.001)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **_windows_hidden_subprocess_kwargs(),
+        )
+        chunks: list[bytes] = []
+
+        def _pump() -> None:
+            assert process.stdout is not None
+            while True:
+                block = process.stdout.read(65536)
+                if not block:
+                    break
+                chunks.append(block)
+
+        pump = threading.Thread(target=_pump, daemon=True)
+        pump.start()
+        try:
+            process.wait(timeout=60)
+            pump.join(timeout=5)
+            self.assertEqual(process.returncode, 0)
+            got = b"".join(chunks)
+            self.assertTrue(got.startswith(_WAV_STDOUT_MAGIC))
+            size = int.from_bytes(got[8:12], "big")
+            self.assertEqual(size, payload_size)
+            self.assertEqual(got[12 : 12 + size], b"R" * payload_size)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    def test_tts_cache_entry_ready_gate(self):
+        from client.app import TtsCacheEntry
+
+        entry = TtsCacheEntry("mid", [SpeechPart("text", text="hi")], 0.75)
+        self.assertFalse(entry.ready.is_set())
+        entry.plan = [("pause", 10)]
+        entry.ready.set()
+        self.assertTrue(entry.ready.wait(0.01))
+
     def test_engine_preference_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             preference = EnginePreference(Path(directory) / "tts.json")
             self.assertIsNone(preference.load())
             preference.save("piper")
             self.assertEqual(preference.load(), "piper")
+            # saved_at must be present for TTL tracking.
+            raw = json.loads((Path(directory) / "tts.json").read_text(encoding="utf-8"))
+            self.assertIn("saved_at", raw)
+            self.assertIsInstance(raw["saved_at"], (int, float))
+
+    def test_engine_preference_expires_after_ttl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tts-engine.json"
+            preference = EnginePreference(path, ttl_seconds=24 * 60 * 60)
+            preference.save("piper")
+            self.assertEqual(preference.load(), "piper")
+            # Age the stamp past 24h.
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw["saved_at"] = time.time() - (24 * 60 * 60 + 1)
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertIsNone(preference.load())
+            # Legacy file without saved_at also expires (force re-probe).
+            path.write_text(json.dumps({"engine": "sapi5-zh"}), encoding="utf-8")
+            self.assertIsNone(preference.load())
 
     def test_single_instance_lock_is_exclusive_and_reusable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -160,6 +305,41 @@ class StoreAndTtsTest(unittest.TestCase):
                 [UnavailableEngine()],
                 threading.Event(),
             )
+
+    def test_sapi_preference_does_not_block_piper(self):
+        """Saved sapi5-zh must not permanently pin over a working Piper engine."""
+
+        class FakePiper:
+            name = "piper"
+
+            def available(self):
+                return True
+
+            def speak(self, text, stop, speech_rate=1.0):
+                self.spoken = text
+
+        class FakeSapi:
+            name = "sapi5-zh"
+
+            def available(self):
+                return True
+
+            def speak(self, text, stop, speech_rate=1.0):
+                raise AssertionError("SAPI must not win when Piper is available")
+
+        with tempfile.TemporaryDirectory() as directory:
+            preference = EnginePreference(Path(directory) / "tts-engine.json")
+            preference.save("sapi5-zh")
+            piper = FakePiper()
+            chosen = speak_with_fallback(
+                compile_speech([{"type": "text", "value": "你好"}]),
+                [piper, FakeSapi()],
+                threading.Event(),
+                preference,
+            )
+            self.assertEqual(chosen, "piper")
+            self.assertEqual(preference.load(), "piper")
+            self.assertEqual(piper.spoken, "你好")
 
     def test_autostart_default_flag_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:

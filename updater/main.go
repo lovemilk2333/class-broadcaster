@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"lukechampine.com/blake3"
 )
 
 type updateMetadata struct {
@@ -26,6 +27,7 @@ type updateMetadata struct {
 	Components    []string `json:"components"`
 	Version       string   `json:"version"`
 	Platform      string   `json:"platform"`
+	Blake3        string   `json:"blake3"`
 	SHA256        string   `json:"sha256"`
 	PayloadFormat string   `json:"payload_format"`
 }
@@ -71,12 +73,36 @@ func main() {
 		fatal(err)
 	}
 	updaterLog("info", "update apply completed package=%s install_dir=%s", *packagePath, *installDir)
+	// Drop downloaded / staged packages under data/updates (apply/<sha>/pkg.tar.zst,
+	// cached <sha>.tar.zst, metadata). applied_updates.json lives in data/ and is kept.
+	cleanupUpdateStaging(*installDir)
 	// Always relaunch so the new binary reconnects and reports the new client_version.
 	if err := restartClient(*installDir); err != nil {
 		// Install already succeeded; log and exit 0 so operators are not stuck offline forever.
 		updaterLog("error", "client restart failed (files updated; start manually): %v", err)
 		return
 	}
+}
+
+// cleanupUpdateStaging removes installDir/data/updates after a successful overlay.
+// Safe once applyPackage has finished reading the staged pkg.tar.zst.
+func cleanupUpdateStaging(installDir string) {
+	updates := filepath.Join(filepath.Clean(installDir), "data", "updates")
+	info, err := os.Stat(updates)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			updaterLog("warn", "update staging stat failed path=%s error=%v", updates, err)
+		}
+		return
+	}
+	if !info.IsDir() {
+		return
+	}
+	if err := os.RemoveAll(updates); err != nil {
+		updaterLog("warn", "could not remove update staging path=%s error=%v", updates, err)
+		return
+	}
+	updaterLog("info", "removed update staging path=%s", updates)
 }
 
 func setupUpdaterLog(path string) {
@@ -137,17 +163,18 @@ func applyPackage(packagePath, installDir string) error {
 	if metadataErr != nil {
 		return metadataErr
 	}
-	updaterLog("info", "package opened version=%s component=%s sha256=%s", metadata.Version, metadata.Component, metadata.SHA256)
+	expected := packageContentDigest(metadata)
+	updaterLog("info", "package opened version=%s component=%s digest=%s", metadata.Version, metadata.Component, expected)
 	if err := validateMetadata(metadata); err != nil {
 		return err
 	}
 	if metadata.PayloadFormat != "" && metadata.PayloadFormat != "files-v1" {
 		return errors.New("update package payload format is unsupported")
 	}
-	if err := verifyTarFiles(archive.tar, metadata.SHA256); err != nil {
+	if err := verifyTarFiles(archive.tar, metadata); err != nil {
 		return err
 	}
-	updaterLog("info", "package verified files-v1 sha256=%s", metadata.SHA256)
+	updaterLog("info", "package verified files-v1 digest=%s", expected)
 	// Overlay onto the install tree. Never replace the whole directory: that
 	// would wipe runtime state under data/ and break updater-only packages
 	// that only ship lovemilk-class-broadcaster-updater.exe.
@@ -262,13 +289,21 @@ func validateMetadata(metadata updateMetadata) error {
 	if metadata.Version == "" {
 		return errors.New("update metadata is incomplete")
 	}
-	if len(metadata.SHA256) != sha256.Size*2 {
-		return errors.New("update metadata sha256 is invalid")
+	digest := packageContentDigest(metadata)
+	if len(digest) != 64 {
+		return errors.New("update metadata blake3/sha256 is invalid")
 	}
-	if _, err := hex.DecodeString(metadata.SHA256); err != nil {
-		return errors.New("update metadata sha256 is invalid")
+	if _, err := hex.DecodeString(digest); err != nil {
+		return errors.New("update metadata blake3/sha256 is invalid")
 	}
 	return nil
+}
+
+func packageContentDigest(metadata updateMetadata) string {
+	if d := strings.ToLower(strings.TrimSpace(metadata.Blake3)); d != "" {
+		return d
+	}
+	return strings.ToLower(strings.TrimSpace(metadata.SHA256))
 }
 
 func openPackage(path string) (*openedPackage, error) {
@@ -371,7 +406,13 @@ func readTarMetadata(entries []tarEntry) (updateMetadata, error) {
 	return updateMetadata{}, errors.New("metadata.json is missing")
 }
 
-func verifyTarFiles(entries []tarEntry, expected string) error {
+func verifyTarFiles(entries []tarEntry, metadata updateMetadata) error {
+	useBlake3 := strings.TrimSpace(metadata.Blake3) != ""
+	digestKey := "sha256"
+	if useBlake3 {
+		digestKey = "blake3"
+	}
+	expected := packageContentDigest(metadata)
 	manifestEntries := make([]map[string]interface{}, 0, len(entries))
 	seen := make(map[string]struct{})
 	for _, entry := range entries {
@@ -382,17 +423,37 @@ func verifyTarFiles(entries []tarEntry, expected string) error {
 			return fmt.Errorf("duplicate update path %q", entry.name)
 		}
 		seen[entry.name] = struct{}{}
-		digest := sha256.Sum256(entry.data)
-		manifestEntries = append(manifestEntries, map[string]interface{}{"path": entry.name, "size": len(entry.data), "sha256": hex.EncodeToString(digest[:])})
+		var digestHex string
+		if useBlake3 {
+			sum := blake3.Sum256(entry.data)
+			digestHex = hex.EncodeToString(sum[:])
+		} else {
+			sum := sha256.Sum256(entry.data)
+			digestHex = hex.EncodeToString(sum[:])
+		}
+		manifestEntries = append(manifestEntries, map[string]interface{}{
+			"path":    entry.name,
+			"size":    len(entry.data),
+			digestKey: digestHex,
+		})
 	}
-	sort.Slice(manifestEntries, func(i, j int) bool { return manifestEntries[i]["path"].(string) < manifestEntries[j]["path"].(string) })
+	sort.Slice(manifestEntries, func(i, j int) bool {
+		return manifestEntries[i]["path"].(string) < manifestEntries[j]["path"].(string)
+	})
 	manifest, err := json.Marshal(manifestEntries)
 	if err != nil {
 		return err
 	}
-	digest := sha256.Sum256(manifest)
-	if hex.EncodeToString(digest[:]) != strings.ToLower(expected) {
-		return errors.New("update payload sha256 mismatch")
+	var computed string
+	if useBlake3 {
+		sum := blake3.Sum256(manifest)
+		computed = hex.EncodeToString(sum[:])
+	} else {
+		sum := sha256.Sum256(manifest)
+		computed = hex.EncodeToString(sum[:])
+	}
+	if computed != strings.ToLower(expected) {
+		return fmt.Errorf("update payload %s mismatch", digestKey)
 	}
 	return nil
 }

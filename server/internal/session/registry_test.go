@@ -245,6 +245,31 @@ func TestIsIntentionalSessionEnd(t *testing.T) {
 	}
 }
 
+func TestSessionEndUpdateDisplay(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_700_000_100, 0)
+	registry := NewRegistry()
+	device, err := registry.Approve(publicKey, "room-update", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.RecordIntentionalSessionEnd(device.ClientID, SessionEndUpdate, "apply_update", now)
+	got, _ := registry.Get(device.ClientID)
+	reason, label := SessionEndDisplay(got, false, now)
+	if reason != SessionEndUpdate || label != "更新重启中" {
+		t.Fatalf("update display = %q %q", reason, label)
+	}
+	// Unexpected note must not clobber intentional update.
+	registry.NoteUnexpectedDisconnect(device.ClientID, now.Add(time.Second))
+	got, _ = registry.Get(device.ClientID)
+	if got.SessionEndReason != SessionEndUpdate {
+		t.Fatalf("update reason overwritten: %q", got.SessionEndReason)
+	}
+}
+
 func TestSessionEndUserExitAndUnexpectedGrace(t *testing.T) {
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

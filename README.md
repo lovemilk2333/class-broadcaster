@@ -65,7 +65,7 @@ Legacy single-field `"version"` is still accepted and applied to both sides.
 Requirements (typical): Go toolchain, `python3`, `zstd`, Zig optional (arm64 cross), `uv` for Windows client wheels, Node/`pnpm` when rebuilding the admin UI.
 
 ```bash
-# Full release: server + client packages under bin/
+# Full release: server + client packages under bin/ (built in parallel)
 make package
 # aliases: make / make all
 
@@ -91,12 +91,12 @@ make package-client
 | Client (full update) | `lovemilk-class-broadcaster-<ver>-windows-amd64-full.tar.zst` — with `make client-full` / `CLIENT_FULL=1` |
 | Updater only | `lovemilk-class-broadcaster-updater-<ver>-windows-amd64.tar.zst` |
 
-The Windows client is assembled without PyInstaller: official CPython 3.11 embeddable runtime + Windows wheels via `uv` + `-O` bytecode + Go GUI launcher. Site-packages are cached under `build/cache/windows-site-packages/`. Offline TTS on Windows prefers `piper-plus` (Tsukuyomi-chan multilingual ONNX); Linux keeps `piper-tts` with zh-CN + en-US voices (`make download-tts-models` → `client/tts/`, packaged as `Lib/tts/`; `make clean` keeps that cache). Windows falls back to SAPI.
+The Windows client is assembled without PyInstaller: official CPython 3.11 embeddable runtime + Windows wheels via `uv` + `-O` bytecode + Go GUI launcher. Site-packages are cached under `build/cache/windows-site-packages/`. Offline TTS on both Windows and Linux uses classic `piper-tts` with `zh_CN-huayan-medium` + `en_US-lessac-medium` (`make download-tts-models` → `client/tts/`, packaged as `Lib/tts/`; `make clean` keeps that cache). Windows falls back to SAPI.
 
 ### Incremental update packages
 
 - **Green `.zip`:** always a full install tree (not accepted by admin publish).
-- **Update `.tar.zst`:** files-v1 overlay package. When a previous install tree exists at `build/cache/client-package-base` (or a previous green zip in `bin/`), `make package-client` packs **only new/changed files**. If the new tree deletes paths present in the base, packaging falls back to a **full** archive (overlay cannot delete files).
+- **Update `.tar.zst`:** files-v1 overlay package. Prefer a **previous-version** green zip under `bin/` as the incremental base (what field installs have); else the newest *other* versioned snapshot under `build/cache/client-package-base/<version>/` (at most 2 versions kept; current version is never used as its own base). Packs **only new/changed files**. If the new tree deletes paths present in the base, packaging falls back to a **full** archive (overlay cannot delete files).
 - Force the **primary** update package to be full: `PACKAGE_FULL=1 make package-client`.
 - Keep incremental primary **and** also emit a full archive: `make client-full` or `CLIENT_FULL=1 make package-client` → `*-windows-amd64-full.tar.zst`.
 
@@ -186,7 +186,7 @@ More detail: [`design/design.md`](design/design.md).
 
 - TOFU fingerprints must be confirmed by an operator; rotation is never silent.
 - Client identity on disk is install-bound and encrypted; it is not a high-entropy HSM binding.
-- Update packages are verified (zstd magic, tar path safety, files-v1 SHA-256) before overlay.
+- Update packages are verified (zstd magic, tar path safety, files-v1 digest: BLAKE3 for new packages, SHA-256 for legacy) before overlay.
 - Management HTTP does not serve update binaries to clients.
 
 ## License

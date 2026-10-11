@@ -176,7 +176,7 @@ mindmap
 
 前端只调用服务端 HTTP API，不直接访问 SQLite 或客户端。叫号发送由服务端统一路由：前端提交一条带 `message_id` 的消息，服务端根据客户端标签/班级/屏幕分组投递，并通过 SSE 回报发送状态。
 
-当前管理 API 包括：`GET /healthz`、`GET /api/v1/health`、`POST/GET /api/v1/messages`、`POST/GET /api/v1/devices`、`POST/GET /api/v1/updates`、`POST /api/v1/updates/publish`、`POST /api/v1/updates/:id/withdraw`、`GET /api/v1/updates/packages/:sha256` 和 `GET/POST /api/v1/config`。更新发布仅接受 multipart 上传的 `.tar.zst` 包，服务端存入 `data/updates/<manifest-sha256>.tar.zst` 并写 SQLite。设备批准接口接收 64 位小写十六进制 SHA-256 公钥指纹作为 `client_id`；服务端只保存指纹，不保存客户端证书或公钥。TLS 握手后服务端计算客户端证书 SPKI 的 SHA-256 并与信任列表比较，未知指纹收到 `client_not_approved` 错误。握手携带 `client_version`，服务端写入设备注册表供管理页面展示。配置更新会生成新的 `config_id`；勾选立即更新时，服务端通过 `ConfigUpdate` 向现有连接发布 snapshot。
+当前管理 API 包括：`GET /healthz`、`GET /api/v1/health`、`POST/GET /api/v1/messages`、`POST/GET /api/v1/devices`、`POST/GET /api/v1/updates`、`POST /api/v1/updates/publish`、`POST /api/v1/updates/:id/withdraw`、`GET /api/v1/updates/packages/:sha256` 和 `GET/POST /api/v1/config`。更新发布仅接受 multipart 上传的 `.tar.zst` 包，服务端存入 `data/updates/<manifest-digest>.tar.zst`（64 位十六进制；新包为 BLAKE3，旧包为 SHA-256；API/DB 字段名仍为 `sha256`）并写 SQLite。设备批准接口接收 64 位小写十六进制 SHA-256 公钥指纹作为 `client_id`；服务端只保存指纹，不保存客户端证书或公钥。TLS 握手后服务端计算客户端证书 SPKI 的 SHA-256 并与信任列表比较，未知指纹收到 `client_not_approved` 错误。握手携带 `client_version`，服务端写入设备注册表供管理页面展示。配置更新会生成新的 `config_id`；勾选立即更新时，服务端通过 `ConfigUpdate` 向现有连接发布 snapshot。
 
 客户端内部拆分为 `discovery`、`connection`、`protocol`、`store`、`display`、`tts`、`updater` 七个模块。UI 线程不直接执行网络读写；网络线程将事件投递到 Qt signal/slot，断线重连采用指数退避并带抖动。
 
@@ -213,7 +213,7 @@ TCP 读取必须先读满固定头，再按长度读取 payload；业务包最�
 
 客户端使用 `0x0205 ClientDisconnect` 接收管理端的主动断开命令。监听模式不自动重连，从模式每 5 分钟发起带 `reconnect_probe` 的握手，由服务端按客户端当前 `connection_mode` 返回 `connect_allowed`；设置页手动连接通过 `manual_connect` 请求，成功后重置退避，失败不改变原探测安排。该状态仅在运行期间保存，不写入本地服务器配置；启动仍会连接上次选中的服务器。客户端通过 `0x0206 ClientLog` 上传本地日志。客户端 `data/client.log` 与独立 Go updater 的 `data/updater.log` 统一为 JSON 行（字段 `time`/`level`/`msg`/`logger`/`source`；updater 为 `logger=mkcb.updater` 并含 version/build_date 身份），与服务端 `json.Valid` 解析一致。客户端更新重启并重新握手后，把未上报的 updater 日志经同一 `ClientLog` 通道推送，便于管理端排查无法更新的问题。连接补推不会把已上报较新 `client_version` 的客户端回滚到更旧包。日志缓存在服务端的独立有界客户端日志缓冲中，最多保留 1000 个客户端、每客户端 500 条；按客户端 SHA-256 ID 查询，不会从服务端进程日志中按 `client_id` 猜测客户端日志。每条上传记录限制 16 KiB。客户端日志 API 在服务端按日志时间倒序分页，默认后端页 100 条；前端使用共享页大小、页码跳转和 SSE 刷新当前页，与服务端日志分页一致。服务端在已知客户端主动断开（`ClientSessionEnd` 的 `user_exit`/`update`/`admin`）且不在线时，跳过监听探测累计，避免探测丢包被人为下线抬高。
 
-客户端在主动退出前发送 `0x020A ClientSessionEnd`（BSON：`reason`=`user_exit`|`update`|`admin`，可选 `detail`）。服务端写入 `session_end_reason`/`session_end_at`：开发者面板 Exit → **人为终止**；更新切换 → **更新重启中**；管理端断开 → **管理端断开**。未收到 goodbye 的掉线进入 30 秒宽限期（UI 显示 **重连中**），30 秒内未重新上线则标记为 **意外终止**。重新握手成功会清除该状态。
+客户端在主动退出前发送 `0x020A ClientSessionEnd`（BSON：`reason`=`user_exit`|`update`|`admin`，可选 `detail`）。服务端写入 `session_end_reason`/`session_end_at`：开发者面板 Exit → **人为终止**；更新切换 → **更新重启中**；管理端断开 → **管理端断开**。未收到 goodbye 的掉线进入 30 秒宽限期（UI 显示 **重连中**），30 秒内未重新上线则标记为 **意外终止**。重新握手成功会清除该状态。客户端在成功刷出 goodbye 后必须停止外层重连循环（`keep_running=False`），否则短暂重握手会 `ClearSessionEnd`，随后进程退出又被记成 **意外终止**。客户端应用更新并重启重连后发送 `0x020B UpdateApplied`（BSON：`sha256`，可选 `version`/`seq`）；服务端按客户端推进 `applied_seq`，推送 `UPDATE_AVAILABLE` 本身不算完成。等待 TTS 预合成且尚未弹窗时，客户端发送 `0x020C ClientActivity`（BSON：`state`=`processing`|`idle`，可选 `message_id`/`detail`/`elapsed_ms`）；服务端仅在 hub 运行时内存保留，管理端在线设备连接状态显示 **处理**（悬停可见耗时与正文摘要），断开或 `idle` 后清除。
 
 “全部客户端”语义：
 - 创建时若已有已批准客户端，目标集合固化为当时已批准指纹；创建时离线的客户端上线后仍会补收，创建后才批准的客户端不会追溯收到该消息。
@@ -243,7 +243,7 @@ TCP 读取必须先读满固定头，再按长度读取 payload；业务包最�
 
 ### TTS 与显示
 
-客户端 TTS 完全离线运行，不使用 `gTTS` 或任何云端语音服务。Windows 首选 `piper-plus`（Tsukuyomi-chan 多语言 ONNX + `language_id`），Linux 首选 `piper-tts`（zh-CN + en-US ONNX）；均直接调用 Python 包 API（不用 CLI）。模型在 `client/tts/` / 打包 `Lib/tts/`，用 jieba 分语言段合成。`speech_rate`（默认 0.75）控制语速。失败回退 Windows SAPI 5。
+客户端 TTS 完全离线运行，不使用 `gTTS` 或任何云端语音服务。Windows 与 Linux 均用经典 `piper-tts`（`zh_CN-huayan-medium` + `en_US-lessac-medium` ONNX）；直接调用 Python 包 API（不用 CLI）。模型在 `client/tts/` / 打包 `Lib/tts/`，用 jieba 分语言段合成。不再依赖 piper-plus / Tsukuyomi / NLTK。`speech_rate`（默认 0.75）控制语速。失败回退 Windows SAPI 5。
 
 首次启动、首次收到 TTS 消息，或服务端 TTS 配置/本地语音版本发生变化时，客户端按 `Piper 库 -> SAPI zh-CN` 顺序探测并缓存成功结果。缓存至少包含引擎、voice/model 标识、版本指纹、探测时间和状态。后续优先使用上次成功的引擎；若运行时启动失败或朗读中途失败，立即切换 fallback，并从头重新朗读当前消息。全部引擎都失败时仍显示消息，回报 `spoken=failed` 和具体错误码。
 
@@ -251,9 +251,9 @@ TCP 读取必须先读满固定头，再按长度读取 payload；业务包最�
 
 **字号表达式（已实现）：** 设备默认与单条消息 `font_size` 支持 `38px` / `1.2em`（相对 38px）/ `5vw`/`25vh`（相对消息窗所在屏幕可用宽/高，0.0–100）；空=客户端内置 **25vh**。单条消息可覆盖设备默认；设备字体 PATCH 后断开以重握手下发。
 
-**Future（未实现）：**
-- 消息级字体族：管理端从各客户端上报的 `available_fonts` 取并集供选择；客户端缺字时回退默认字体并提示。
-- HTML 富文本：`content` 白名单子集（`b`/`i`/`u`/`span(font-family|size|color)`/`br`/`img(data URI)`/`svg` 内联）；禁 script/iframe/外链；TTS 使用去标签纯文本。当前 `content` 仍为纯文本 + TTS。
+**字号 / 富文本：**
+- 消息级字体族（Future）：管理端从各客户端上报的 `available_fonts` 取并集供选择；客户端缺字时回退默认字体并提示。
+- HTML 富文本（已实现）：`content` 仍为字符串，可含白名单 HTML（`b`/`i`/`u`/`span(font-family|size|color|font-weight|font-style)`/`br`/`img(data URI，可带 width/height)`/`svg` 内联）；管理端发送框为轻量 contenteditable 工具栏（粗体/斜体/下划线/换行/插图），提交前再 sanitize（浏览器 `execCommand` 产出的 `font-weight`/`font-style` span 会收成 `<b>`/`<i>`）；对选区加粗等后若光标落在末尾样式节点内，会移到标签外（必要时插 NBSP 尾节点），避免后续输入继承样式。插图会压缩到约 960px 边长并限制体积。客户端正文默认字重 400，使 `<b>` 可见；`sanitize_html` 禁 script/iframe/外链/on*；含 `br`/`img`/`svg`/真换行**或**行内强调（`b`/`i`/`u`/font-weight|font-style）时禁用 marquee、以 QLabel 富文本静态显示并限高约屏高 45%（保证中文粗斜体可见）；仅颜色等非强调 `span` 仍可走单行 marquee。长 `data:image/...;base64` 在部分 Qt 上无法绘制：客户端先解码，优先 `QLabel.setResourceProvider`（Qt≥6.1），否则写短时临时文件并把 `src` 换成 `file://`。TTS 与时长 Token 使用 `html_to_plain_text` 去标签纯文本。撤回提示为「消息已撤回：」+ 净化 HTML（`force_rich` 保留格式），TTS 读纯文本。启用 TTS 时客户端在收到消息入队后即后台预合成 Piper WAV（内存缓存，不落盘）；轮到播放时若预取未完成则延后弹窗并上报 **处理** 活动态，就绪后再显示并朗读，失败则弹窗后回退现场合成；等待期间客户端日志输出正文摘要与已耗时。行内 `b`/`i`/`u` 走静态富文本以便中文粗斜体可见。Windows piper-tts 依赖较新的 VC++ 2015–2022 x64（≥14.40）。包内不再把 PySide6 自带的过旧 `msvcp140`（常为 14.29）放进 `onnxruntime/capi`；TTS 探测/合成子进程也不会 `add_dll_directory(PySide6)` 或预加载 embeddable `runtime/` 的 vcruntime 14.38（二者都会盖住 System32 新 CRT 并 `0xC0000005`）。子进程 PATH 剥离 Qt/`runtime`，并优先 `WinDLL` 预加载 `System32\\msvcp140` / `vcruntime140`。客户端**启动时**后台探测 piper-tts/onnxruntime；若 ACCESS_VIOLATION 且本机尚未关闭过提示，则弹窗一次（写入 `data/vc-redist-prompt.json`），确认后打开 `https://aka.ms/vc14/vc_redist.x64.exe`。设置页「运行环境」可随时重新检测并手动打开同一下载链接。
 
 语音内容使用结构化 BSON 节点，不让客户端解析任意 XML 或脚本。首版只支持普通文本、重复和停顿三种节点：重复朗读使用 `{type: "repeat", count: 3, children: [...]}`，停顿使用 `{type: "pause", duration_ms: 800}`。客户端将节点编译为 SAPI 或 Piper 可接受的纯文本/语音片段；服务端保存原始语义结构，客户端只做安全清理和标点处理。
 
@@ -310,7 +310,8 @@ ciphertext = AES-256-GCM(key, nonce = random_12_bytes, plaintext = private_key)
 
 ### 更新与发布
 
-更新包仅为服务端本地 `data/updates/<manifest-sha256>.tar.zst`（zstd level 3 包住的 tar）。顶层直接含 `metadata.json` 与安装文件。metadata 含 `components`（规范顺序 `updater` 先于 `client`）、兼容 `component`（`client`/`updater`/`bundle`）、`version`、`client_version`、`updater_version`、`platform`、`payload_format`、`sha256`（files-v1 清单摘要）；增量包另可含 `incremental=true` 与 `file_count`。`scripts/package_update.py` 支持相对上一构建缓存（`build/cache/client-package-base`）或上一绿色 `.zip` 的差量打包：只打入变更/新增文件；若新树删除了基线路径则自动回退全量（overlay 无法删文件）。绿色安装始终为全量 `.zip`。发布时服务端校验 zstd magic + tar、清单 SHA-256 与路径安全；在线目标收到 `UPDATE_AVAILABLE`（meta + 鉴权 `download_token` + `seq` + 可选 `force`），客户端对业务 TLS 端口 **新建**短连接（`ConnectReq.update_download` + `UpdateDownloadReq/Resp` 分块）拉取包，**不**使用管理 HTTP `39003`。下载进度按百分比里程碑记录（`>0%` / `25%` / `50%` / `75%` / `>99%`，日志含 `%=… speed=…MiB/s`）。`UPDATE_AVAILABLE` **不**写入握手 `ConnectResp`；业务会话建立后，若客户端 `last_seq` 落后于其适用的已发布更新（含发布时离线），服务端补推最高适用 seq；已上报 `client_version` ≥ 包内版本则不再补推（强制/非强制相同，避免同包重启循环）。`force=true` 时目标为全部已批准客户端。客户端校验通过后启动独立 Go updater（日志 `data/updater.log`）对安装目录做文件级覆盖（保留 `data/`，支持仅 updater 包与稀疏增量包）；组合包内容已含 updater 优先文件布局。
+更新包仅为服务端本地 `data/updates/<manifest-digest>.tar.zst`（zstd level 3 包住的 tar）。顶层直接含 `metadata.json` 与安装文件。metadata 含 `components`（规范顺序 `updater` 先于 `client`）、兼容 `component`（`client`/`updater`/`bundle`）、`version`、`client_version`、`updater_version`、`platform`、`payload_format`、`blake3`（files-v1 清单 BLAKE3 摘要；per-file 键为 `blake3`；新包不再写 `sha256`）；旧包仍可能仅有 `sha256`。服务端发布时把包摘要写入 API/DB/wire 字段 `sha256`（下载路径与 `UPDATE_AVAILABLE` 身份）。增量包另可含 `incremental=true` 与 `file_count`。`scripts/package_update.py` 支持相对上一构建缓存（`build/cache/client-package-base/<version>/`，最多保留 2 个版本快照）或上一绿色 `.zip` 的差量打包：只打入变更/新增文件；若新树删除了基线路径则自动回退全量（overlay 无法删文件）。
+绿色安装始终为全量 `.zip`。发布时服务端校验 zstd magic + tar、清单摘要（优先 `blake3`，否则 `sha256`）与路径安全；在线目标收到 `UPDATE_AVAILABLE`（meta + 鉴权 `download_token` + `seq` + 可选 `force`），客户端对业务 TLS 端口 **新建**短连接（`ConnectReq.update_download` + `UpdateDownloadReq/Resp` 分块）拉取包，**不**使用管理 HTTP `39003`。下载进度按百分比里程碑记录（`>0%` / `25%` / `50%` / `75%` / `>99%`，日志含 `%=… speed=…MiB/s`）。`UPDATE_AVAILABLE` **不**写入握手 `ConnectResp`，也**不**视为该客户端已完成更新。是否下发由服务端按 `applied_seq` 与握手 `client_version` 判定；客户端一旦收到推送即应用（仅本地已应用过的同一 digest 才跳过并补报）。业务会话建立后，若客户端 `applied_seq`（来自 `UpdateApplied` `0x020B`）落后于其适用的已发布更新（含发布时离线），服务端补推最高适用 seq；客户端应用并重启重连后上报 `UpdateApplied`（BSON：`sha256` + 可选 `version`/`seq`），服务端才将该客户端标为已应用。已上报 `client_version` ≥ 包内版本则不再补推（旧客户端无 `UpdateApplied` 时的回退，强制/非强制相同，避免同包重启循环）。`force=true` 时目标为全部已批准客户端。客户端校验通过后启动独立 Go updater（日志 `data/updater.log`）对安装目录做文件级覆盖（保留 `data/`，支持仅 updater 包与稀疏增量包）；组合包内容已含 updater 优先文件布局。
 
 管理端“更新发布”只接受 `.tar.zst`，经 `POST /api/v1/updates/publish` 向已选客户端推送通知。服务端从包内 `metadata.json` 识别组件/版本/平台与清单摘要；前端不手填这些字段。不接受 `.zip` 上传，也不再二次重压。收到更新时客户端只写日志（不弹 Windows 托盘通知）。
 

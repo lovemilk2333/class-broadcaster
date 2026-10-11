@@ -107,8 +107,19 @@ export function formatDisplayDurationMs(ms: number): string {
 }
 
 export function messagePreview(value: string) {
-  const characters = Array.from(value)
-  return characters.length > 72 ? `${characters.slice(0, 72).join('')}…` : value
+  // Strip tags for table ellipsis so data-URI images don't flood the cell.
+  const plain = String(value || '')
+    .replace(/<img\b[^>]*>/gi, '[图片]')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const characters = Array.from(plain || value)
+  return characters.length > 72 ? `${characters.slice(0, 72).join('')}…` : plain || value
 }
 
 export function logDateParam(value: Date | null) {

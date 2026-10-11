@@ -40,8 +40,7 @@
 | zstandard | BSD-3-Clause | https://github.com/indygreg/python-zstandard |
 | jieba | MIT | https://github.com/fxsjy/jieba |
 | onnxruntime | MIT | https://github.com/microsoft/onnxruntime |
-| piper-plus（Windows） | MIT | https://github.com/ayutaz/piper-plus |
-| piper-tts（Linux） | MIT | https://github.com/rhasspy/piper |
+| piper-tts | GPL-3.0-or-later | https://github.com/OHF-voice/piper1-gpl |
 | PySide6 / PySide2 | LGPL-3.0 | https://code.qt.io/cgit/pyside/pyside-setup.git |
 | pywin32（Windows） | PSF / BSD-style | https://github.com/mhammond/pywin32 |
 
@@ -49,5 +48,4 @@
 
 | 名称 | 许可证 | URL |
 |------|--------|-----|
-| piper-plus Tsukuyomi 模型 | tsukuyomi-chan-corpus | https://huggingface.co/ayousanz/piper-plus-tsukuyomi-chan |
-| rhasspy/piper-voices（Linux 打包语音） | MIT | https://huggingface.co/rhasspy/piper-voices |
+| rhasspy/piper-voices（zh_CN-huayan / en_US-lessac） | MIT | https://huggingface.co/rhasspy/piper-voices |

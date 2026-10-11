@@ -26,7 +26,8 @@ def _write_tar_package(path: Path, metadata: dict, files: list[tuple[str, bytes]
 
 
 class UpdaterTest(unittest.TestCase):
-    def test_files_v1_stages_direct_files_without_metadata(self):
+    def test_files_v1_stages_legacy_sha256_package(self):
+        """Legacy packages (no blake3 field) still verify with SHA-256."""
         files = [("client.exe", b"client"), ("lib/helper.dll", b"helper")]
         manifest = [
             {"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
@@ -45,6 +46,41 @@ class UpdaterTest(unittest.TestCase):
             package = Path(directory) / "package.tar"
             _write_tar_package(package, metadata, files)
             staged = stage_update(package, metadata, Path(directory) / "staged")
+            self.assertEqual((staged / "client.exe").read_bytes(), b"client")
+            self.assertEqual((staged / "lib/helper.dll").read_bytes(), b"helper")
+            self.assertFalse((staged / "metadata.json").exists())
+
+    def test_files_v1_stages_blake3_package(self):
+        """New packages use blake3 only (no sha256 in package metadata)."""
+        import blake3
+
+        files = [("client.exe", b"client"), ("lib/helper.dll", b"helper")]
+        manifest = [
+            {"path": path, "size": len(data), "blake3": blake3.blake3(data).hexdigest()}
+            for path, data in files
+        ]
+        digest = blake3.blake3(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        package_metadata = {
+            "components": ["client"],
+            "component": "client",
+            "version": "2.1.0",
+            "platform": "windows-x64",
+            "payload_format": "files-v1",
+            "blake3": digest,
+        }
+        # Wire notification may only carry the digest under sha256.
+        wire_metadata = {
+            "components": ["client"],
+            "component": "client",
+            "version": "2.1.0",
+            "platform": "windows-x64",
+            "payload_format": "files-v1",
+            "sha256": digest,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "package.tar"
+            _write_tar_package(package, package_metadata, files)
+            staged = stage_update(package, wire_metadata, Path(directory) / "staged")
             self.assertEqual((staged / "client.exe").read_bytes(), b"client")
             self.assertEqual((staged / "lib/helper.dll").read_bytes(), b"helper")
             self.assertFalse((staged / "metadata.json").exists())

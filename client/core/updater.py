@@ -77,7 +77,28 @@ class _Archive:
         return member.name
 
 
-def _manifest_bytes(archive: _Archive) -> bytes:
+def _package_uses_blake3(metadata: Mapping[str, Any]) -> bool:
+    return bool(str(metadata.get("blake3") or "").strip())
+
+
+def _package_content_digest(metadata: Mapping[str, Any]) -> str:
+    """Authoritative 64-hex package identity: prefer blake3, else sha256."""
+    blake = str(metadata.get("blake3") or "").strip().lower()
+    if blake:
+        return blake
+    return str(metadata.get("sha256") or "").strip().lower()
+
+
+def _file_digest_hex(data: bytes, *, use_blake3: bool) -> str:
+    if use_blake3:
+        import blake3
+
+        return blake3.blake3(data).hexdigest()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _manifest_bytes(archive: _Archive, *, use_blake3: bool) -> bytes:
+    digest_key = "blake3" if use_blake3 else "sha256"
     entries = []
     seen = set()
     for member in sorted(archive.members(), key=archive.member_name):
@@ -88,13 +109,28 @@ def _manifest_bytes(archive: _Archive) -> bytes:
             raise UpdateError(f"duplicate update path: {name}")
         seen.add(name)
         data = archive.read(member)
-        entries.append({"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        entries.append({
+            "path": name,
+            "size": len(data),
+            digest_key: _file_digest_hex(data, use_blake3=use_blake3),
+        })
     return json.dumps(entries, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
-def _verify_manifest(archive: _Archive, expected: str) -> None:
-    if hashlib.sha256(_manifest_bytes(archive)).hexdigest() != expected.lower():
-        raise UpdateError("update payload sha256 mismatch")
+def _verify_manifest(archive: _Archive, metadata: Mapping[str, Any]) -> None:
+    use_blake3 = _package_uses_blake3(metadata)
+    expected = _package_content_digest(metadata)
+    manifest = _manifest_bytes(archive, use_blake3=use_blake3)
+    if use_blake3:
+        import blake3
+
+        computed = blake3.blake3(manifest).hexdigest()
+        label = "blake3"
+    else:
+        computed = hashlib.sha256(manifest).hexdigest()
+        label = "sha256"
+    if computed != expected.lower():
+        raise UpdateError(f"update payload {label} mismatch")
 
 
 def _safe_member_path(target: Path, name: str, is_dir: bool) -> Path:
@@ -154,15 +190,19 @@ def normalize_components(metadata: Mapping[str, Any]) -> list[str]:
 
 
 def verify_metadata(metadata: Mapping[str, Any], public_key: bytes) -> None:
-    """校验更新组件、版本和 SHA-256；当前版本不启用发布签名。"""
-    required = ("version", "platform", "sha256")
-    if any(not isinstance(metadata.get(key), str) or not metadata[key] for key in required):
+    """校验更新组件、版本和内容摘要；当前版本不启用发布签名。
+
+    新包优先 ``blake3``；旧包仍认 ``sha256``。两者均为 64 位小写十六进制。
+    """
+    if not isinstance(metadata.get("version"), str) or not metadata["version"]:
+        raise UpdateError("update metadata is incomplete")
+    if not isinstance(metadata.get("platform"), str) or not metadata["platform"]:
         raise UpdateError("update metadata is incomplete")
     if not normalize_components(metadata):
         raise UpdateError("update components is incomplete")
-    digest = str(metadata["sha256"]).lower()
+    digest = _package_content_digest(metadata)
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-        raise UpdateError("update sha256 is invalid")
+        raise UpdateError("update blake3/sha256 is invalid")
     return
 
 
@@ -175,11 +215,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _digests_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return _package_content_digest(left) == _package_content_digest(right)
+
+
 def store_update_package(metadata: Mapping[str, Any], package_bytes: bytes, destination: Path) -> Path:
     """保存服务端通过业务连接直接发送的更新包为 ``*.tar.zst``。"""
     verify_metadata(metadata, b"")
     destination.mkdir(parents=True, exist_ok=True)
-    digest = str(metadata.get("sha256") or "").lower()
+    digest = _package_content_digest(metadata)
     if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
         package = destination / f"{digest}.tar.zst"
     else:
@@ -194,13 +238,17 @@ def store_update_package(metadata: Mapping[str, Any], package_bytes: bytes, dest
             if "metadata.json" not in archive.names():
                 raise UpdateError("update package metadata.json is missing")
             metadata_document = json.loads(archive.read(next(item for item in archive.members() if archive.member_name(item) == "metadata.json")))
-            if any(metadata_document.get(key) != metadata.get(key) for key in ("version", "sha256")):
+            if str(metadata_document.get("version") or "") != str(metadata.get("version") or ""):
+                raise UpdateError("embedded update metadata does not match")
+            if not _digests_match(metadata_document, metadata):
                 raise UpdateError("embedded update metadata does not match")
             if normalize_components(metadata_document) != normalize_components(metadata):
                 raise UpdateError("embedded update components do not match")
             if metadata_document.get("payload_format", "files-v1") != "files-v1":
                 raise UpdateError("update package payload format is unsupported")
-            _verify_manifest(archive, str(metadata["sha256"]))
+            # Algorithm comes from the package (blake3-only new packages); wire
+            # UPDATE_AVAILABLE may only carry the digest under the sha256 field.
+            _verify_manifest(archive, metadata_document)
         except Exception:
             package.unlink(missing_ok=True)
             raise
@@ -229,17 +277,19 @@ def stage_update(package: Path, metadata: Mapping[str, Any], staging_dir: Path) 
                 raise UpdateError("embedded update metadata does not match")
             if str(embedded.get("version") or "") != str(metadata.get("version") or ""):
                 raise UpdateError("embedded update metadata does not match")
-            if str(embedded.get("sha256") or "").lower() != str(metadata.get("sha256") or "").lower():
+            if not _digests_match(embedded, metadata):
                 raise UpdateError("embedded update metadata does not match")
             if normalize_components(embedded) != normalize_components(metadata):
                 raise UpdateError("embedded update components do not match")
             if embedded.get("payload_format", "files-v1") != "files-v1":
                 raise UpdateError("update package payload format is unsupported")
             if "payload_format" in embedded:
-                _verify_manifest(archive, str(metadata["sha256"]))
+                _verify_manifest(archive, embedded)
             else:
+                # Legacy single-payload packages: always SHA-256 of the lone member.
                 payload_members = [item for item in archive.members() if archive.member_name(item) != "metadata.json" and not archive.is_dir(item)]
-                if len(payload_members) != 1 or hashlib.sha256(archive.read(payload_members[0])).hexdigest() != str(metadata["sha256"]).lower():
+                expected = _package_content_digest(metadata)
+                if len(payload_members) != 1 or hashlib.sha256(archive.read(payload_members[0])).hexdigest() != expected:
                     raise UpdateError("update payload sha256 mismatch")
             _extract_members(archive, target, skip_metadata=True)
         finally:
@@ -262,13 +312,13 @@ def verify_package_files(package: Path, metadata: Mapping[str, Any]) -> None:
                 raise UpdateError("embedded update metadata does not match")
             if str(embedded.get("version") or "") != str(metadata.get("version") or ""):
                 raise UpdateError("embedded update metadata does not match")
-            if str(embedded.get("sha256") or "").lower() != str(metadata.get("sha256") or "").lower():
+            if not _digests_match(embedded, metadata):
                 raise UpdateError("embedded update metadata does not match")
             if normalize_components(embedded) != normalize_components(metadata):
                 raise UpdateError("embedded update components do not match")
             if embedded.get("payload_format", "files-v1") != "files-v1":
                 raise UpdateError("update package payload format is unsupported")
-            _verify_manifest(archive, str(metadata["sha256"]))
+            _verify_manifest(archive, embedded)
         finally:
             archive.close()
 

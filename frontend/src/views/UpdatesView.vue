@@ -70,7 +70,7 @@ const filters = ref<FiltersModel>({
 })
 
 const filterFields: FilterFieldDef[] = [
-  { key: 'global', label: '搜索', type: 'text', placeholder: '版本、组件、SHA-256 或更新 ID', matchMode: CustomFilterMatchMode.UPDATE_SEARCH },
+  { key: 'global', label: '搜索', type: 'text', placeholder: '版本、组件、摘要或更新 ID', matchMode: CustomFilterMatchMode.UPDATE_SEARCH },
   { key: 'status', label: '状态', type: 'select', options: updateStatusOptions, placeholder: '全部状态', showClear: true, matchMode: FilterMatchMode.EQUALS }
 ]
 
@@ -258,8 +258,8 @@ async function publishUpdate() {
         severity,
         summary: `已上传 ${published}/${packages.length} 个更新包${forceHint}${failureHint}`,
         detail: totalSent || totalOffline
-          ? `推送 ${totalSent} 个在线客户端，${totalOffline} 个离线${force ? '；离线客户端上线后会自动补推' : ''}`
-          : '后台校验 SHA-256，通过后自动推送；失败会在状态列显示',
+          ? `推送 ${totalSent} 个在线客户端，${totalOffline} 个离线${force ? '；离线客户端上线后会自动补推；客户端应用并重连后上报完成' : '；客户端应用并重连后上报完成'}`
+          : '后台校验文件完整性，通过后自动推送；失败会在状态列显示',
         life: 4800
       })
     }
@@ -297,7 +297,7 @@ async function publishUpdate() {
     <div class="section-head">
       <div>
         <h2 class="section-title-with-badge">发布客户端更新 <span class="beta-badge" title="实验性功能">Beta</span></h2>
-        <p>上传后立即入队；后台校验 SHA-256，通过后推送在线客户端。勾选「强制」时所有已批准客户端必须更新，离线客户端上线后自动补推。失败原因显示在状态列。</p>
+        <p>上传后立即入队；后台校验文件完整性，通过后推送在线客户端。勾选「强制」时所有已批准客户端必须更新，离线客户端上线后自动补推。推送不等于完成：客户端应用并重连后上报 UpdateApplied。失败原因显示在状态列。</p>
       </div>
       <Button label="添加更新" icon="pi pi-cloud-upload" @click="openUpdateDialog" />
     </div>
@@ -337,7 +337,7 @@ async function publishUpdate() {
           @click="openUpdateTargets(slotProps.data)"
         />
       </template></Column>
-      <Column field="sha256" header="SHA-256"><template #body="slotProps"><code class="update-hash" :title="slotProps.data.sha256">{{ slotProps.data.sha256 }}</code></template></Column>
+      <Column field="sha256" header="摘要"><template #body="slotProps"><code class="update-hash" :title="slotProps.data.sha256">{{ slotProps.data.sha256 }}</code></template></Column>
       <Column field="status" header="状态" style="width: 12rem"><template #body="slotProps">
         <div class="update-status-cell">
           <Tag :value="updateStatusLabel(slotProps.data.status)" :severity="updateStatusSeverity(slotProps.data.status)" :title="updateStatusTitle(slotProps.data)" />
@@ -405,7 +405,7 @@ async function publishUpdate() {
             <Button type="button" icon="pi pi-times" text rounded severity="secondary" :aria-label="`移除 ${file.name}`" :disabled="admin.publishingUpdate" @click="removeUpdatePackage(index)" />
           </li>
         </ul>
-        <small>可一次选择或多个追加更新包；组件、版本、平台和 SHA-256 将由服务端从包内 metadata.json 自动识别并校验。</small>
+        <small>可一次选择或多个追加更新包；组件、版本、平台和文件完整性摘要将由服务端从包内 metadata.json 自动识别并校验。</small>
       </div>
       <div class="target-field">
         <span class="field-label">推送范围</span>
@@ -429,8 +429,8 @@ async function publishUpdate() {
         />
       </div>
       <small v-if="admin.publishingUpdate">正在按提交时的强制/目标设置上传，请勿关闭对话框。</small>
-      <small v-else-if="updateForce">强制更新会推送给当前全部已批准客户端；离线或序列号落后的客户端上线后自动补推。客户端列表中的当前版本由最近一次握手上报。</small>
-      <small v-else>在线目标立即推送；发布时离线或序列号落后的目标客户端，下次连接后自动补推最高适用更新。客户端列表中的当前版本由最近一次握手上报。</small>
+      <small v-else-if="updateForce">强制更新会推送给当前全部已批准客户端；离线或尚未应用成功的客户端上线后自动补推。推送不等于完成；客户端应用并重连后上报。客户端列表中的当前版本由最近一次握手上报。</small>
+      <small v-else>在线目标立即推送；发布时离线或尚未应用成功的目标客户端，下次连接后自动补推最高适用更新。推送不等于完成；客户端应用并重连后上报。客户端列表中的当前版本由最近一次握手上报。</small>
       <div class="dialog-actions">
         <Button
           type="submit"

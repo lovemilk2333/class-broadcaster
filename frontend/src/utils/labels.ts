@@ -104,7 +104,10 @@ export function deviceStatusSeverity(status?: Device['status']) {
 }
 
 export function deviceConnectionLabel(device: Device) {
-  if (device.online) return '已连接'
+  if (device.online) {
+    if ((device.activity_state || '').trim() === 'processing') return '处理'
+    return '已连接'
+  }
   const label = (device.session_end_label || '').trim()
   if (label) return label
   return '未连接'
@@ -130,7 +133,10 @@ export function deviceMatchesConnectionFilter(device: Device, filter: DeviceConn
 }
 
 export function deviceConnectionSeverity(device: Device) {
-  if (device.online) return 'success'
+  if (device.online) {
+    if ((device.activity_state || '').trim() === 'processing') return 'warn'
+    return 'success'
+  }
   const reason = device.session_end_reason || ''
   if (reason === 'user_exit') return 'warn' // 人为终止
   if (reason === 'unexpected') return 'danger' // 意外终止
@@ -139,8 +145,33 @@ export function deviceConnectionSeverity(device: Device) {
   return 'secondary'
 }
 
+function formatActivityElapsed(ms?: number): string {
+  const value = Number(ms || 0)
+  if (!Number.isFinite(value) || value <= 0) return ''
+  if (value < 1000) return `${Math.round(value)}ms`
+  const seconds = value / 1000
+  if (seconds < 60) return `${seconds.toFixed(1)}s`
+  const minutes = Math.floor(seconds / 60)
+  const rem = seconds - minutes * 60
+  return `${minutes}m${rem.toFixed(0).padStart(2, '0')}s`
+}
+
 export function deviceConnectionTitle(device: Device, formatDateTime: (value?: number) => string) {
-  if (device.online) return 'TLS 会话在线'
+  if (device.online) {
+    if ((device.activity_state || '').trim() === 'processing') {
+      const parts = ['处理中（TTS 预合成）']
+      let elapsedMs = device.activity_elapsed_ms
+      if (device.activity_started_at && device.activity_started_at > 0) {
+        elapsedMs = Date.now() - device.activity_started_at
+      }
+      const elapsed = formatActivityElapsed(elapsedMs)
+      if (elapsed) parts.push(`已耗时 ${elapsed}`)
+      if (device.activity_detail) parts.push(device.activity_detail)
+      if (device.activity_message_id) parts.push(device.activity_message_id)
+      return parts.join(' · ')
+    }
+    return 'TLS 会话在线'
+  }
   const parts = [deviceConnectionLabel(device)]
   if (device.session_end_detail) parts.push(device.session_end_detail)
   if (device.session_end_at) parts.push(formatDateTime(device.session_end_at))
@@ -165,7 +196,7 @@ export function updateStatusSeverity(status?: string) {
 
 export function updateStatusTitle(update: UpdateRecord) {
   if (update.status === 'failed' && update.status_detail) return update.status_detail
-  if (update.status === 'verifying') return '正在校验包内 files-v1 清单 SHA-256'
+  if (update.status === 'verifying') return '正在校验包内文件完整性'
   return updateStatusLabel(update.status)
 }
 

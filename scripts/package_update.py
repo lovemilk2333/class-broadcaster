@@ -26,29 +26,47 @@ import zipfile
 from pathlib import Path
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def file_blake3(path: Path) -> str:
+    """BLAKE3-256 hex digest of a file (primary files-v1 content hash)."""
+    try:
+        import blake3
+    except ImportError as exc:  # pragma: no cover - packaging env must have blake3
+        raise SystemExit(
+            "blake3 package is required for update packaging; "
+            "install with: uv add blake3 / pip install blake3"
+        ) from exc
+    hasher = blake3.blake3()
     with path.open("rb") as stream:
         while True:
             chunk = stream.read(1 << 20)
             if not chunk:
                 break
-            digest.update(chunk)
-    return digest.hexdigest()
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def file_content_digest(path: Path) -> str:
+    """Content digest used for incremental base comparison (BLAKE3)."""
+    return file_blake3(path)
 
 
 def file_manifest(files: list[Path], root: Path) -> bytes:
-    """Build the canonical files-v1 manifest bytes.
+    """Build the canonical files-v1 manifest bytes (BLAKE3).
 
     Entries must be ordered by the POSIX path *string* (not pathlib.Path order).
+    Object keys sort as blake3, path, size.
     """
     entries = []
     for path in files:
         data = path.read_bytes()
+        try:
+            import blake3
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit("blake3 package is required for update packaging") from exc
         entries.append({
             "path": path.relative_to(root).as_posix(),
             "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "blake3": blake3.blake3(data).hexdigest(),
         })
     entries.sort(key=lambda item: item["path"])
     return json.dumps(entries, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
@@ -164,7 +182,7 @@ def select_incremental_files(
             changed.append(path)
             continue
         try:
-            if file_sha256(path) != file_sha256(base_path):
+            if file_content_digest(path) != file_content_digest(base_path):
                 changed.append(path)
             else:
                 unchanged += 1
@@ -276,14 +294,19 @@ def main() -> None:
         if not files:
             raise SystemExit(f"input directory is empty: {args.input_dir}")
 
-        digest = hashlib.sha256(file_manifest(files, args.input_dir)).hexdigest()
+        import blake3
+
+        manifest = file_manifest(files, args.input_dir)
+        digest = blake3.blake3(manifest).hexdigest()
         primary = components[0] if len(components) == 1 else "bundle"
+        # Package metadata uses blake3 only. Server maps the digest into the
+        # API/DB/wire field still named sha256 for download paths & UPDATE_AVAILABLE.
         metadata: dict[str, object] = {
             "components": components,
             "component": primary,
             "version": args.version,
             "platform": args.platform,
-            "sha256": digest,
+            "blake3": digest,
             "payload_format": "files-v1",
             "client_version": args.client_version if "client" in components else "",
             "updater_version": args.updater_version if "updater" in components else "",
@@ -303,7 +326,7 @@ def main() -> None:
         meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
         kind = "incremental" if incremental else "full"
         print(
-            f"wrote {output} kind={kind} files={len(files)} sha256={digest} components={components}",
+            f"wrote {output} kind={kind} files={len(files)} blake3={digest} components={components}",
             flush=True,
         )
         if cleanup_base:

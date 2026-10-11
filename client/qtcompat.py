@@ -14,8 +14,18 @@ _BINDING = ""
 _QT_ERROR: Exception | None = None
 
 try:
-    from PySide2.QtCore import QPoint, Qt, QThread, QTimer, Signal  # type: ignore
-    from PySide2.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QIcon, QPainter, QPixmap  # type: ignore
+    from PySide2.QtCore import QPoint, Qt, QThread, QTimer, QUrl, Signal  # type: ignore
+    from PySide2.QtGui import (  # type: ignore
+        QColor,
+        QCloseEvent,
+        QDesktopServices,
+        QFont,
+        QFontDatabase,
+        QIcon,
+        QPainter,
+        QPixmap,
+        QTextDocument,
+    )
     from PySide2.QtWidgets import (  # type: ignore
         QAbstractItemView,
         QAction,
@@ -47,16 +57,18 @@ try:
 except Exception as exc:  # noqa: BLE001 — try PySide6 next
     _QT_ERROR = exc
     try:
-        from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal  # type: ignore
+        from PySide6.QtCore import QPoint, Qt, QThread, QTimer, QUrl, Signal  # type: ignore
         from PySide6.QtGui import (  # type: ignore
             QAction,
             QColor,
             QCloseEvent,
+            QDesktopServices,
             QFont,
             QFontDatabase,
             QIcon,
             QPainter,
             QPixmap,
+            QTextDocument,
         )
         from PySide6.QtWidgets import (  # type: ignore
             QAbstractItemView,
@@ -132,6 +144,9 @@ TextSelectableByMouse = _attr(
     "TextSelectableByMouse",
     default=_attr(_attr(Qt, "TextInteractionFlag", default=Qt), "TextSelectableByMouse"),
 )
+RichText = _attr(Qt, "RichText", default=_attr(_attr(Qt, "TextFormat", default=Qt), "RichText"))
+PlainText = _attr(Qt, "PlainText", default=_attr(_attr(Qt, "TextFormat", default=Qt), "PlainText"))
+AutoText = _attr(Qt, "AutoText", default=_attr(_attr(Qt, "TextFormat", default=Qt), "AutoText"))
 WindowMinimized = _attr(
     Qt, "WindowMinimized", default=_attr(_attr(Qt, "WindowState", default=Qt), "WindowMinimized")
 )
@@ -249,6 +264,7 @@ __all__ = [
     "QCloseEvent",
     "QColor",
     "QComboBox",
+    "QDesktopServices",
     "QDialog",
     "QFont",
     "QFontDatabase",
@@ -272,12 +288,17 @@ __all__ = [
     "QSpinBox",
     "QStackedWidget",
     "QSystemTrayIcon",
+    "QTextDocument",
     "Qt",
     "QThread",
     "QTimer",
+    "QUrl",
     "QueuedConnection",
     "QVBoxLayout",
     "QWidget",
+    "RichText",
+    "PlainText",
+    "AutoText",
     "ScrollBarAlwaysOff",
     "Signal",
     "TextSelectableByMouse",

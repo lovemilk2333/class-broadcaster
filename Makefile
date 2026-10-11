@@ -24,6 +24,9 @@ SERVER_LDFLAGS = -s -w -X '$(SERVER_VERSION_PKG).Version=$(SERVER_VERSION)' -X '
 ZIG := $(HOME)/tools/zig/zig
 ZIG_TARGET := aarch64-linux-gnu.2.31
 ZSTD ?= zstd
+# package_update.py needs blake3 (client dep); run via uv so the build host
+# does not require a system-wide blake3 install.
+PACKAGE_UPDATE := uv run --project '$(CLIENT_DIR)' python
 ICON_ICO := $(ROOT)/assets/icons/mkcb.ico
 # Avoid `case ...)` inside $(shell): Make treats `)` as end of $(shell ...).
 NATIVE_SERVER_ARCH := $(shell u=$$(uname -m); if [ "$$u" = x86_64 ] || [ "$$u" = amd64 ]; then echo amd64; elif [ "$$u" = aarch64 ] || [ "$$u" = arm64 ]; then echo arm64; else echo unsupported; fi)
@@ -33,7 +36,7 @@ NATIVE_SERVER_ARCH := $(shell u=$$(uname -m); if [ "$$u" = x86_64 ] || [ "$$u" =
 #   make build-server / build-client → same (explicit “compile and package” alias)
 #   make package-server / package-client → bin/ archives only (expects build/ already present)
 #   make client-full / package-client-full → client packages + an extra full .tar.zst
-#   make package / make all       → server + client release packages
+#   make package / make all       → server + client in parallel (-j2)
 # SKIP_FRONTEND=1 → compile server without running pnpm / overwriting web/ stub
 # (use with `pnpm dev` on :39004). Release `make server` still embeds full UI.
 SKIP_FRONTEND ?= 0
@@ -43,13 +46,18 @@ SKIP_FRONTEND ?= 0
 	package-server package-client package-client-full \
 	build-server-amd64 build-server-arm64 \
 	server-amd64 server-arm64 \
-	frontend-embed frontend-embed-force ensure-web-stub sync-version \
-	updater windows-icon download-tts-models \
+	frontend-embed frontend-embed-force ensure-web-stub \
+	sync-version sync-version-server sync-version-client \
+	updater windows-icon download-tts-models download-nltk-data \
 	install-server-user-service uninstall-server-user-service clean
 
 all: package
 
-package: server client
+# Server and client release trains are independent; run them concurrently.
+# Nested -j2 still works when the top-level make was invoked without -j.
+# --output-sync=target keeps each target's logs readable under parallel make.
+package:
+	@$(MAKE) -j2 --output-sync=target server client
 
 # -----------------------------------------------------------------------------
 # Public release targets (compile + package → bin/)
@@ -59,7 +67,9 @@ package: server client
 # `server` and `build-server` are equivalent (compile + package).
 server: build-server
 
-build-server: build-server-amd64 build-server-arm64
+# amd64 + arm64 compile in parallel, then package once both exist.
+build-server:
+	@$(MAKE) -j2 --output-sync=target build-server-amd64 build-server-arm64
 	@$(MAKE) --no-print-directory package-server
 
 # Releasable client: green zip + .tar.zst update packages under bin/.
@@ -78,18 +88,31 @@ build-client: updater download-tts-models
 	BUILD_DATE='$(BUILD_DATE)' python3 $(ROOT)/scripts/build_embedded_client.py --root $(ROOT) --output $(BUILD_DIR)/client/lovemilk-class-broadcaster --build-date '$(BUILD_DATE)'
 	@$(MAKE) --no-print-directory package-client CLIENT_FULL='$(CLIENT_FULL)' PACKAGE_FULL='$(PACKAGE_FULL)'
 
-# Download TTS ONNX voices into client/tts (gitignored; survives `make clean`):
-# piper-plus Tsukuyomi-chan (Windows) + rhasspy zh/en (Linux piper-tts).
+# Download classic piper-tts ONNX voices into client/tts (gitignored; survives `make clean`):
+# zh_CN-huayan-medium + en_US-lessac-medium (Windows + Linux).
 download-tts-models:
 	python3 $(ROOT)/scripts/download_tts_models.py --out $(CLIENT_DIR)/tts
+
+# Optional legacy target: NLTK was only needed by piper-plus/g2p_en (removed).
+# Kept so older docs/CI that call `make download-nltk-data` still succeed.
+download-nltk-data:
+	python3 $(ROOT)/scripts/download_nltk_data.py --out $(CLIENT_DIR)/nltk_data
 
 # -----------------------------------------------------------------------------
 # Version stamp
 # -----------------------------------------------------------------------------
 
 # Project server/client version.json from root (optional stamp via BUILD_DATE).
+# Prefer the component-specific targets under parallel `make package` so server
+# and client do not race on writing client/version.json.
 sync-version:
 	python3 $(ROOT)/scripts/sync_version_json.py --root $(ROOT) --build-date '$(BUILD_DATE)' --targets server client-source
+
+sync-version-server:
+	python3 $(ROOT)/scripts/sync_version_json.py --root $(ROOT) --build-date '$(BUILD_DATE)' --targets server
+
+sync-version-client:
+	python3 $(ROOT)/scripts/sync_version_json.py --root $(ROOT) --build-date '$(BUILD_DATE)' --targets client-source
 
 # -----------------------------------------------------------------------------
 # Frontend embed (into server binary)
@@ -169,14 +192,14 @@ else
 SERVER_FRONTEND_DEP := $(FRONTEND_EMBED_STAMP)
 endif
 
-build-server-amd64: $(SERVER_FRONTEND_DEP) sync-version
+build-server-amd64: $(SERVER_FRONTEND_DEP) sync-version-server
 	@if [ '$(SKIP_FRONTEND)' = '1' ]; then echo 'SKIP_FRONTEND=1 → using stub/existing web/ (no pnpm build)'; fi
 	@mkdir -p $(BUILD_DIR)/server/amd64
 	@echo "server version=$(SERVER_VERSION) build_date=$(BUILD_DATE)"
 	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$(SERVER_LDFLAGS)" -o $(BUILD_DIR)/server/amd64/lovemilk-class-broadcaster-server ./cmd/server
 	$(call strip-server-binary,$(BUILD_DIR)/server/amd64/lovemilk-class-broadcaster-server,amd64)
 
-build-server-arm64: $(SERVER_FRONTEND_DEP) sync-version
+build-server-arm64: $(SERVER_FRONTEND_DEP) sync-version-server
 	@if [ '$(SKIP_FRONTEND)' = '1' ]; then echo 'SKIP_FRONTEND=1 → using stub/existing web/ (no pnpm build)'; fi
 	@mkdir -p $(BUILD_DIR)/server/arm64
 	@echo "server version=$(SERVER_VERSION) build_date=$(BUILD_DATE)"
@@ -221,8 +244,12 @@ package-server:
 	bash $(ROOT)/scripts/package-server-zip.sh amd64 $(SERVER_VERSION)
 	bash $(ROOT)/scripts/package-server-zip.sh arm64 $(SERVER_VERSION)
 
-# Previous install tree used as the incremental .tar.zst base (refreshed after each package-client).
-CLIENT_PACKAGE_BASE_DIR := $(BUILD_DIR)/cache/client-package-base
+# Versioned install-tree snapshots for incremental .tar.zst bases.
+# Layout: build/cache/client-package-base/<CLIENT_VERSION>/ (full tree per version).
+# After each package-client the current version's snapshot is replaced; at most 2
+# version directories are kept (oldest by mtime pruned).
+CLIENT_PACKAGE_BASE_ROOT := $(BUILD_DIR)/cache/client-package-base
+CLIENT_PACKAGE_BASE_DIR := $(CLIENT_PACKAGE_BASE_ROOT)/$(CLIENT_VERSION)
 # Set PACKAGE_FULL=1 to force the primary .tar.zst to be full (no incremental).
 PACKAGE_FULL ?= 0
 # Set CLIENT_FULL=1 (or use make client-full / package-client-full) to also emit a
@@ -239,7 +266,10 @@ package-client:
 	# Green install zip: always full install tree (first-time deploy; NOT accepted by updates/publish).
 	python3 $(ROOT)/scripts/package_client_zip.py --input-dir $(BUILD_DIR)/client/lovemilk-class-broadcaster --output $(BIN_DIR)/lovemilk-class-broadcaster-$(CLIENT_VERSION)-windows-amd64.zip
 	# Update packages are only .tar.zst (server publish rejects .zip).
-	# Prefer incremental against build/cache/client-package-base or the previous green zip.
+	# Prefer incremental against a *previous-version* green zip (what field installs
+	# actually have). Else use the newest *other* versioned snapshot under
+	# client-package-base/ (never the current version — a same-tree cache
+	# refreshed mid-dev would drop TTS/code from the published .tar.zst).
 	# Full client install tree includes the updater PE → components ["updater","client"].
 	# CLIENT_FULL=1 → also write *-windows-amd64-full.tar.zst (always --force-full).
 	@set -euo pipefail; \
@@ -250,29 +280,46 @@ package-client:
 	if [ '$(PACKAGE_FULL)' = '1' ]; then \
 		echo 'PACKAGE_FULL=1 → primary .tar.zst is full'; \
 		BASE_ARGS+=(--force-full); \
-	elif [ -d '$(CLIENT_PACKAGE_BASE_DIR)' ] && [ -n "$$(find '$(CLIENT_PACKAGE_BASE_DIR)' -type f 2>/dev/null | head -n 1)" ]; then \
-		echo "incremental base: $(CLIENT_PACKAGE_BASE_DIR)"; \
-		BASE_ARGS+=(--base-dir '$(CLIENT_PACKAGE_BASE_DIR)'); \
 	else \
-		PREV_ZIP=$$(ls -1t '$(BIN_DIR)'/lovemilk-class-broadcaster-*-windows-amd64.zip 2>/dev/null | grep -v '$(CLIENT_VERSION)' | head -n 1 || true); \
+		PREV_ZIP=$$(ls -1t '$(BIN_DIR)'/lovemilk-class-broadcaster-*-windows-amd64.zip 2>/dev/null | grep -vF -- '-$(CLIENT_VERSION)-windows-amd64.zip' | head -n 1 || true); \
 		if [ -n "$$PREV_ZIP" ]; then \
 			echo "incremental base zip: $$PREV_ZIP"; \
 			BASE_ARGS+=(--base-zip "$$PREV_ZIP"); \
 		else \
-			echo 'no previous base → primary .tar.zst is full'; \
+			# Only version dirs (e.g. 0.1.2); ignore leftover flat-layout junk. \
+			PREV_BASE=$$(ls -1td '$(CLIENT_PACKAGE_BASE_ROOT)'/[0-9]*/ 2>/dev/null | grep -vF -- '/$(CLIENT_VERSION)/' | head -n 1 || true); \
+			PREV_BASE=$${PREV_BASE%/}; \
+			if [ -n "$$PREV_BASE" ] && [ -n "$$(find "$$PREV_BASE" -type f 2>/dev/null | head -n 1)" ]; then \
+				echo "incremental base cache (no older zip): $$PREV_BASE"; \
+				BASE_ARGS+=(--base-dir "$$PREV_BASE"); \
+			else \
+				echo 'no previous base → primary .tar.zst is full'; \
+			fi; \
 		fi; \
 	fi; \
-	python3 '$(ROOT)/scripts/package_update.py' --components updater client --version '$(CLIENT_VERSION)' --platform windows-amd64 --input-dir "$$INPUT" --output "$$OUT" --client-version '$(CLIENT_VERSION)' --updater-version '$(CLIENT_VERSION)' --zstd '$(ZSTD)' "$${BASE_ARGS[@]}"; \
+	$(PACKAGE_UPDATE) '$(ROOT)/scripts/package_update.py' --components updater client --version '$(CLIENT_VERSION)' --platform windows-amd64 --input-dir "$$INPUT" --output "$$OUT" --client-version '$(CLIENT_VERSION)' --updater-version '$(CLIENT_VERSION)' --zstd '$(ZSTD)' "$${BASE_ARGS[@]}"; \
 	if [ '$(CLIENT_FULL)' = '1' ]; then \
 		echo "CLIENT_FULL=1 → also writing $$FULL_OUT"; \
-		python3 '$(ROOT)/scripts/package_update.py' --components updater client --version '$(CLIENT_VERSION)' --platform windows-amd64 --input-dir "$$INPUT" --output "$$FULL_OUT" --client-version '$(CLIENT_VERSION)' --updater-version '$(CLIENT_VERSION)' --zstd '$(ZSTD)' --force-full; \
+		$(PACKAGE_UPDATE) '$(ROOT)/scripts/package_update.py' --components updater client --version '$(CLIENT_VERSION)' --platform windows-amd64 --input-dir "$$INPUT" --output "$$FULL_OUT" --client-version '$(CLIENT_VERSION)' --updater-version '$(CLIENT_VERSION)' --zstd '$(ZSTD)' --force-full; \
 	fi
-	python3 $(ROOT)/scripts/package_update.py --component updater --version $(CLIENT_VERSION) --platform windows-amd64 --input-dir $(BUILD_DIR)/updater --output $(BIN_DIR)/lovemilk-class-broadcaster-updater-$(CLIENT_VERSION)-windows-amd64.tar.zst --client-version $(CLIENT_VERSION) --updater-version $(CLIENT_VERSION) --zstd '$(ZSTD)'
-	# Refresh incremental base cache from the just-built install tree for the next package-client.
+	$(PACKAGE_UPDATE) $(ROOT)/scripts/package_update.py --component updater --version $(CLIENT_VERSION) --platform windows-amd64 --input-dir $(BUILD_DIR)/updater --output $(BIN_DIR)/lovemilk-class-broadcaster-updater-$(CLIENT_VERSION)-windows-amd64.tar.zst --client-version $(CLIENT_VERSION) --updater-version $(CLIENT_VERSION) --zstd '$(ZSTD)'
+	# Snapshot this version's install tree; keep only the 2 newest version dirs.
+	# Also strip leftover flat-layout entries (pre-versioned cache) at the root.
+	@mkdir -p '$(CLIENT_PACKAGE_BASE_ROOT)'
+	@find '$(CLIENT_PACKAGE_BASE_ROOT)' -mindepth 1 -maxdepth 1 ! -name '[0-9]*' -exec rm -rf {} +
 	@rm -rf '$(CLIENT_PACKAGE_BASE_DIR)'
 	@mkdir -p '$(CLIENT_PACKAGE_BASE_DIR)'
 	@cp -a '$(BUILD_DIR)/client/lovemilk-class-broadcaster/.' '$(CLIENT_PACKAGE_BASE_DIR)/'
 	@echo "updated incremental base cache → $(CLIENT_PACKAGE_BASE_DIR)"
+	@set -euo pipefail; \
+	KEEP=2; \
+	mapfile -t DIRS < <(ls -1td '$(CLIENT_PACKAGE_BASE_ROOT)'/[0-9]*/ 2>/dev/null || true); \
+	if [ "$${#DIRS[@]}" -gt "$$KEEP" ]; then \
+		for d in "$${DIRS[@]:$$KEEP}"; do \
+			echo "pruning old incremental base cache → $$d"; \
+			rm -rf "$$d"; \
+		done; \
+	fi
 
 # -----------------------------------------------------------------------------
 # Install / clean
@@ -287,7 +334,7 @@ uninstall-server-user-service:
 	systemctl --user daemon-reload
 
 clean:
-	# Keep client/tts (Piper ONNX voice cache) — re-downloading ~120 MiB is slow.
+	# Keep client/tts (Piper ONNX) and client/nltk_data — re-downloading is slow.
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
 	rm -f $(ROOT)/cmd/client-launcher/rsrc_windows_*.syso $(ROOT)/updater/rsrc_windows_*.syso
 	rm -rf $(ROOT)/cmd/client-launcher/winres $(ROOT)/updater/winres

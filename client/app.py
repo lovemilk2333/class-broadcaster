@@ -38,6 +38,7 @@ from .qtcompat import (  # noqa: E402
     AlignVCenter,
     FramelessWindowHint,
     Key_Escape,
+    PlainText,
     QAbstractItemView,
     QAction,
     QApplication,
@@ -45,6 +46,7 @@ from .qtcompat import (  # noqa: E402
     QCloseEvent,
     QColor,
     QComboBox,
+    QDesktopServices,
     QDialog,
     QFont,
     QFormLayout,
@@ -70,9 +72,11 @@ from .qtcompat import (  # noqa: E402
     Qt,
     QThread,
     QTimer,
+    QUrl,
     QueuedConnection,
     QVBoxLayout,
     QWidget,
+    RichText,
     ScrollBarAlwaysOff,
     Signal,
     TextSelectableByMouse,
@@ -125,6 +129,13 @@ from .core.delivery import (
 from .core.fontsize import DEFAULT_EXPR as FONT_DEFAULT_EXPR
 from .core.fontsize import DEFAULT_FALLBACK_PX as FONT_DEFAULT_PX
 from .core.fontsize import resolve_px as resolve_font_size_px
+from .core.richtext import (
+    html_to_plain_text,
+    looks_like_html,
+    needs_static_rich_display,
+    rewrite_data_images_for_qt,
+    sanitize_html,
+)
 from .core.discovery import DiscoveryResponse, discover, parse_scan_destinations
 from .core.identity import (
     decrypt_private_key,
@@ -140,10 +151,16 @@ from .core.tts import (
     EnginePreference,
     SAPIEngine,
     SpeechPart,
+    VC_REDIST_X64_URL,
     compile_speech,
+    diagnose_windows_tts_runtime,
     estimate_duration_ms,
+    is_vc_redist_prompt_dismissed,
+    mark_vc_redist_prompt_dismissed,
     normalize_speech_rate,
+    play_cached_speech_plan,
     speak_with_fallback,
+    synthesize_parts_to_plan,
 )
 from .core.updater import (
     UpdateError,
@@ -158,36 +175,18 @@ from .core.updater import (
     verify_package_files,
 )
 from .core.updater_log_upload import queue_pending_updater_logs
-from .core.applied_updates import is_update_applied, load_applied_digests, mark_update_applied
+from .core.applied_updates import (
+    is_update_applied,
+    load_applied_digests,
+    mark_update_applied,
+    mark_update_reported,
+    pending_update_reports,
+)
 
 
 LOGGER = logger.bind(name="mkcb.client")
 CLIENT_LOG_UPLOAD = 0x0206
 _CLIENT_LOG_QUEUE: queue.Queue = queue.Queue(maxsize=1000)
-
-
-def _parse_version_parts(value: str) -> list[object]:
-    parts: list[object] = []
-    for part in str(value or "").strip().split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            parts.append(part)
-    return parts
-
-
-def _client_version_behind(reported: str, target: str) -> bool:
-    """True when reported is strictly older than target (numeric dotted versions)."""
-    reported = str(reported or "").strip()
-    target = str(target or "").strip()
-    if not reported or not target or reported == target:
-        return False
-    left = _parse_version_parts(reported)
-    right = _parse_version_parts(target)
-    width = max(len(left), len(right))
-    left.extend([0] * (width - len(left)))
-    right.extend([0] * (width - len(right)))
-    return left < right
 
 
 def _enqueue_client_log_entry(entry: str) -> None:
@@ -997,7 +996,7 @@ class UpdateApplyWorker(QThread):
         download_url = str(self.update.get("download_url") or self.update.get("release_url") or "")
         force = bool(self.update.get("force"))
         LOGGER.info(
-            "update apply worker start components={} primary={} version={} seq={} sha256={} force={} has_package={} has_token={}",
+            "update apply worker start components={} primary={} version={} seq={} digest={} force={} has_package={} has_token={}",
             components,
             component,
             version,
@@ -1009,7 +1008,7 @@ class UpdateApplyWorker(QThread):
         )
         try:
             if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-                raise ValueError(f"invalid sha256={self.update.get('sha256')!r}")
+                raise ValueError(f"invalid digest={self.update.get('sha256')!r}")
             update_dir = self.data_dir / "updates"
             update_dir.mkdir(parents=True, exist_ok=True)
             package_path = ClientWindow._update_package_path(update_dir, digest)
@@ -1017,7 +1016,11 @@ class UpdateApplyWorker(QThread):
             skip_keys = {"package", "download_token", "source_fingerprint"}
             metadata = {key: value for key, value in self.update.items() if key not in skip_keys}
             metadata["components"] = components
+            # Wire UPDATE_AVAILABLE still names the 64-hex identity ``sha256``
+            # (value is BLAKE3 for new packages). Mirror into blake3 so verify
+            # prefers the BLAKE3 algorithm against the package's files-v1.
             metadata["sha256"] = digest
+            metadata["blake3"] = digest
             if isinstance(package, (bytes, bytearray)) and package:
                 package_path.write_bytes(bytes(package))
                 source = "inline"
@@ -1051,7 +1054,7 @@ class UpdateApplyWorker(QThread):
                 self.quit_for_update.emit()
         except Exception as exc:
             LOGGER.exception(
-                "update apply worker failed sha256={} version={} seq={} error={}",
+                "update apply worker failed digest={} version={} seq={} error={}",
                 digest,
                 version,
                 seq,
@@ -1079,7 +1082,7 @@ class UpdateApplyWorker(QThread):
         if expires_at and expires_at <= int(time.time()):
             raise ValueError("update download token expired")
         LOGGER.info(
-            "update TLS download starting host={} port={} sha256={} dest={}",
+            "update TLS download starting host={} port={} digest={} dest={}",
             host,
             port,
             expected_sha256,
@@ -1110,7 +1113,7 @@ class UpdateApplyWorker(QThread):
                 idle_fail_seconds=120.0,
             )
             LOGGER.info(
-                "update TLS download finished host={} port={} sha256={} dest={}",
+                "update TLS download finished host={} port={} digest={} dest={}",
                 host,
                 port,
                 expected_sha256,
@@ -1164,7 +1167,7 @@ class UpdateApplyWorker(QThread):
         version = str(metadata.get("version") or "")
         digest = str(metadata.get("sha256") or "").lower()
         LOGGER.info(
-            "update verify start path={} components={} version={} sha256={}",
+            "update verify start path={} components={} version={} digest={}",
             package_path,
             components,
             version,
@@ -1172,7 +1175,7 @@ class UpdateApplyWorker(QThread):
         )
         verify_metadata(metadata, b"")
         verify_package_files(package_path, metadata)
-        LOGGER.info("update package verified path={} sha256={}", package_path, digest)
+        LOGGER.info("update package verified path={} digest={}", package_path, digest)
         install_dir = resolve_install_dir()
         if not (os.environ.get("MKCB_INSTALL_DIR") or "").strip():
             LOGGER.warning(
@@ -1251,6 +1254,10 @@ class ConnectionWorker(QThread):
         # (reason, detail) intentional goodbye; flushed on the connection thread only.
         self.session_end_queue: queue.Queue = queue.Queue()
         self._session_end_sent = threading.Event()
+        # (digest, version, seq) UpdateApplied reports; flushed after reconnect.
+        self.update_applied_queue: queue.Queue = queue.Queue()
+        # (state, message_id, detail, elapsed_ms) ClientActivity reports.
+        self.activity_queue: queue.Queue = queue.Queue()
         self.dedup = MessageDeduplicator()
         self.completed_acks: dict[str, tuple[str, Optional[str]]] = {}
         self._active_connection: Optional[Connection] = None
@@ -1270,6 +1277,27 @@ class ConnectionWorker(QThread):
     def acknowledge(self, message_id: str, status: str, error: Optional[str] = None) -> None:
         self.acks.put((message_id, status, error))
 
+    def report_activity(
+        self,
+        state: str,
+        *,
+        message_id: str = "",
+        detail: str = "",
+        elapsed_ms: int = 0,
+    ) -> None:
+        """Queue ClientActivity for the connection thread (processing / idle)."""
+        try:
+            self.activity_queue.put_nowait(
+                (
+                    str(state or "idle"),
+                    str(message_id or ""),
+                    str(detail or ""),
+                    int(elapsed_ms or 0),
+                )
+            )
+        except queue.Full:
+            pass
+
     def accept_server_fingerprint(self, fingerprint: Optional[bytes]) -> None:
         """交由 UI 确认运行时发现的服务端指纹变化。"""
         self.trust_decisions.put(bytes(fingerprint) if fingerprint is not None else None)
@@ -1283,6 +1311,24 @@ class ConnectionWorker(QThread):
             pass
         # Nudge the read loop off a blocking receive so flush can run promptly.
         self._manual_reconnect.set()
+
+    def queue_update_applied_report(
+        self, digest: str, version: str = "", seq: int = 0
+    ) -> None:
+        """Queue an UpdateApplied report for the connection thread to flush."""
+        digest = str(digest or "").strip().lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            return
+        try:
+            seq_value = int(seq or 0)
+        except (TypeError, ValueError):
+            seq_value = 0
+        try:
+            self.update_applied_queue.put_nowait(
+                (digest, str(version or ""), max(0, seq_value))
+            )
+        except queue.Full:
+            pass
 
     def stop(self) -> None:
         self.keep_running = False
@@ -1460,13 +1506,30 @@ class ConnectionWorker(QThread):
                         LOGGER.info("queued {} updater log line(s) for server upload", queued)
                 except Exception as exc:
                     LOGGER.debug("updater log upload queue skipped error={}", exc)
+                # After restart, report locally-applied digests the server has not acked yet.
+                try:
+                    for digest in pending_update_reports(self.data_dir):
+                        self.queue_update_applied_report(digest)
+                    if not self.update_applied_queue.empty():
+                        LOGGER.info(
+                            "queued pending UpdateApplied report(s) for server host={}:{}",
+                            self.endpoint.get("host"),
+                            self.endpoint.get("tcp_port"),
+                        )
+                except Exception as exc:
+                    LOGGER.debug("update applied report queue skipped error={}", exc)
                 last_ping = time.monotonic()
                 last_pong = last_ping
                 while self.keep_running:
                     self._flush_acks(connection)
                     self._flush_client_logs(connection)
+                    self._flush_update_applied(connection)
+                    self._flush_activity(connection)
                     if self._flush_session_end(connection):
-                        # Intentional goodbye sent; leave the session cleanly.
+                        # Intentional goodbye sent. Stop the outer reconnect loop too —
+                        # otherwise we briefly re-handshake (ClearSessionEnd) and the
+                        # subsequent quit looks like 意外终止 instead of 更新重启中.
+                        self.keep_running = False
                         break
                     now = time.monotonic()
                     if now - last_ping >= snapshot.heartbeat_interval:
@@ -1713,6 +1776,66 @@ class ConnectionWorker(QThread):
             self._session_end_sent.set()
         return sent
 
+    def _flush_update_applied(self, connection: Connection) -> None:
+        """Send queued UpdateApplied packets; mark digests reported on success."""
+        while True:
+            try:
+                digest, version, seq = self.update_applied_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                connection.report_update_applied(str(digest), str(version or ""), int(seq or 0))
+                mark_update_reported(self.data_dir, str(digest))
+                LOGGER.info(
+                    "update applied reported host={}:{} digest={} version={} seq={}",
+                    self.endpoint.get("host"),
+                    self.endpoint.get("tcp_port"),
+                    digest,
+                    version or "",
+                    seq,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "update applied report failed host={}:{} digest={} error={}",
+                    self.endpoint.get("host"),
+                    self.endpoint.get("tcp_port"),
+                    digest,
+                    exc,
+                )
+                try:
+                    self.update_applied_queue.put_nowait((digest, version, seq))
+                except queue.Full:
+                    pass
+                return
+
+    def _flush_activity(self, connection: Connection) -> None:
+        """Send queued ClientActivity packets (processing / idle)."""
+        while True:
+            try:
+                state, message_id, detail, elapsed_ms = self.activity_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                connection.report_activity(
+                    str(state),
+                    message_id=str(message_id or ""),
+                    detail=str(detail or ""),
+                    elapsed_ms=int(elapsed_ms or 0),
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "client activity report failed host={}:{} state={} error={}",
+                    self.endpoint.get("host"),
+                    self.endpoint.get("tcp_port"),
+                    state,
+                    exc,
+                )
+                try:
+                    self.activity_queue.put_nowait((state, message_id, detail, elapsed_ms))
+                except queue.Full:
+                    pass
+                return
+
     def _flush_client_logs(self, connection: Connection) -> None:
         for _ in range(20):
             try:
@@ -1736,6 +1859,90 @@ class ConnectionWorker(QThread):
             self.msleep(100)
 
 
+class TtsCacheEntry:
+    """In-memory prefetch state for one message (WAV plan, not persisted)."""
+
+    __slots__ = (
+        "message_id",
+        "parts",
+        "speech_rate",
+        "plan",
+        "error",
+        "ready",
+        "cancel",
+        "bytes_total",
+    )
+
+    def __init__(
+        self,
+        message_id: str,
+        parts: list[Any],
+        speech_rate: float,
+    ) -> None:
+        self.message_id = message_id
+        self.parts = list(parts)
+        self.speech_rate = float(speech_rate)
+        self.plan: Optional[list[tuple[str, Any]]] = None
+        self.error: Optional[str] = None
+        self.ready = threading.Event()
+        self.cancel = threading.Event()
+        self.bytes_total = 0
+
+
+class TtsPrefetchWorker(QThread):
+    """Background Piper synthesize-only worker; fills a TtsCacheEntry."""
+
+    finished_prefetch = Signal(str, bool, str)  # message_id, ok, error
+
+    def __init__(self, entry: TtsCacheEntry, data_dir: Path, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.entry = entry
+        self.data_dir = Path(data_dir)
+
+    def stop(self) -> None:
+        self.entry.cancel.set()
+
+    def run(self) -> None:
+        try:
+            plan = synthesize_parts_to_plan(
+                self.entry.parts,
+                data_dir=self.data_dir,
+                speech_rate=self.entry.speech_rate,
+                stop=self.entry.cancel,
+            )
+            if self.entry.cancel.is_set():
+                self.entry.error = "cancelled"
+                self.entry.ready.set()
+                self.finished_prefetch.emit(self.entry.message_id, False, "cancelled")
+                return
+            self.entry.plan = plan
+            self.entry.bytes_total = sum(
+                len(payload) for kind, payload in plan if kind == "wav" and isinstance(payload, (bytes, bytearray))
+            )
+            self.entry.ready.set()
+            LOGGER.info(
+                "TTS prefetch ready message_id={} segments={} bytes={}",
+                self.entry.message_id,
+                sum(1 for kind, _ in plan if kind == "wav"),
+                self.entry.bytes_total,
+            )
+            self.finished_prefetch.emit(self.entry.message_id, True, "")
+        except Exception as exc:
+            if self.entry.cancel.is_set():
+                self.entry.error = "cancelled"
+            else:
+                self.entry.error = str(exc) or exc.__class__.__name__
+                LOGGER.warning(
+                    "TTS prefetch failed message_id={} error={}",
+                    self.entry.message_id,
+                    self.entry.error,
+                )
+            self.entry.ready.set()
+            self.finished_prefetch.emit(
+                self.entry.message_id, False, self.entry.error or "prefetch_failed"
+            )
+
+
 class SpeechWorker(QThread):
     finished_playback = Signal(str, bool, str)
     text_part = Signal(str, str)
@@ -1746,30 +1953,44 @@ class SpeechWorker(QThread):
         parts: list[Any],
         data_dir: Path,
         speech_rate: float = 0.75,
+        *,
+        cache_entry: Optional[TtsCacheEntry] = None,
     ) -> None:
         super().__init__()
         self.message_id = message_id
         self.parts = parts
         self.data_dir = data_dir
         self.speech_rate = float(speech_rate) if speech_rate else 0.75
+        self.cache_entry = cache_entry
         self.stop_event = threading.Event()
         self.cancelled = False
 
     def stop(self) -> None:
         self.cancelled = True
         self.stop_event.set()
+        entry = self.cache_entry
+        if entry is not None:
+            entry.cancel.set()
 
     def run(self) -> None:
-        from .core.tts import PiperLibraryEngine, resolve_tts_model_dirs
+        from .core.tts import (
+            PiperLibraryEngine,
+            ensure_windows_native_dll_dirs,
+            resolve_tts_model_dirs,
+        )
 
-        model_dirs = resolve_tts_model_dirs(self.data_dir)
-        # Prefer the Python Piper package (piper-plus on Windows / piper-tts on Linux).
-        # No CLI fallback — SAPI remains the only Windows backup when models/lib fail.
-        engines = [
-            PiperLibraryEngine(model_dirs),
-            SAPIEngine(),
-        ]
+        # Register onnxruntime DLL dirs before any piper import (avoids 0xC0000005).
+        ensure_windows_native_dll_dirs(include_qt=False)
         try:
+            if self._play_from_cache_if_ready():
+                return
+            model_dirs = resolve_tts_model_dirs(self.data_dir)
+            # Prefer classic piper-tts (zh_CN-huayan + en_US-lessac) on both platforms.
+            # No CLI fallback — SAPI remains the only Windows backup when models/lib fail.
+            engines = [
+                PiperLibraryEngine(model_dirs),
+                SAPIEngine(),
+            ]
             engine_name = speak_with_fallback(
                 self.parts,
                 engines,
@@ -1789,12 +2010,89 @@ class SpeechWorker(QThread):
                 LOGGER.error("TTS unavailable message_id={} error={}", self.message_id, exc)
             self.finished_playback.emit(self.message_id, False, str(exc))
 
+    def _play_from_cache_if_ready(self) -> bool:
+        """Wait for prefetch (if any) and play cached WAVs. False → live synth fallback."""
+        entry = self.cache_entry
+        if entry is None:
+            return False
+        # Wait until prefetch finishes (or we are cancelled). Popup is deferred
+        # until ready when possible; this wait covers late/live-fallback paths.
+        while not entry.ready.is_set():
+            if self.stop_event.is_set() or entry.cancel.is_set():
+                self.finished_playback.emit(self.message_id, False, "cancelled")
+                return True
+            entry.ready.wait(0.05)
+        if self.stop_event.is_set() or entry.cancel.is_set():
+            self.finished_playback.emit(self.message_id, False, "cancelled")
+            return True
+        if entry.error or not entry.plan:
+            LOGGER.info(
+                "TTS cache miss message_id={} error={}; falling back to live synth",
+                self.message_id,
+                entry.error or "empty_plan",
+            )
+            return False
+        try:
+            play_cached_speech_plan(
+                entry.plan,
+                self.stop_event,
+                on_text=lambda text: self.text_part.emit(self.message_id, text) if text else None,
+            )
+            LOGGER.info(
+                "TTS playback completed message_id={} engine=piper-cache segments={}",
+                self.message_id,
+                sum(1 for kind, _ in entry.plan if kind == "wav"),
+            )
+            self.finished_playback.emit(
+                self.message_id, not self.cancelled, "cancelled" if self.cancelled else ""
+            )
+            return True
+        except Exception as exc:
+            if self.cancelled or self.stop_event.is_set():
+                self.finished_playback.emit(self.message_id, False, "cancelled")
+                return True
+            LOGGER.warning(
+                "TTS cache play failed message_id={} error={}; falling back",
+                self.message_id,
+                exc,
+            )
+            return False
+
+
+class RuntimeProbeWorker(QThread):
+    """Background Windows TTS/runtime probe (piper-tts + CRT diagnostics)."""
+
+    finished_probe = Signal(object)  # dict from diagnose_windows_tts_runtime
+
+    def __init__(self, data_dir: Path, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.data_dir = Path(data_dir)
+
+    def run(self) -> None:
+        try:
+            report = diagnose_windows_tts_runtime(self.data_dir)
+        except Exception as exc:
+            LOGGER.warning("runtime probe failed error={}", exc)
+            report = {
+                "applicable": platform.system() == "Windows",
+                "piper_ok": False,
+                "needs_vc_redist": False,
+                "summary": f"运行环境检测失败：{exc}",
+                "crt_files": {},
+                "prompt_dismissed": False,
+            }
+        self.finished_probe.emit(report)
+
 
 class MarqueeLabel(QLabel):
-    """超长单行消息按 Token 停留策略向左滚动；含换行时仍居中静态显示。
+    """超长单行消息按 Token 停留策略向左滚动；含换行 / 图片时静态富文本显示。
 
     节奏（prefer 单 Token）：开头 padding 停顿 → 每个 Token：滚入边缘 → 停顿 → 滚出窗口
     → 结尾停顿；窗口仍可见则循环。时长为 0（手动关闭）时用舒适默认速度，仍保留首尾停顿。
+
+    含 ``br`` / ``img`` / ``svg`` 或行内强调（``b`` / ``i`` / ``u`` / font-weight|style）
+    时经 ``sanitize_html`` 后以 QLabel 富文本静态展示，保证中文粗斜体可见。
+    仅颜色等非强调 ``span`` 仍可走单行 marquee。撤回提示可 ``force_rich``。
     """
 
     _TICK_MS = 40
@@ -1807,6 +2105,9 @@ class MarqueeLabel(QLabel):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._source_text = ""
+        self._rich_mode = False
+        self._rich_image_resources: list[tuple[str, QPixmap]] = []
+        self._rich_image_temp_files: list[str] = []
         self._tokens: list[str] = []
         self._token_widths: list[int] = []
         self._token_offsets: list[float] = []  # left edge of each token in the full string
@@ -1830,17 +2131,141 @@ class MarqueeLabel(QLabel):
         self._timer.timeout.connect(self._advance)
         self.setMinimumWidth(1)
 
-    def setText(self, text: str) -> None:  # type: ignore[override]
-        self._source_text = str(text)
+    def _clear_rich_image_resources(self) -> None:
+        self._rich_image_resources = []
+        for path in list(getattr(self, "_rich_image_temp_files", []) or []):
+            try:
+                Path(path).unlink(missing_ok=True)  # type: ignore[call-arg]
+            except TypeError:
+                # Python 3.7 compat: missing_ok added in 3.8
+                try:
+                    p = Path(path)
+                    if p.is_file():
+                        p.unlink()
+                except OSError:
+                    pass
+            except OSError:
+                pass
+        self._rich_image_temp_files = []
+        setter = getattr(self, "setResourceProvider", None)
+        if callable(setter):
+            try:
+                setter(None)
+            except Exception:
+                pass
+
+    def _materialize_rich_images(
+        self, sanitized_html: str
+    ) -> str:
+        """Rewrite data-URI images so QLabel can paint them on Qt5 and Qt6.
+
+        Prefer ``setResourceProvider`` (Qt ≥ 6.1). Otherwise write short-lived
+        temp files and point ``img src`` at absolute paths (Qt rich-text subset
+        loads local files reliably; long ``data:`` URLs often render blank).
+        """
+        display_html, image_resources = rewrite_data_images_for_qt(sanitized_html)
+        self._clear_rich_image_resources()
+        if not image_resources:
+            return sanitized_html
+
+        loaded: list[tuple[str, QPixmap]] = []
+        for name, raw in image_resources:
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(raw):
+                LOGGER.warning("rich-text image decode failed resource={}", name)
+                continue
+            loaded.append((name, pixmap))
+        self._rich_image_resources = loaded
+        if not loaded:
+            return sanitized_html
+
+        mapping = {name: pixmap for name, pixmap in loaded}
+        setter = getattr(self, "setResourceProvider", None)
+        if callable(setter):
+            def _provider(url: Any, type_: Any = None) -> Any:
+                key = url.toString() if hasattr(url, "toString") else str(url)
+                return mapping.get(key)
+
+            try:
+                setter(_provider)
+                return display_html
+            except Exception:
+                LOGGER.debug("setResourceProvider failed; falling back to temp files", exc_info=True)
+
+        # Qt5 / no provider: replace mkcb:// with temp file paths.
+        rewritten = display_html
+        temp_files: list[str] = []
+        # Pair original bytes with successfully decoded names only.
+        raw_by_name = {name: raw for name, raw in image_resources}
+        for name, pixmap in loaded:
+            raw = raw_by_name.get(name, b"")
+            try:
+                fd, path = tempfile.mkstemp(prefix="mkcb-img-", suffix=".png")
+                os.close(fd)
+                path_obj = Path(path)
+                written = False
+                if raw:
+                    try:
+                        path_obj.write_bytes(raw)
+                        written = True
+                    except OSError:
+                        written = False
+                if not written and not pixmap.save(str(path_obj), "PNG"):
+                    try:
+                        path_obj.unlink()
+                    except OSError:
+                        pass
+                    continue
+                temp_files.append(str(path_obj))
+                file_url = QUrl.fromLocalFile(str(path_obj)).toString()
+                rewritten = rewritten.replace(name, file_url)
+            except Exception:
+                LOGGER.warning("rich-text temp image write failed resource={}", name, exc_info=True)
+        self._rich_image_temp_files = temp_files
+        return rewritten
+
+    def setText(self, text: str, *, force_rich: bool = False) -> None:  # type: ignore[override]
+        raw = str(text)
+        # Detect markup before sanitize so plain "a < b" stays marquee-friendly;
+        # br/img/svg → static rich text; pure inline b/i/u/span → marquee (plain)
+        # unless force_rich (e.g. withdrawal notice that must keep bold/italic).
+        looks_html = looks_like_html(raw)
+        sanitized = sanitize_html(raw) if looks_html else raw
+        self._rich_mode = bool(
+            looks_html and (force_rich or needs_static_rich_display(sanitized))
+        )
+        if self._rich_mode:
+            self._source_text = sanitized if looks_html else raw
+        elif looks_html:
+            # Inline-only HTML: marquee paints glyphs, not Qt rich text — strip tags.
+            self._source_text = html_to_plain_text(sanitized)
+        else:
+            self._source_text = raw
         self._offset = 0.0
         self._phase = "idle"
         self._phase_elapsed_ms = 0
         self._token_index = 0
-        # Keep an empty QLabel text so sizeHint is driven by our constraints,
-        # not the full unwrapped string (which would expand past the screen).
-        QLabel.setText(self, "" if "\n" not in self._source_text else self._source_text)
-        self._rebuild_tokens()
-        self._update_marquee()
+        if self._rich_mode:
+            self.setWordWrap(True)
+            if RichText is not None:
+                self.setTextFormat(RichText)
+            display_html = self._materialize_rich_images(self._source_text)
+            QLabel.setText(self, display_html)
+            self._timer.stop()
+            self._tokens = []
+            self._token_widths = []
+            self._token_offsets = []
+            self._text_width = 0
+        else:
+            self._clear_rich_image_resources()
+            self.setWordWrap(False)
+            if PlainText is not None:
+                self.setTextFormat(PlainText)
+            # Keep an empty QLabel text so sizeHint is driven by our constraints,
+            # not the full unwrapped string (which would expand past the screen).
+            QLabel.setText(self, "" if "\n" not in self._source_text else self._source_text)
+            self._rebuild_tokens()
+            self._update_marquee()
         self.updateGeometry()
         self.update()
 
@@ -1862,7 +2287,7 @@ class MarqueeLabel(QLabel):
 
     def sizeHint(self) -> Any:
         hint = super().sizeHint()
-        if "\n" in self._source_text:
+        if self._rich_mode or "\n" in self._source_text:
             return hint
         metrics = self.fontMetrics()
         height = max(hint.height(), metrics.height() + 8)
@@ -1876,7 +2301,7 @@ class MarqueeLabel(QLabel):
         return max(1, self.width() - 2 * self._side_margin_px)
 
     def _needs_marquee(self) -> bool:
-        if not self._source_text or "\n" in self._source_text:
+        if self._rich_mode or not self._source_text or "\n" in self._source_text:
             return False
         return self._text_width > self._content_width()
 
@@ -1886,6 +2311,12 @@ class MarqueeLabel(QLabel):
     def _rebuild_tokens(self) -> None:
         from .core.tokenize import tokenize
 
+        if self._rich_mode:
+            self._tokens = []
+            self._token_widths = []
+            self._token_offsets = []
+            self._text_width = 0
+            return
         metrics = self.fontMetrics()
         raw = tokenize(self._source_text) if self._source_text and "\n" not in self._source_text else []
         # Keep visual order: rebuild offsets by walking the original string when possible.
@@ -1897,7 +2328,30 @@ class MarqueeLabel(QLabel):
         for width in self._token_widths:
             self._token_offsets.append(cursor)
             cursor += float(width)
-        self._text_width = max(1, int(round(cursor))) if self._tokens else text_width(metrics, self._source_text)
+        # Authoritative width is the full string: summing jieba tokens can undershoot
+        # (kerning / CJK metrics), which made short lines like 「请…室」clip the ends.
+        full_width = text_width(metrics, self._source_text) if self._source_text else 0
+        token_sum = int(round(cursor)) if self._tokens else 0
+        # leftBearing/rightBearing can be negative; reserve a few px so glyphs are not clipped.
+        bearing = 0
+        try:
+            if self._source_text:
+                first = self._source_text[0]
+                last = self._source_text[-1]
+                left = int(getattr(metrics, "leftBearing", lambda _c: 0)(first) or 0)
+                right = int(getattr(metrics, "rightBearing", lambda _c: 0)(last) or 0)
+                bearing = max(0, -left) + max(0, -right)
+        except Exception:
+            bearing = 0
+        self._text_width = max(1, full_width, token_sum) + bearing + 2
+        # If token-sum pacing is shorter than the full string, scale offsets so the
+        # last glyph still lines up with the measured full width (minus bearing pad).
+        paced = max(1, token_sum)
+        target = max(1, self._text_width - bearing - 2)
+        if self._token_offsets and paced != target:
+            scale = float(target) / float(paced)
+            self._token_offsets = [offset * scale for offset in self._token_offsets]
+            self._token_widths = [max(1, int(round(width * scale))) for width in self._token_widths]
 
     def _recompute_scroll_profile(self) -> None:
         """Allocate start/end holds and per-token enter/dwell/exit within the display window."""
@@ -2026,12 +2480,19 @@ class MarqueeLabel(QLabel):
         self.update()
 
     def paintEvent(self, event: Any) -> None:
+        if self._rich_mode:
+            # QLabel paints whitelist HTML (b/i/u/span/br/img); skip custom marquee paint.
+            super().paintEvent(event)
+            return
         if "\n" in self._source_text or not self._needs_marquee():
             if "\n" not in self._source_text and self._source_text:
                 painter = QPainter(self)
                 painter.setPen(self.palette().color(self.foregroundRole()))
                 painter.setFont(self.font())
+                # Do not clip to side margins here — margins are already empty space;
+                # clipping the draw rect was cutting CJK glyphs at both ends.
                 rect = self.rect().adjusted(self._side_margin_px, 0, -self._side_margin_px, 0)
+                painter.setClipRect(self.rect())
                 painter.drawText(rect, int(AlignCenter | AlignVCenter), self._source_text)
                 painter.end()
                 return
@@ -2040,7 +2501,9 @@ class MarqueeLabel(QLabel):
         painter = QPainter(self)
         painter.setPen(self.palette().color(self.foregroundRole()))
         painter.setFont(self.font())
-        painter.setClipRect(self.rect().adjusted(self._side_margin_px, 0, -self._side_margin_px, 0))
+        # Clip to the full label; side margins are padding via x0, not a hard crop.
+        # Cropping to margin-adjusted rect clipped the first/last CJK glyph.
+        painter.setClipRect(self.rect())
         baseline = (self.height() + self.fontMetrics().ascent() - self.fontMetrics().descent()) // 2
         # Draw tokens at measured offsets so jieba splits stay visually contiguous.
         x0 = self._side_margin_px - int(self._offset)
@@ -2170,6 +2633,17 @@ class ClientWindow(QMainWindow):
         self.pending_messages = PriorityQueue()
         self.current_message: Optional[IncomingMessage] = None
         self.current_speech: Optional[SpeechWorker] = None
+        # message_id → in-memory Piper WAV prefetch (not persisted).
+        self._tts_cache: dict[str, TtsCacheEntry] = {}
+        self._tts_prefetch_workers: dict[str, TtsPrefetchWorker] = {}
+        self._tts_cache_max_entries = 8
+        # When True, _play_next is waiting for Piper prefetch before showing the popup.
+        self._awaiting_tts_ready = False
+        # Ephemeral "处理" activity while deferred on TTS prefetch (no popup yet).
+        self._processing_message_id = ""
+        self._processing_plain = ""
+        self._processing_started_at = 0.0
+        self._processing_last_log_at = 0.0
         self.current_displayed = False
         self.current_speech_done = False
         self.current_speech_success = False
@@ -2220,6 +2694,8 @@ class ClientWindow(QMainWindow):
                     "fingerprint": fingerprint,
                 }
             )
+        # Windows: probe piper-tts / CRT at startup (not on first message).
+        QTimer.singleShot(800, self._refresh_runtime_diagnostics)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -2237,7 +2713,7 @@ class ClientWindow(QMainWindow):
         self.settings_categories.setFixedWidth(150)
         self.settings_categories.setHorizontalScrollBarPolicy(ScrollBarAlwaysOff)
         self.settings_categories.setVerticalScrollBarPolicy(ScrollBarAlwaysOff)
-        self.settings_categories.addItems(["连接与服务端", "客户端身份", "系统", "关于"])
+        self.settings_categories.addItems(["连接与服务端", "客户端身份", "系统", "运行环境", "关于"])
         self.settings_categories.currentRowChanged.connect(self.settings_pages_index_changed)
         settings_layout.addWidget(self.settings_categories)
 
@@ -2389,6 +2865,44 @@ class ClientWindow(QMainWindow):
         system_layout.addWidget(system_group, 1)
         self.settings_pages.addWidget(system_page)
 
+        runtime_page = QWidget()
+        runtime_layout = QVBoxLayout(runtime_page)
+        runtime_layout.setContentsMargins(0, 0, 0, 0)
+        runtime_group = QGroupBox("运行环境")
+        runtime_group_layout = QVBoxLayout(runtime_group)
+        self.runtime_summary_label = QLabel("正在检测…")
+        self.runtime_summary_label.setWordWrap(True)
+        runtime_group_layout.addWidget(self.runtime_summary_label)
+        self.runtime_detail_label = QLabel("")
+        self.runtime_detail_label.setWordWrap(True)
+        self.runtime_detail_label.setTextInteractionFlags(TextSelectableByMouse)
+        self.runtime_detail_label.setStyleSheet("color: #555;")
+        runtime_group_layout.addWidget(self.runtime_detail_label)
+        runtime_actions = QHBoxLayout()
+        self.runtime_refresh_button = QPushButton("重新检测")
+        self.runtime_refresh_button.clicked.connect(self._refresh_runtime_diagnostics)
+        runtime_actions.addWidget(self.runtime_refresh_button)
+        self.runtime_vc_download_button = QPushButton("打开 VC++ 运行库下载")
+        self.runtime_vc_download_button.setToolTip(
+            "Microsoft Visual C++ 2015–2022 Redistributable (x64)\n{}".format(VC_REDIST_X64_URL)
+        )
+        self.runtime_vc_download_button.clicked.connect(self._open_vc_redist_download)
+        runtime_actions.addWidget(self.runtime_vc_download_button)
+        runtime_actions.addStretch(1)
+        runtime_group_layout.addLayout(runtime_actions)
+        runtime_hint = QLabel(
+            "高质量朗读（piper-tts / huayan·lessac）依赖较新的 VC++ 2015–2022 x64 运行库。"
+            "若检测失败，可从此处打开微软官方下载；安装后请重启客户端。"
+        )
+        runtime_hint.setWordWrap(True)
+        runtime_hint.setStyleSheet("color: #666;")
+        runtime_group_layout.addWidget(runtime_hint)
+        runtime_group_layout.addStretch(1)
+        runtime_layout.addWidget(runtime_group, 1)
+        self.settings_pages.addWidget(runtime_page)
+        self._runtime_report: dict[str, Any] = {}
+        self._runtime_probe_worker: Optional[RuntimeProbeWorker] = None
+
         about_page = QWidget()
         about_layout = QVBoxLayout(about_page)
         about_layout.setContentsMargins(0, 0, 0, 0)
@@ -2487,6 +3001,9 @@ class ClientWindow(QMainWindow):
 
     def settings_pages_index_changed(self, index: int) -> None:
         self.settings_pages.setCurrentIndex(max(0, index))
+        # Category order: 连接 / 身份 / 系统 / 运行环境 / 关于
+        if index == 3:
+            self._refresh_runtime_diagnostics()
 
     def copy_identity_fingerprint(self) -> None:
         clipboard = QApplication.clipboard()
@@ -2601,6 +3118,10 @@ class ClientWindow(QMainWindow):
         self.withdrawal_timer = QTimer(self)
         self.withdrawal_timer.setSingleShot(True)
         self.withdrawal_timer.timeout.connect(self._withdrawal_display_elapsed)
+        # Periodic log + activity refresh while waiting on TTS prefetch.
+        self._processing_timer = QTimer(self)
+        self._processing_timer.setInterval(5000)
+        self._processing_timer.timeout.connect(self._tick_processing_activity)
         self.withdrawal_notice_active = False
         self.withdrawal_displayed = False
         self.withdrawal_speech_done = True
@@ -2678,14 +3199,27 @@ class ClientWindow(QMainWindow):
                 )
             )
         if hasattr(self, "display_content") and self.display_content is not None:
+            # Body default is regular; do NOT set a widget-level font-weight that
+            # Qt rich text inherits onto <b>/<i> (CJK bold would look identical).
+            # Emphasize via document CSS so <b>/<strong>/<i>/<em> stay distinct.
             self.display_content.setStyleSheet(
-                'font-family: "{}"; font-size: {}px; font-weight: 600;'.format(
-                    family_css, content_font_px
-                )
+                'font-family: "{}"; font-size: {}px;'
+                " font-weight: 400;"
+                " b, strong {{ font-weight: 700; }}"
+                " i, em {{ font-style: italic; }}".format(family_css, content_font_px)
             )
             try:
                 font = QFont(family_name, content_font_px)
-                font.setBold(True)
+                font.setBold(False)
+                font.setItalic(False)
+                # Prefer synthetic bold/italic when the CJK face has no dedicated style.
+                try:
+                    font.setStyleStrategy(
+                        getattr(QFont, "PreferAntialias", 0)
+                        | getattr(QFont, "ForceOutline", 0)
+                    )
+                except Exception:
+                    pass
                 self.display_content.setFont(font)
             except Exception:
                 pass
@@ -2769,6 +3303,7 @@ class ClientWindow(QMainWindow):
         natural_width = self.display.sizeHint().width()
         # Short messages can shrink; long messages fill up to max_width and marquee.
         text = getattr(self.display_content, "_source_text", "") or ""
+        rich_mode = bool(getattr(self.display_content, "_rich_mode", False))
         metrics = self.display_content.fontMetrics()
         side = max(0, int(getattr(self.display_content, "_side_margin_px", 0)))
         layout_margins = (
@@ -2777,13 +3312,26 @@ class ClientWindow(QMainWindow):
         outer_side = (
             (layout_margins.left() + layout_margins.right()) if layout_margins is not None else 0
         )
-        measured = text_width(metrics, text.split("\n", 1)[0]) if text else 0
-        needed = measured + 2 * side + outer_side + 8
-        width = min(
-            max_width, max(320, needed if "\n" not in text else natural_width, natural_width)
-        )
+        if rich_mode:
+            # Prefer measured plain width; do not let unbounded rich sizeHint dominate.
+            plain = html_to_plain_text(text)
+            first_line = plain.split("\n", 1)[0] if plain else ""
+            measured = text_width(metrics, first_line) if first_line else 0
+            needed = measured + 2 * side + outer_side + 8
+            # Allow some growth for images / multi-line, but stay under 95% screen.
+            width = min(max_width, max(320, needed, min(natural_width, max_width)))
+        else:
+            measured = text_width(metrics, text.split("\n", 1)[0]) if text else 0
+            needed = measured + 2 * side + outer_side + 8
+            width = min(
+                max_width, max(320, needed if "\n" not in text else natural_width, natural_width)
+            )
         width = min(width, max_width)
-        height = min(max(self.display.sizeHint().height(), 160), max(1, area.height() - margin * 2))
+        # Rich (br/img) can inflate sizeHint toward full screen — cap at ~45% height.
+        max_height = max(1, area.height() - margin * 2)
+        if rich_mode:
+            max_height = min(max_height, max(160, math.ceil(area.height() * 0.45)))
+        height = min(max(self.display.sizeHint().height(), 160), max_height)
         self.display.resize(width, height)
         content_width = max(1, width - outer_side)
         self.display_content.setMinimumWidth(1)
@@ -2931,36 +3479,34 @@ class ClientWindow(QMainWindow):
             )
             return
         digest = str(update.get("sha256") or "").lower()
-        target_client_version = str(update.get("client_version") or "").strip()
         LOGGER.info(
-            "update available received on UI thread sha256={} version={} client_version={} force={} has_token={}",
+            "update available received on UI thread digest={} version={} client_version={} force={} has_token={}",
             digest,
             update.get("version"),
-            target_client_version or "-",
+            str(update.get("client_version") or "").strip() or "-",
             bool(update.get("force")),
             bool(update.get("download_token")),
         )
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-            LOGGER.error("update available ignored: invalid sha256={!r}", update.get("sha256"))
+            LOGGER.error("update available ignored: invalid digest={!r}", update.get("sha256"))
             return
-        # Ignore packages we already applied (persisted across restart) or whose
-        # client_version we already meet/exceed — stops force catch-up restart loops.
+        # Server decides whether to offer (applied_seq + version). Once offered,
+        # the client always applies unless this exact digest was already applied
+        # (local memory / pending UpdateApplied after reconnect).
+        seq = 0
+        try:
+            seq = int(update.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        version = str(update.get("version") or "")
         if is_update_applied(self.data_dir, digest) or digest in self._update_apply_done:
-            LOGGER.info("update apply skipped (already applied) sha256={}", digest)
+            LOGGER.info("update apply skipped (already applied) digest={}", digest)
             self._update_apply_done.add(digest)
-            return
-        if target_client_version and not _client_version_behind(VERSION_STR, target_client_version):
-            LOGGER.info(
-                "update apply skipped (client_version={} meets/exceeds target={}) sha256={}",
-                VERSION_STR,
-                target_client_version,
-                digest,
-            )
             mark_update_applied(self.data_dir, digest)
-            self._update_apply_done.add(digest)
+            self._queue_update_applied_report_all(digest, version, seq)
             return
         if digest in self._update_apply_in_progress:
-            LOGGER.info("update apply skipped (already in progress) sha256={}", digest)
+            LOGGER.info("update apply skipped (already in progress) digest={}", digest)
             return
         # Ensure peer routing fields even if the signal payload lost them.
         if not update.get("source_host") or not update.get("source_tcp_port"):
@@ -2996,11 +3542,14 @@ class ClientWindow(QMainWindow):
             self._update_apply_done.add(sha)
             mark_update_applied(self.data_dir, sha)
             self._update_apply_in_progress.discard(sha)
+            # Pending report persists across quit; reconnect flush sends UpdateApplied.
+            # Also queue now in case we stay up (dev mode / no quit).
+            self._queue_update_applied_report_all(sha, version, seq)
             try:
                 self._update_workers.remove(worker_ref)
             except ValueError:
                 pass
-            LOGGER.info("update apply worker finished ok sha256={}", sha)
+            LOGGER.info("update apply worker finished ok digest={}", sha)
 
         def _on_err(sha: str, error: str, worker_ref: UpdateApplyWorker = apply_worker) -> None:
             self._update_apply_in_progress.discard(sha)
@@ -3009,13 +3558,13 @@ class ClientWindow(QMainWindow):
                 self._update_workers.remove(worker_ref)
             except ValueError:
                 pass
-            LOGGER.error("update apply worker finished error sha256={} error={}", sha, error)
+            LOGGER.error("update apply worker finished error digest={} error={}", sha, error)
 
         apply_worker.finished_ok.connect(_on_ok, QueuedConnection)
         apply_worker.finished_error.connect(_on_err, QueuedConnection)
         apply_worker.quit_for_update.connect(self._quit_for_update, QueuedConnection)
         apply_worker.start()
-        LOGGER.info("update apply worker started sha256={}", digest)
+        LOGGER.info("update apply worker started digest={}", digest)
 
     def _quit_for_update(self) -> None:
         """Stop workers and exit so the detached updater can replace PE files and restart us."""
@@ -3650,6 +4199,9 @@ class ClientWindow(QMainWindow):
             self._ack(message, "received")
             return
         self.pending_messages.put(message)
+        # Prefetch Piper WAV while the message waits in the queue (or behind current).
+        if message.tts_enabled:
+            self._start_tts_prefetch(message)
         if self.current_message is None:
             self._play_next()
         elif message.priority < self.current_message.priority:
@@ -3659,6 +4211,231 @@ class ClientWindow(QMainWindow):
             self.pending_messages.put(interrupted)
             self._stop_current_speech()
             self._play_next()
+
+    def _resolve_message_speech_rate(self, message: IncomingMessage) -> float:
+        source_key: Optional[tuple[str, int]] = None
+        if message.source_host and message.source_tcp_port:
+            source_key = (str(message.source_host), int(message.source_tcp_port))
+        server_defaults = self._server_display_defaults.get(source_key) if source_key else None
+        base_speech_rate = (
+            server_defaults[2]
+            if server_defaults and len(server_defaults) >= 3
+            else self.speech_rate
+        )
+        if message.as_default and message.default_speech_rate is not None:
+            base_speech_rate = float(message.default_speech_rate)
+        return normalize_speech_rate(
+            message.speech_rate
+            if message.speech_rate is not None
+            else (
+                message.default_speech_rate
+                if message.default_speech_rate is not None
+                else base_speech_rate
+            ),
+            default=DEFAULT_SPEECH_RATE,
+        )
+
+    def _compile_message_speech_parts(self, message: IncomingMessage) -> list[SpeechPart]:
+        """Strip HTML from speech nodes / content and compile SpeechPart list."""
+        plain_for_tts = html_to_plain_text(message.content)
+        speech_nodes = list(message.speech) if message.speech else []
+        if speech_nodes:
+            stripped: list[dict[str, Any]] = []
+            for node in speech_nodes:
+                if not isinstance(node, dict):
+                    stripped.append(node)  # type: ignore[arg-type]
+                    continue
+                if str(node.get("type", "text")) == "text":
+                    value = html_to_plain_text(str(node.get("value", "")))
+                    stripped.append({**node, "value": value})
+                else:
+                    stripped.append(node)
+            return compile_speech(stripped)
+        if plain_for_tts:
+            return compile_speech([{"type": "text", "value": plain_for_tts}])
+        return []
+
+    def _start_tts_prefetch(self, message: IncomingMessage) -> None:
+        """Kick off Piper synthesize-only prefetch for a queued message."""
+        message_id = message.message_id
+        if not message.tts_enabled or message_id in self.withdrawn_ids:
+            return
+        existing = self._tts_cache.get(message_id)
+        if existing is not None and (not existing.ready.is_set() or existing.plan):
+            return
+        try:
+            parts = self._compile_message_speech_parts(message)
+        except (TypeError, ValueError) as exc:
+            LOGGER.warning(
+                "TTS prefetch skipped message_id={} reason=invalid_speech error={}",
+                message_id,
+                exc,
+            )
+            return
+        if not parts:
+            return
+        speech_rate = self._resolve_message_speech_rate(message)
+        self._evict_tts_cache_if_needed(keep=message_id)
+        entry = TtsCacheEntry(message_id, parts, speech_rate)
+        self._tts_cache[message_id] = entry
+        worker = TtsPrefetchWorker(entry, self.data_dir, self)
+        self._tts_prefetch_workers[message_id] = worker
+        worker.finished_prefetch.connect(
+            lambda mid, _ok, _err: self._on_tts_prefetch_finished(mid),
+            QueuedConnection,
+        )
+        worker.start()
+        LOGGER.info(
+            "TTS prefetch started message_id={} parts={} speech_rate={}",
+            message_id,
+            len(parts),
+            speech_rate,
+        )
+
+    def _on_tts_prefetch_finished(self, message_id: str) -> None:
+        worker = self._tts_prefetch_workers.pop(message_id, None)
+        if worker is not None:
+            worker.wait(100)
+        # Show the popup only after prefetch settles (success or failure → live fallback).
+        if (
+            self._awaiting_tts_ready
+            and self.current_message is not None
+            and self.current_message.message_id == message_id
+            and message_id not in self.withdrawn_ids
+        ):
+            elapsed_ms = self._processing_elapsed_ms()
+            LOGGER.info(
+                "TTS ready; presenting deferred message message_id={} elapsed_ms={} content={}",
+                message_id,
+                elapsed_ms,
+                self._processing_plain or html_to_plain_text(self.current_message.content),
+            )
+            self._clear_processing_activity()
+            self._present_current_message()
+
+    def _processing_elapsed_ms(self) -> int:
+        if self._processing_started_at <= 0:
+            return 0
+        return max(0, int((time.monotonic() - self._processing_started_at) * 1000))
+
+    def _report_activity_to_workers(
+        self,
+        state: str,
+        *,
+        message_id: str = "",
+        detail: str = "",
+        elapsed_ms: int = 0,
+    ) -> None:
+        """Fan-out ClientActivity to every live TLS worker (multi-server safe)."""
+        for worker in list(self.connection_workers.values()):
+            try:
+                worker.report_activity(
+                    state,
+                    message_id=message_id,
+                    detail=detail,
+                    elapsed_ms=elapsed_ms,
+                )
+            except Exception:
+                pass
+
+    def _begin_processing_activity(self, message: IncomingMessage) -> None:
+        """Mark admin status as 处理 and start progress logging (no popup)."""
+        plain = html_to_plain_text(message.content).replace("\r", " ").replace("\n", " ").strip()
+        if len(plain) > 200:
+            plain = plain[:200] + "…"
+        self._awaiting_tts_ready = True
+        self._processing_message_id = str(message.message_id)
+        self._processing_plain = plain
+        self._processing_started_at = time.monotonic()
+        self._processing_last_log_at = self._processing_started_at
+        LOGGER.info(
+            "message display deferred until TTS ready message_id={} content={}",
+            message.message_id,
+            plain,
+        )
+        self._report_activity_to_workers(
+            "processing",
+            message_id=str(message.message_id),
+            detail=plain,
+            elapsed_ms=0,
+        )
+        if not self._processing_timer.isActive():
+            self._processing_timer.start()
+
+    def _tick_processing_activity(self) -> None:
+        """Periodic log + activity refresh while waiting on TTS prefetch."""
+        if not self._awaiting_tts_ready or not self._processing_message_id:
+            self._processing_timer.stop()
+            return
+        message = self.current_message
+        if message is None or message.message_id != self._processing_message_id:
+            self._clear_processing_activity()
+            return
+        elapsed_ms = self._processing_elapsed_ms()
+        elapsed_s = elapsed_ms / 1000.0
+        LOGGER.info(
+            "TTS processing message_id={} elapsed={:.1f}s content={}",
+            self._processing_message_id,
+            elapsed_s,
+            self._processing_plain,
+        )
+        self._processing_last_log_at = time.monotonic()
+        self._report_activity_to_workers(
+            "processing",
+            message_id=self._processing_message_id,
+            detail=self._processing_plain,
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _clear_processing_activity(self) -> None:
+        """Clear 处理 state after popup, withdraw, or interrupt."""
+        was_processing = bool(self._awaiting_tts_ready or self._processing_message_id)
+        self._awaiting_tts_ready = False
+        message_id = self._processing_message_id
+        self._processing_message_id = ""
+        self._processing_plain = ""
+        self._processing_started_at = 0.0
+        self._processing_last_log_at = 0.0
+        if self._processing_timer.isActive():
+            self._processing_timer.stop()
+        if was_processing:
+            self._report_activity_to_workers("idle", message_id=message_id)
+
+    def _evict_tts_cache_if_needed(self, *, keep: str = "") -> None:
+        """Drop oldest ready cache entries when over the in-memory cap."""
+        while len(self._tts_cache) >= self._tts_cache_max_entries:
+            victim: Optional[str] = None
+            for mid, entry in self._tts_cache.items():
+                if mid == keep:
+                    continue
+                if self.current_message is not None and self.current_message.message_id == mid:
+                    continue
+                if entry.ready.is_set():
+                    victim = mid
+                    break
+            if victim is None:
+                # Prefer cancelling a non-current in-flight prefetch over growing unbounded.
+                for mid, entry in self._tts_cache.items():
+                    if mid == keep:
+                        continue
+                    if self.current_message is not None and self.current_message.message_id == mid:
+                        continue
+                    victim = mid
+                    break
+            if victim is None:
+                break
+            self._drop_tts_cache(victim)
+
+    def _drop_tts_cache(self, message_id: str) -> None:
+        entry = self._tts_cache.pop(message_id, None)
+        if entry is not None:
+            entry.cancel.set()
+            entry.plan = None
+        worker = self._tts_prefetch_workers.pop(message_id, None)
+        if worker is not None:
+            worker.stop()
+            if worker.isRunning():
+                worker.wait(500)
 
     def _format_sent_time(self, milliseconds: Optional[int]) -> str:
         if milliseconds is None:
@@ -3671,6 +4448,7 @@ class ClientWindow(QMainWindow):
             # Do not start the next business message while a withdrawal notice is on screen.
             return
         self.withdrawal_timer.stop()
+        self._clear_processing_activity()
         message = self.pending_messages.get()
         if message is None:
             self.current_message = None
@@ -3684,6 +4462,24 @@ class ClientWindow(QMainWindow):
         self.current_speech_done = not message.tts_enabled
         self.current_speech_success = False
         self.current_error = ""
+        # TTS messages: wait for Piper prefetch before showing the popup so users
+        # do not see a silent window while synthesis is still running.
+        if message.tts_enabled:
+            self._start_tts_prefetch(message)
+            cache_entry = self._tts_cache.get(message.message_id)
+            if cache_entry is not None and not cache_entry.ready.is_set():
+                self._begin_processing_activity(message)
+                return
+        self._present_current_message()
+
+    def _present_current_message(self) -> None:
+        """Show the current message popup and start TTS/timer (after any TTS wait)."""
+        message = self.current_message
+        if message is None or message.message_id in self.withdrawn_ids:
+            self._clear_processing_activity()
+            self._play_next()
+            return
+        self._clear_processing_activity()
         # Resolve display defaults from the source server first (multi-server safe).
         source_key: Optional[tuple[str, int]] = None
         if message.source_host and message.source_tcp_port:
@@ -3711,19 +4507,12 @@ class ClientWindow(QMainWindow):
                     float(base_ratio),
                     float(base_speech_rate),
                 )
-        speech_rate = normalize_speech_rate(
-            message.speech_rate
-            if message.speech_rate is not None
-            else (
-                message.default_speech_rate
-                if message.default_speech_rate is not None
-                else base_speech_rate
-            ),
-            default=DEFAULT_SPEECH_RATE,
-        )
+        speech_rate = self._resolve_message_speech_rate(message)
         sent_time = self._format_sent_time(message.created_at_ms)
         self.display.setWindowTitle("{} | lovemilk class broadcaster".format(sent_time))
+        # Display keeps sanitized HTML; TTS uses tag-stripped plain text.
         self.display_content.setText(message.content)
+        plain_for_tts = html_to_plain_text(message.content)
         self.display_time.setText(sent_time)
         # Per-message font_size overrides device default for this playback only.
         self._apply_message_font(size_px=self._effective_message_font_size(message.font_size))
@@ -3739,8 +4528,17 @@ class ClientWindow(QMainWindow):
             len(message.speech),
             speech_rate,
         )
+        cache_entry = self._tts_cache.get(message.message_id) if message.tts_enabled else None
         try:
-            parts = compile_speech(message.speech) if message.tts_enabled else []
+            if message.tts_enabled:
+                # Prefer parts compiled at prefetch time so cache matches playback.
+                if cache_entry is not None and cache_entry.parts:
+                    parts = list(cache_entry.parts)
+                    speech_rate = float(cache_entry.speech_rate)
+                else:
+                    parts = self._compile_message_speech_parts(message)
+            else:
+                parts = []
         except (TypeError, ValueError) as exc:
             parts = []
             self.current_speech_done = True
@@ -3763,23 +4561,54 @@ class ClientWindow(QMainWindow):
             # Manual close: marquee uses comfortable default speed with end holds.
             self.display_content.set_display_duration_ms(0)
         elif message.tts_enabled and parts:
-            # TTS path: estimated speech duration + 5s headroom (capped at 120s).
-            total_ms = min(120_000, estimate_duration_ms(parts, speech_rate) + 5000)
+            # Prefer measured WAV duration when prefetch already finished.
+            if (
+                cache_entry is not None
+                and cache_entry.ready.is_set()
+                and cache_entry.plan
+                and not cache_entry.error
+            ):
+                from .core.tts import _wav_duration_seconds
+
+                wav_ms = int(
+                    sum(
+                        _wav_duration_seconds(payload) * 1000.0
+                        for kind, payload in cache_entry.plan
+                        if kind == "wav" and isinstance(payload, (bytes, bytearray))
+                    )
+                    + sum(
+                        float(payload)
+                        for kind, payload in cache_entry.plan
+                        if kind == "pause"
+                    )
+                )
+                total_ms = min(120_000, max(1000, wav_ms + 5000))
+            else:
+                total_ms = min(120_000, estimate_duration_ms(parts, speech_rate) + 5000)
             self.display_timer.start(total_ms)
             self.display_content.set_display_duration_ms(total_ms)
         else:
-            configured_duration_ms = display_duration_ms(message.content, display_ratio)
+            # Duration tokens use plain text so HTML tags do not inflate counts.
+            configured_duration_ms = display_duration_ms(plain_for_tts or message.content, display_ratio)
             total_ms = min(120_000, max(1000, configured_duration_ms))
             self.display_timer.start(total_ms)
             # Drive marquee so one full pass (+ ≥0.5s holds) fits this window.
             self.display_content.set_display_duration_ms(total_ms)
         if message.tts_enabled and parts:
+            # Ensure prefetch is running if receive-time start was skipped/missed.
+            if cache_entry is None:
+                self._start_tts_prefetch(message)
+                cache_entry = self._tts_cache.get(message.message_id)
             self.current_speech = SpeechWorker(
-                message.message_id, parts, self.data_dir, speech_rate=speech_rate
+                message.message_id,
+                parts,
+                self.data_dir,
+                speech_rate=speech_rate,
+                cache_entry=cache_entry,
             )
             self.current_speech.finished_playback.connect(self._speech_finished)
             # Do not connect text_part: speech text is sanitized (symbols like
-            # <= stripped) while the popup must keep message.content verbatim.
+            # <= stripped) while the popup must keep message.content (HTML) verbatim.
             self.current_speech.start()
         elif not message.tts_enabled:
             # Displayed is the final receipt when speech is disabled.
@@ -3805,10 +4634,166 @@ class ClientWindow(QMainWindow):
         self.current_error = error
         self._finish_current_if_ready()
 
+    def _refresh_runtime_diagnostics(self) -> None:
+        """Run / re-run the Windows TTS runtime probe on a background thread."""
+        if platform.system() != "Windows":
+            if hasattr(self, "runtime_summary_label"):
+                self.runtime_summary_label.setText("非 Windows：无需 VC++ / piper-tts 检测。")
+                self.runtime_detail_label.setText("")
+                self.runtime_vc_download_button.setEnabled(False)
+            return
+        worker = getattr(self, "_runtime_probe_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        if hasattr(self, "runtime_summary_label"):
+            self.runtime_summary_label.setText("正在检测运行环境…")
+            self.runtime_refresh_button.setEnabled(False)
+        # Allow a fresh import probe when the user clicks 重新检测.
+        try:
+            from .core.tts import clear_subprocess_import_cache
+
+            clear_subprocess_import_cache("piper", "onnxruntime")
+        except Exception:
+            pass
+        worker = RuntimeProbeWorker(self.data_dir, self)
+        self._runtime_probe_worker = worker
+        worker.finished_probe.connect(self._on_runtime_probe_finished, QueuedConnection)
+        worker.start()
+
+    def _on_runtime_probe_finished(self, report: object) -> None:
+        payload = report if isinstance(report, dict) else {}
+        self._runtime_report = payload
+        if hasattr(self, "runtime_refresh_button"):
+            self.runtime_refresh_button.setEnabled(True)
+        self._apply_runtime_diagnostics(payload)
+        # One-time automatic prompt at startup (persisted under data/).
+        if (
+            platform.system() == "Windows"
+            and payload.get("needs_vc_redist")
+            and not payload.get("prompt_dismissed")
+            and not getattr(self, "_vc_redist_auto_prompt_done", False)
+        ):
+            self._vc_redist_auto_prompt_done = True
+            QTimer.singleShot(
+                0,
+                lambda: self._offer_vc_redist_download(
+                    str(payload.get("summary") or payload.get("piper_detail") or ""),
+                    automatic=True,
+                ),
+            )
+
+    def _apply_runtime_diagnostics(self, report: dict[str, Any]) -> None:
+        if not hasattr(self, "runtime_summary_label"):
+            return
+        summary = str(report.get("summary") or "—")
+        self.runtime_summary_label.setText(summary)
+        lines: list[str] = []
+        if report.get("applicable"):
+            lines.append(
+                "piper-tts：{}".format("可用" if report.get("piper_ok") else "不可用")
+            )
+            if report.get("piper_detail") and not report.get("piper_ok"):
+                lines.append("  {}".format(report.get("piper_detail")))
+            lines.append(
+                "onnxruntime：{}".format("可用" if report.get("onnxruntime_ok") else "不可用")
+            )
+            if report.get("onnxruntime_detail") and not report.get("onnxruntime_ok"):
+                lines.append("  {}".format(report.get("onnxruntime_detail")))
+            lines.append(
+                "语音模型：{}".format(
+                    report.get("model_path") or ("未找到" if not report.get("model_found") else "—")
+                )
+            )
+            crt = report.get("crt_files") or {}
+            if isinstance(crt, dict) and crt:
+                lines.append("CRT 文件：")
+                for name, info in crt.items():
+                    if not isinstance(info, dict):
+                        continue
+                    if info.get("present"):
+                        flag = "（过旧）" if info.get("outdated") else ""
+                        lines.append("  {} v{}{}".format(name, info.get("version") or "?", flag))
+                    else:
+                        lines.append("  {}：不在包内（将使用系统运行库）".format(name))
+            if report.get("prompt_dismissed"):
+                lines.append("自动提示：已关闭（本机不再自动弹窗；可点下方按钮手动下载）")
+        self.runtime_detail_label.setText("\n".join(lines))
+        needs = bool(report.get("needs_vc_redist")) or not bool(report.get("piper_ok"))
+        self.runtime_vc_download_button.setEnabled(platform.system() == "Windows")
+        if needs and platform.system() == "Windows":
+            self.runtime_vc_download_button.setText("打开 VC++ 运行库下载（建议）")
+        else:
+            self.runtime_vc_download_button.setText("打开 VC++ 运行库下载")
+
+    def _open_vc_redist_download(self) -> None:
+        """Settings-page action: always open the official VC++ x64 download."""
+        self._offer_vc_redist_download(
+            str((self._runtime_report or {}).get("summary") or ""),
+            automatic=False,
+        )
+
+    def _offer_vc_redist_download(self, reason: str, *, automatic: bool = False) -> None:
+        """Offer the VC++ 2015–2022 x64 redistributable download.
+
+        automatic=True: startup one-shot; dismissed permanently after Yes or No.
+        automatic=False: settings button; always opens (or confirms) without changing
+        the dismissal flag unless the user confirms.
+        """
+        if platform.system() != "Windows":
+            return
+        if automatic and is_vc_redist_prompt_dismissed(self.data_dir):
+            return
+        detail = (reason or "").strip()
+        if len(detail) > 280:
+            detail = detail[:277] + "…"
+        if automatic:
+            message = (
+                "高质量朗读（piper-tts）无法加载原生组件（常见原因：未安装或过旧的 "
+                "Microsoft Visual C++ 2015–2022 x64 运行库）。\n\n"
+                "是否打开微软官方下载页？\n"
+                "（未安装前将回退到系统朗读 SAPI；安装完成后请重启客户端。"
+                "此提示本机只弹出一次，之后可在「设置 → 运行环境」再次打开。）"
+            )
+            if detail:
+                message += "\n\n诊断：{}".format(detail)
+            answer = QMessageBox.warning(
+                self,
+                "需要安装 VC++ 运行库",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            opened = False
+            if answer == QMessageBox.StandardButton.Yes:
+                opened = self._launch_vc_redist_url()
+            mark_vc_redist_prompt_dismissed(self.data_dir, opened_download=opened)
+            # Refresh settings page label if visible.
+            if self._runtime_report:
+                self._runtime_report["prompt_dismissed"] = True
+                self._apply_runtime_diagnostics(self._runtime_report)
+            return
+        # Manual: open immediately (settings already explained why).
+        self._launch_vc_redist_url()
+
+    def _launch_vc_redist_url(self) -> bool:
+        try:
+            opened = bool(QDesktopServices.openUrl(QUrl(VC_REDIST_X64_URL)))
+        except Exception as exc:
+            LOGGER.warning("open VC++ redistributable URL failed error={}", exc)
+            opened = False
+        if not opened:
+            QMessageBox.information(
+                self,
+                "请手动下载",
+                "无法自动打开浏览器。请访问：\n{}".format(VC_REDIST_X64_URL),
+            )
+        return opened
+
     def _finish_current_if_ready(self) -> None:
         message = self.current_message
         if message is None or not self.current_displayed or not self.current_speech_done:
             return
+        finished_id = message.message_id
         if message.tts_enabled:
             self._ack(
                 message,
@@ -3821,6 +4806,9 @@ class ClientWindow(QMainWindow):
         self.display_close_button.hide()
         self.current_message = None
         self.current_speech = None
+        # Consumed after display+TTS finish. Preempt path uses _stop_current_speech
+        # (keeps cache) and never reaches here for the interrupted message.
+        self._drop_tts_cache(finished_id)
         self._play_next()
 
     def _dismiss_current(self) -> None:
@@ -3839,16 +4827,19 @@ class ClientWindow(QMainWindow):
             self.current_speech_done = True
             self.current_speech_success = False
             self.current_error = "manually_dismissed"
+        self._drop_tts_cache(message.message_id)
         self.current_displayed = True
         self._finish_current_if_ready()
 
     def _stop_current_speech(self) -> None:
         self.display_timer.stop()
+        self._clear_processing_activity()
         if self.current_speech is not None and self.current_speech.isRunning():
             self.current_speech.stop()
             self.current_speech.wait(1500)
         self.current_speech = None
         self.display.hide()
+        # Keep TTS cache for the interrupted message — it may be re-queued.
         self.current_message = None
 
     def _worker_for_message(self, message: object) -> Optional[ConnectionWorker]:
@@ -3882,19 +4873,34 @@ class ClientWindow(QMainWindow):
             worker.acknowledge(message_id, status, error)
 
     @staticmethod
-    def _format_withdrawal_text(withdrawal: IncomingWithdrawal) -> str:
-        """Single-line notice so MarqueeLabel can auto-scroll long original content."""
+    def _format_withdrawal_text(withdrawal: IncomingWithdrawal) -> tuple[str, str]:
+        """Build withdrawal notice for display + TTS.
+
+        Returns ``(display_html_or_plain, tts_plain)``.
+        Display keeps sanitized original HTML after an escaped title prefix;
+        TTS always uses plain text.
+        """
+        import html as html_lib
+
         title = (withdrawal.message or "消息已撤回").strip() or "消息已撤回"
-        content = (withdrawal.content or "").replace("\r", " ").replace("\n", " ").strip()
-        if content:
-            return "{}：{}".format(title, content)
-        return title
+        raw_body = withdrawal.content or ""
+        plain_body = html_to_plain_text(raw_body).replace("\r", " ").replace("\n", " ").strip()
+        tts_plain = "{}：{}".format(title, plain_body) if plain_body else title
+        if looks_like_html(raw_body):
+            body_html = sanitize_html(raw_body)
+            if body_html.strip():
+                display = "{}：{}".format(html_lib.escape(title), body_html)
+                return display, tts_plain
+        if plain_body:
+            return "{}：{}".format(title, plain_body), tts_plain
+        return title, tts_plain
 
     def _message_withdrawn(self, endpoint_key: object, withdrawal: IncomingWithdrawal) -> None:
         self.withdrawn_ids.add(withdrawal.message_id)
         self.pending_messages.withdraw(withdrawal.message_id)
-        # Resolve display ratio from the withdrawn message when it is on screen;
-        # otherwise use the withdrawal payload / global default.
+        self._drop_tts_cache(withdrawal.message_id)
+        # Resolve display ratio from the withdrawn message when it is on screen
+        # (or waiting for TTS before show); otherwise use payload / global default.
         ratio = self.display_duration_ratio
         if (
             self.current_message is not None
@@ -3911,6 +4917,7 @@ class ClientWindow(QMainWindow):
                 ratio = server_defaults[1] if server_defaults else self.display_duration_ratio
             else:
                 ratio = message.display_duration_ratio
+            # Clears _awaiting_tts_ready when the message was deferred pending synth.
             self._stop_current_speech()
         else:
             if withdrawal.display_duration_ratio is not None:
@@ -3924,29 +4931,31 @@ class ClientWindow(QMainWindow):
             sent_time = self._format_sent_time(int(time.time() * 1000))
             self.display.setWindowTitle("{} | lovemilk class broadcaster".format(sent_time))
             self.display_time.setText(sent_time)
-        withdrawn_text = self._format_withdrawal_text(withdrawal)
+        display_text, tts_plain = self._format_withdrawal_text(withdrawal)
         self._show_withdrawal_notice(
-            withdrawn_text, float(ratio) if ratio is not None else self.display_duration_ratio
+            display_text,
+            tts_plain,
+            float(ratio) if ratio is not None else self.display_duration_ratio,
         )
         self._ack(withdrawal, "withdrawn")
 
-    def _show_withdrawal_notice(self, text: str, ratio: float) -> None:
-        """Show withdrawal notice with marquee + TTS; ratio 0 keeps a manual close button."""
+    def _show_withdrawal_notice(self, display_text: str, tts_plain: str, ratio: float) -> None:
+        """Show withdrawal notice with marquee/rich + TTS; ratio 0 keeps a manual close button."""
         self._stop_withdrawal_speech()
         self.withdrawal_notice_active = True
         self.withdrawal_displayed = False
         self.withdrawal_speech_done = False
-        display_text = (
-            str(text or "消息已撤回").replace("\r", " ").replace("\n", " ").strip() or "消息已撤回"
-        )
+        shown = str(display_text or "消息已撤回").strip() or "消息已撤回"
+        spoken = str(tts_plain or "消息已撤回").replace("\r", " ").replace("\n", " ").strip() or "消息已撤回"
         self.display_content.setAlignment(AlignCenter)
-        self.display_content.setText(display_text)
+        # Keep original formatting (b/i/u/br/img) on the notice even when inline-only.
+        self.display_content.setText(shown, force_rich=looks_like_html(shown))
         self.display.adjustSize()
         self.display_close_button.setVisible(ratio <= 0)
         _play_notification_sound()
         self._show_display("center")
 
-        parts = [SpeechPart("text", text=display_text)]
+        parts = [SpeechPart("text", text=spoken)]
         speech_rate = normalize_speech_rate(self.speech_rate, default=DEFAULT_SPEECH_RATE)
         if ratio <= 0:
             self.withdrawal_timer.stop()
@@ -3961,7 +4970,7 @@ class ClientWindow(QMainWindow):
 
         LOGGER.info(
             "withdrawal notice shown tts=True chars={} ratio={} speech_rate={} manual_close={}",
-            len(display_text),
+            len(spoken),
             ratio,
             speech_rate,
             ratio <= 0,
@@ -4122,6 +5131,21 @@ class ClientWindow(QMainWindow):
         if application is not None:
             application.quit()
 
+    def _queue_update_applied_report_all(
+        self, digest: str, version: str = "", seq: int = 0
+    ) -> None:
+        """Queue UpdateApplied on every live ConnectionWorker (multi-server safe)."""
+        digest = str(digest or "").strip().lower()
+        if len(digest) != 64:
+            return
+        for worker in list(self.connection_workers.values()):
+            if not worker.isRunning():
+                continue
+            try:
+                worker.queue_update_applied_report(digest, version, seq)
+            except Exception:
+                pass
+
     def _report_session_end_all(self, reason: str, detail: str = "") -> None:
         """Queue ClientSessionEnd on every live worker and wait briefly for the flush."""
         workers = [w for w in self.connection_workers.values() if w.isRunning()]
@@ -4149,6 +5173,8 @@ class ClientWindow(QMainWindow):
             self.display_timer.stop()
         except Exception:
             pass
+        for message_id in list(self._tts_cache.keys()):
+            self._drop_tts_cache(message_id)
         self._stop_current_speech()
         try:
             self._stop_withdrawal_speech()
@@ -4276,6 +5302,13 @@ def main() -> None:
     configure_platform_for_popup()
     # 在创建主窗口前取得安装目录锁，避免两个进程同时消费同一状态文件。
     _configure_qt_plugin_path()
+    # Windows: register onnxruntime / openjtalk DLL dirs early (same set as launcher PATH).
+    try:
+        from .core.tts import ensure_windows_native_dll_dirs
+
+        ensure_windows_native_dll_dirs()
+    except Exception:
+        pass
     data_dir = _data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     had_existing_state = (data_dir / "state.json").is_file()

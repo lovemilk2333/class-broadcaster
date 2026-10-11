@@ -38,7 +38,14 @@ const (
 	// ClientSessionEnd is a client→server goodbye before closing the TLS session.
 	// Payload reason: user_exit | update | admin (optional detail).
 	ClientSessionEnd uint16 = 0x020A
-	ListenerPing     uint16 = 0x0204
+	// UpdateApplied is a client→server report that a package was applied (after restart reconnect).
+	// Payload BSON: sha256 (64-hex digest), optional version, optional seq.
+	UpdateApplied uint16 = 0x020B
+	// ClientActivity is a client→server ephemeral activity hint for the admin device list.
+	// Payload BSON: state ("processing"|"idle"), optional message_id / detail / elapsed_ms.
+	// "processing" = message received, display free, waiting on TTS prefetch before popup.
+	ClientActivity uint16 = 0x020C
+	ListenerPing   uint16 = 0x0204
 	Message          uint16 = 0x1001
 	MessageAck       uint16 = 0x1002
 	MessageWithdraw  uint16 = 0x1003

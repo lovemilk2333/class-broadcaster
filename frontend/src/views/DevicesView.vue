@@ -131,6 +131,9 @@ function customFilter(row: Device, model: FiltersModel): boolean {
       row.forced_mode,
       row.online ? 'online connected 已连接' : 'offline 未连接',
       connectionLabel,
+      row.activity_state === 'processing' ? 'processing 处理' : '',
+      row.activity_detail,
+      row.activity_message_id,
       row.session_end_reason,
       row.session_end_detail,
       row.session_end_label

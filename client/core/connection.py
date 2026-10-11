@@ -40,6 +40,8 @@ UPDATE_AVAILABLE = 0x0207
 UPDATE_DOWNLOAD_REQ = 0x0208
 UPDATE_DOWNLOAD_RESP = 0x0209
 CLIENT_SESSION_END = 0x020A  # client→server intentional goodbye (user_exit / update / …)
+UPDATE_APPLIED = 0x020B  # client→server: package applied (after restart reconnect)
+CLIENT_ACTIVITY = 0x020C  # client→server: ephemeral activity (processing / idle)
 ERROR = 0x7F00
 
 
@@ -154,6 +156,53 @@ class Connection(BaseModel):
             payload["detail"] = str(detail)[:256]
         self.send(Packet(1, 0, CLIENT_SESSION_END, 0, 0, encode(payload)))
 
+    def report_update_applied(self, digest: str, version: str = "", seq: int = 0) -> None:
+        """Tell the server this package digest was applied (typically after restart reconnect).
+
+        Wire field stays ``sha256`` even when the digest is BLAKE3.
+        """
+        digest = str(digest or "").strip().lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("invalid update digest")
+        payload: dict[str, Any] = {"sha256": digest}
+        version = str(version or "").strip()
+        if version:
+            payload["version"] = version[:128]
+        try:
+            seq_value = int(seq or 0)
+        except (TypeError, ValueError):
+            seq_value = 0
+        if seq_value > 0:
+            payload["seq"] = seq_value
+        self.send(Packet(1, 0, UPDATE_APPLIED, 0, 0, encode(payload)))
+
+    def report_activity(
+        self,
+        state: str,
+        *,
+        message_id: str = "",
+        detail: str = "",
+        elapsed_ms: int = 0,
+    ) -> None:
+        """Report ephemeral activity for the admin device list (processing / idle)."""
+        cleaned = str(state or "idle").strip().lower() or "idle"
+        if cleaned not in ("processing", "idle"):
+            cleaned = "idle"
+        payload: dict[str, Any] = {"state": cleaned}
+        mid = str(message_id or "").strip()
+        if mid:
+            payload["message_id"] = mid[:128]
+        note = str(detail or "").strip()
+        if note:
+            payload["detail"] = note[:512]
+        try:
+            elapsed = int(elapsed_ms or 0)
+        except (TypeError, ValueError):
+            elapsed = 0
+        if elapsed > 0:
+            payload["elapsed_ms"] = elapsed
+        self.send(Packet(1, 0, CLIENT_ACTIVITY, 0, 0, encode(payload)))
+
 
 def decode_message(packet: Packet) -> IncomingMessage:
     if packet.packet_type != MESSAGE:
@@ -234,7 +283,7 @@ def decode_update_available(packet: Packet) -> dict[str, Any]:
     if not isinstance(package, (bytes, bytearray)):
         raise ValueError("update notification package field is invalid")
     if len(result["sha256"]) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in result["sha256"]):
-        raise ValueError("update notification SHA-256 is invalid")
+        raise ValueError("update notification digest is invalid")
     if not package and not download_token and not download_url and not legacy_release_url:
         raise ValueError("update notification is missing package bytes and download token")
     seq_value = document.get("seq", 0)
@@ -484,7 +533,7 @@ def download_update_package_tls(
     digest = str(sha256_hex).strip().lower()
     token = str(download_token or "").strip()
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
-        raise ValueError("update download sha256 is invalid")
+        raise ValueError("update download digest is invalid")
     if not token:
         raise ValueError("update download token is required")
     dest = Path(destination)
@@ -503,7 +552,7 @@ def download_update_package_tls(
     packet_read_timeout = max(float(timeout), 60.0)
 
     LOGGER.info(
-        "update download begin host={} port={} sha256={} dest={}",
+        "update download begin host={} port={} digest={} dest={}",
         host,
         port,
         digest,
@@ -533,7 +582,7 @@ def download_update_package_tls(
         req_payload = encode({"sha256": digest, "token": token})
         connection.send(Packet(1, 0, UPDATE_DOWNLOAD_REQ, 1, 0, req_payload))
         LOGGER.info(
-            "update download request sent host={} port={} sha256={} waiting_for_first_chunk",
+            "update download request sent host={} port={} digest={} waiting_for_first_chunk",
             host,
             port,
             digest,
@@ -556,7 +605,7 @@ def download_update_package_tls(
                     last_idle_warn_at = now
                     LOGGER.warning(
                         "update download idle no data for {:.1f}s host={} port={} "
-                        "received={} total={} chunks={} sha256={} partial={}",
+                        "received={} total={} chunks={} digest={} partial={}",
                         idle_for,
                         host,
                         port,
@@ -588,7 +637,7 @@ def download_update_package_tls(
                     # select/pending said data may be ready, but a full MKCB frame did not arrive.
                     LOGGER.warning(
                         "update download packet read timeout host={} port={} received={} "
-                        "total={} chunks={} sha256={} error={}",
+                        "total={} chunks={} digest={} error={}",
                         host,
                         port,
                         received,
@@ -609,7 +658,7 @@ def download_update_package_tls(
                 except (OSError, EOFError, ssl.SSLError) as exc:
                     LOGGER.warning(
                         "update download socket error host={} port={} received={} total={} "
-                        "chunks={} sha256={} error={}",
+                        "chunks={} digest={} error={}",
                         host,
                         port,
                         received,
@@ -623,7 +672,7 @@ def download_update_package_tls(
                     document = decode(packet.payload)
                     message = str(document.get("message") or document.get("code") or "server_error")
                     LOGGER.warning(
-                        "update download server error host={} port={} sha256={} message={}",
+                        "update download server error host={} port={} digest={} message={}",
                         host,
                         port,
                         digest,
@@ -632,7 +681,7 @@ def download_update_package_tls(
                     raise RuntimeError(message)
                 if packet.packet_type != UPDATE_DOWNLOAD_RESP:
                     LOGGER.warning(
-                        "update download unexpected packet type=0x{:04x} host={} port={} sha256={}",
+                        "update download unexpected packet type=0x{:04x} host={} port={} digest={}",
                         packet.packet_type,
                         host,
                         port,
@@ -645,7 +694,7 @@ def download_update_package_tls(
                 error = str(document.get("error") or "").strip()
                 if error:
                     LOGGER.warning(
-                        "update download response error host={} port={} sha256={} error={}",
+                        "update download response error host={} port={} digest={} error={}",
                         host,
                         port,
                         digest,
@@ -654,7 +703,7 @@ def download_update_package_tls(
                     raise RuntimeError(error)
                 resp_sha = str(document.get("sha256") or "").lower()
                 if resp_sha and resp_sha != digest:
-                    raise RuntimeError("update download sha256 mismatch")
+                    raise RuntimeError("update download digest mismatch")
                 try:
                     offset = int(document.get("offset") or 0)
                     chunk_total = int(document.get("total_size") or 0)
@@ -663,7 +712,7 @@ def download_update_package_tls(
                 if total_size < 0 and chunk_total > 0:
                     total_size = chunk_total
                     LOGGER.info(
-                        "update download first chunk host={} port={} total_size={} sha256={}",
+                        "update download first chunk host={} port={} total_size={} digest={}",
                         host,
                         port,
                         total_size,
@@ -695,7 +744,7 @@ def download_update_package_tls(
                             elapsed = max(0.001, last_data_at - started_at)
                             LOGGER.info(
                                 "update download progress milestone={:.0f} %={:.1f} speed={} "
-                                "received={} total={} sha256={}",
+                                "received={} total={} digest={}",
                                 mark,
                                 pct,
                                 format_speed_mib_s(received / elapsed),
@@ -715,7 +764,7 @@ def download_update_package_tls(
         elapsed = max(0.001, time.monotonic() - started_at)
         LOGGER.info(
             "update package downloaded via TLS host={} port={} path={} bytes={} "
-            "chunks={} elapsed_s={:.2f} %={:.1f} speed={} sha256={}",
+            "chunks={} elapsed_s={:.2f} %={:.1f} speed={} digest={}",
             host,
             port,
             dest,
@@ -735,7 +784,7 @@ def download_update_package_tls(
             partial_size = None
         LOGGER.warning(
             "update download failed host={} port={} received={} total={} chunks={} "
-            "partial={} partial_bytes={} sha256={} error={}",
+            "partial={} partial_bytes={} digest={} error={}",
             host,
             port,
             received,

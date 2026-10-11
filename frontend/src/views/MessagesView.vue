@@ -10,9 +10,9 @@ import type { FormSubmitEvent } from '@primevue/forms'
 import MultiSelect from 'primevue/multiselect'
 import Select from 'primevue/select'
 import Tag from 'primevue/tag'
-import Textarea from 'primevue/textarea'
 import { useToast } from 'primevue/usetoast'
 import FilterableDataTable, { type FiltersModel, type FilterFieldDef } from '../components/FilterableDataTable.vue'
+import MessageRichEditor from '../components/MessageRichEditor.vue'
 import SafeInputNumber from '../components/SafeInputNumber.vue'
 import TargetClientsDialog from '../components/TargetClientsDialog.vue'
 import { useAdminStore } from '../stores/admin'
@@ -20,6 +20,7 @@ import { useSettingsStore } from '../stores/settings'
 import type { Message } from '../types'
 import { CustomFilterMatchMode, FilterMatchMode, ensureCustomFiltersRegistered, textFilter, emptyFilter } from '../utils/filters'
 import { displayDurationMs, formatDateTime, formatDisplayDurationMs, messagePreview } from '../utils/format'
+import { htmlToPlainText, looksLikeHtml, sanitizeMessageHtml } from '../utils/richtext'
 import {
   displayDurationLabel,
   displayPositionLabel,
@@ -44,6 +45,7 @@ const messagePreviewVisible = ref(false)
 const previewMessage = ref<Message | null>(null)
 
 const content = ref('')
+const richEditorRef = ref<InstanceType<typeof MessageRichEditor> | null>(null)
 const priority = ref(1024)
 const targetAll = ref(true)
 const selectedTargets = ref<string[]>([])
@@ -115,17 +117,17 @@ const effectiveSpeechRate = computed(() => {
 })
 
 const estimatedDisplayDurationHint = computed(() => {
-  const text = content.value.trim()
+  const plain = htmlToPlainText(content.value).trim() || content.value.replace(/<[^>]+>/g, '').trim()
   const ratio = effectiveMessageDisplayRatio.value
-  if (!text) return '输入内容后将实时估算客户端显示时长。'
+  if (!plain && !content.value.trim()) return '输入内容后将实时估算客户端显示时长。'
   if (ratio <= 0 && !ttsEnabled.value) return '预计显示：需手动关闭（显示比率为 0）。'
   if (ttsEnabled.value) {
     // Rough preview: ~250ms/char at rate 1.0, then +5s (mirrors client estimate_duration_ms + 5000).
-    const base = Math.max(1000, Math.trunc(text.length * 250 / effectiveSpeechRate.value))
+    const base = Math.max(1000, Math.trunc(plain.length * 250 / effectiveSpeechRate.value))
     const ms = Math.min(120_000, base + 5000)
     return `开启朗读：预计显示约 ${formatDisplayDurationMs(ms)}（TTS 估算 + 5s，语速 ${effectiveSpeechRate.value}）`
   }
-  const ms = displayDurationMs(text, ratio)
+  const ms = displayDurationMs(plain, ratio)
   return `预计显示约 ${formatDisplayDurationMs(ms)}（比率 ${ratio}）`
 })
 
@@ -193,7 +195,12 @@ function openMessagePreview(message: Message) {
 }
 
 async function sendMessage(event: FormSubmitEvent<Record<string, any>>) {
-  if (!event.valid || !event.values.content?.trim()) return
+  richEditorRef.value?.flushToModel()
+  const sanitized = sanitizeMessageHtml(content.value)
+  if (!event.valid || !sanitized.trim()) {
+    toast.add({ severity: 'warn', summary: '请输入消息内容', life: 2800 })
+    return
+  }
   const targetClientIDs = event.values.target_all
     ? []
     : (Array.isArray(event.values.target_client_ids) ? event.values.target_client_ids : [])
@@ -201,13 +208,14 @@ async function sendMessage(event: FormSubmitEvent<Record<string, any>>) {
     toast.add({ severity: 'warn', summary: '请选择至少一个目标客户端，或勾选全部客户端', life: 3200 })
     return
   }
+  const plain = htmlToPlainText(sanitized)
   admin.sending = true
   try {
     const response = await fetch('/api/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        content: event.values.content,
+        content: sanitized,
         priority: event.values.priority ?? 1024,
         target_client_ids: targetClientIDs,
         display_position: useDefaultMessagePosition.value ? null : messageDisplayPosition.value,
@@ -215,7 +223,7 @@ async function sendMessage(event: FormSubmitEvent<Record<string, any>>) {
         font_size: composeMessageFontSize(),
         speech_rate: useDefaultMessageSpeechRate.value ? null : messageSpeechRate.value,
         speech: event.values.tts_enabled
-          ? [{ type: 'text', value: event.values.content.trim() }]
+          ? [{ type: 'text', value: plain || sanitized.trim() }]
           : []
       })
     })
@@ -328,7 +336,13 @@ async function sendMessage(event: FormSubmitEvent<Record<string, any>>) {
   <Dialog v-model:visible="dialogVisible" modal closable :showHeader="true" :closeOnEscape="false" :draggable="false" position="center" class="app-dialog" :style="{ width: 'min(34rem, calc(100vw - 2rem))' }">
     <template #header><div class="send-dialog-header"><span>发送消息</span><small v-if="sendFormHint" class="form-hint">{{ sendFormHint }}</small></div></template>
     <Form class="form" :initialValues="{ content: '', priority: 1024, target_all: true, target_client_ids: [], tts_enabled: true }" @submit="sendMessage">
-      <label>内容<Textarea name="content" v-model="content" rows="5" autoResize /></label>
+      <!-- Do not wrap the rich editor in <label>: a label click activates the first
+           nested button (粗体/斜体), so focusing the surface would toggle formatting. -->
+      <div class="field">
+        <span class="field-label">内容</span>
+        <MessageRichEditor ref="richEditorRef" v-model="content" />
+        <input type="hidden" name="content" :value="content" />
+      </div>
       <label class="checkbox-label"><Checkbox name="tts_enabled" v-model="ttsEnabled" binary />朗读消息内容</label>
       <div class="form-row">
         <label class="checkbox-label"><Checkbox v-model="useDefaultMessageSpeechRate" binary :disabled="!ttsEnabled" />使用默认 TTS 语速</label>
@@ -394,7 +408,12 @@ async function sendMessage(event: FormSubmitEvent<Record<string, any>>) {
   </Dialog>
 
   <Dialog v-model:visible="messagePreviewVisible" modal closable :showHeader="true" :closeOnEscape="false" :draggable="false" position="center" header="消息内容" class="app-dialog" :style="{ width: 'min(46rem, calc(100vw - 2rem))' }">
-    <div class="message-preview-content">{{ previewMessage?.content || '' }}</div>
+    <div
+      v-if="previewMessage && looksLikeHtml(previewMessage.content)"
+      class="message-preview-content message-preview-html"
+      v-html="sanitizeMessageHtml(previewMessage.content)"
+    />
+    <div v-else class="message-preview-content">{{ previewMessage?.content || '' }}</div>
   </Dialog>
 
   <TargetClientsDialog

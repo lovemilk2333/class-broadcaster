@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"hash"
 	"database/sql"
 	"embed"
 	"encoding/base64"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
+	"lukechampine.com/blake3"
 	_ "modernc.org/sqlite"
 
 	"lovemilk-class-broadcaster/server/internal/broadcast"
@@ -194,7 +196,10 @@ func openServerPreferences(path string) (*serverPreferences, error) {
 		last_sha256 TEXT NOT NULL DEFAULT '',
 		last_component TEXT NOT NULL DEFAULT '',
 		last_version TEXT NOT NULL DEFAULT '',
-		updated_at INTEGER NOT NULL DEFAULT 0
+		updated_at INTEGER NOT NULL DEFAULT 0,
+		applied_seq INTEGER NOT NULL DEFAULT 0,
+		applied_digest TEXT NOT NULL DEFAULT '',
+		applied_at INTEGER NOT NULL DEFAULT 0
 	)`); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -216,6 +221,10 @@ func openServerPreferences(path string) (*serverPreferences, error) {
 		`ALTER TABLE update_records ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE update_records ADD COLUMN status_detail TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE update_records ADD COLUMN force INTEGER NOT NULL DEFAULT 0`,
+		// Per-client applied tracking: offer (last_*) must not count as completion.
+		`ALTER TABLE client_update_state ADD COLUMN applied_seq INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE client_update_state ADD COLUMN applied_digest TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE client_update_state ADD COLUMN applied_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			msg := strings.ToLower(err.Error())
@@ -224,6 +233,17 @@ func openServerPreferences(path string) (*serverPreferences, error) {
 			}
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate update_records: %w", err)
+		}
+	}
+	// Dev DBs that briefly used applied_sha256: copy into applied_digest when empty.
+	if _, err := db.Exec(`UPDATE client_update_state
+		SET applied_digest = applied_sha256
+		WHERE (applied_digest IS NULL OR applied_digest = '')
+		  AND applied_sha256 IS NOT NULL AND applied_sha256 != ''`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "no such column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate applied_digest: %w", err)
 		}
 	}
 	// Ensure status_detail is queryable even if a previous migration path was skipped.
@@ -517,7 +537,7 @@ func (p *serverPreferences) markClientUpdateOffered(clientID string, record upda
 	if p == nil || p.db == nil || clientID == "" || record.Seq == 0 {
 		return nil
 	}
-	// Per-client row upsert (PRIMARY KEY client_id); does not lock update_records.
+	// Diagnostics only: last_* records the last offered package. Catch-up uses applied_seq.
 	_, err := p.db.Exec(`INSERT INTO client_update_state(client_id, last_seq, last_sha256, last_component, last_version, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(client_id) DO UPDATE SET
@@ -531,18 +551,102 @@ func (p *serverPreferences) markClientUpdateOffered(clientID string, record upda
 	return err
 }
 
-func (p *serverPreferences) clientUpdateSeq(clientID string) uint64 {
+// clientUpdateAppliedSeq is the seq the client has reported as applied (UpdateApplied).
+// Catch-up must use this, not last_seq (which only records offers).
+func (p *serverPreferences) clientUpdateAppliedSeq(clientID string) uint64 {
 	if p == nil || p.db == nil || clientID == "" {
 		return 0
 	}
 	var seq int64
-	if err := p.db.QueryRow(`SELECT last_seq FROM client_update_state WHERE client_id = ?`, clientID).Scan(&seq); err != nil {
+	// COALESCE covers pre-migration rows if the column was just added with DEFAULT 0.
+	if err := p.db.QueryRow(`SELECT COALESCE(applied_seq, 0) FROM client_update_state WHERE client_id = ?`, clientID).Scan(&seq); err != nil {
 		return 0
 	}
 	if seq < 0 {
 		return 0
 	}
 	return uint64(seq)
+}
+
+// clientUpdateSeq returns the applied seq used for catch-up decisions.
+func (p *serverPreferences) clientUpdateSeq(clientID string) uint64 {
+	return p.clientUpdateAppliedSeq(clientID)
+}
+
+func (p *serverPreferences) clientAppliedDigest(clientID string) string {
+	if p == nil || p.db == nil || clientID == "" {
+		return ""
+	}
+	var digest string
+	if err := p.db.QueryRow(`SELECT COALESCE(applied_digest, '') FROM client_update_state WHERE client_id = ?`, clientID).Scan(&digest); err != nil {
+		return ""
+	}
+	digest = strings.ToLower(strings.TrimSpace(digest))
+	if digest != "" {
+		return digest
+	}
+	// Legacy column from a brief applied_sha256 name (dev DBs only).
+	if err := p.db.QueryRow(`SELECT COALESCE(applied_sha256, '') FROM client_update_state WHERE client_id = ?`, clientID).Scan(&digest); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(digest))
+}
+
+// markClientUpdateApplied records that the client applied a package (UpdateApplied).
+// Only advances applied_seq when the new seq is >= the current applied_seq.
+func (p *serverPreferences) markClientUpdateApplied(clientID, digest, version string, seq uint64) error {
+	if p == nil || p.db == nil || clientID == "" {
+		return nil
+	}
+	digest = strings.ToLower(strings.TrimSpace(digest))
+	if len(digest) != 64 {
+		return errors.New("invalid update digest")
+	}
+	version = strings.TrimSpace(version)
+	component := ""
+	recordSeq := seq
+	if _, record, err := p.packagePathBySHA(digest); err == nil {
+		if recordSeq == 0 {
+			recordSeq = record.Seq
+		}
+		if version == "" {
+			version = record.Version
+		}
+		component = record.Component
+	} else if recordSeq == 0 {
+		// Allow applied reports for digests no longer published (withdrawn/replaced);
+		// still require a positive seq from the client when the package is unknown.
+		return fmt.Errorf("unknown update digest: %w", err)
+	}
+	if recordSeq == 0 {
+		return errors.New("update applied report missing seq")
+	}
+	now := time.Now().UnixMilli()
+	current := p.clientUpdateAppliedSeq(clientID)
+	if recordSeq < current {
+		// Stale report: keep the higher applied_seq, but refresh digest metadata if empty.
+		_, err := p.db.Exec(`INSERT INTO client_update_state(client_id, applied_seq, applied_digest, applied_at, last_seq, last_sha256, last_component, last_version, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(client_id) DO UPDATE SET
+				applied_digest = CASE WHEN client_update_state.applied_digest = '' THEN excluded.applied_digest ELSE client_update_state.applied_digest END,
+				updated_at = excluded.updated_at`,
+			clientID, int64(current), digest, now, int64(current), digest, component, version, now)
+		return err
+	}
+	_, err := p.db.Exec(`INSERT INTO client_update_state(client_id, applied_seq, applied_digest, applied_at, last_seq, last_sha256, last_component, last_version, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(client_id) DO UPDATE SET
+			applied_seq = excluded.applied_seq,
+			applied_digest = excluded.applied_digest,
+			applied_at = excluded.applied_at,
+			last_seq = CASE WHEN excluded.last_seq >= client_update_state.last_seq THEN excluded.last_seq ELSE client_update_state.last_seq END,
+			last_sha256 = CASE WHEN excluded.last_seq >= client_update_state.last_seq THEN excluded.last_sha256 ELSE client_update_state.last_sha256 END,
+			last_component = CASE WHEN excluded.last_seq >= client_update_state.last_seq THEN excluded.last_component ELSE client_update_state.last_component END,
+			last_version = CASE WHEN excluded.last_seq >= client_update_state.last_seq THEN excluded.last_version ELSE client_update_state.last_version END,
+			updated_at = excluded.updated_at
+		WHERE excluded.applied_seq >= client_update_state.applied_seq`,
+		clientID, int64(recordSeq), digest, now, int64(recordSeq), digest, component, version, now)
+	return err
 }
 
 func (p *serverPreferences) packagePathBySHA(sha256Hex string) (string, updateRecord, error) {
@@ -1730,13 +1834,14 @@ func serveTLSConnection(ctx context.Context, raw net.Conn, serverIdentity identi
 		}
 		managementEvents.publish("devices")
 	}()
-	// Catch up any published update this client still needs: seq behind (including
-	// offline at publish time). Force and non-force share the same rule — never
-	// re-offer a package whose client_version the client already meets/exceeds.
+	// Catch up any published update this client still needs: applied_seq behind
+	// (including offline at publish time). Offering alone does not count as applied.
+	// Force and non-force share the same rule — never re-offer a package whose
+	// client_version the client already meets/exceeds (fallback for old clients).
 	// Offer the highest applicable seq so one reconnect can jump to the latest.
 	if preferences != nil {
 		if pending, ok := preferences.latestPublishedUpdateForClient(clientID, request.ClientVersion); ok {
-			priorSeq := preferences.clientUpdateSeq(clientID)
+			priorSeq := preferences.clientUpdateAppliedSeq(clientID)
 			metaInput := publishUpdateRequest{
 				Component: pending.Component, Components: append([]string(nil), pending.Components...),
 				Version: pending.Version, ClientVersion: pending.ClientVersion, UpdaterVersion: pending.UpdaterVersion,
@@ -1757,7 +1862,7 @@ func serveTLSConnection(ctx context.Context, raw net.Conn, serverIdentity identi
 						slog.Info("update catch-up sent",
 							"client_id", clientID,
 							"seq", pending.Seq,
-							"sha256", pending.SHA256,
+							"digest", pending.SHA256,
 							"version", pending.Version,
 							"force", pending.Force,
 							"client_version", request.ClientVersion,
@@ -1856,6 +1961,69 @@ func serveTLSConnection(ctx context.Context, raw net.Conn, serverIdentity identi
 			managementEvents.publish("devices")
 			// Client will close shortly; end the read loop.
 			return
+		} else if packet.Type == protocol.UpdateApplied {
+			var report struct {
+				SHA256  string `bson:"sha256"`
+				Version string `bson:"version"`
+				Seq     uint64 `bson:"seq"`
+			}
+			if protocol.UnmarshalBSON(packet.Payload, &report) != nil {
+				slog.Warn("update applied report malformed", "client_id", clientID)
+				continue
+			}
+			digest := strings.ToLower(strings.TrimSpace(report.SHA256))
+			if preferences == nil {
+				continue
+			}
+			if err := preferences.markClientUpdateApplied(clientID, digest, report.Version, report.Seq); err != nil {
+				slog.Warn("update applied report rejected",
+					"client_id", clientID,
+					"digest", digest,
+					"seq", report.Seq,
+					"error", err,
+				)
+				continue
+			}
+			slog.Info("update applied reported",
+				"client_id", clientID,
+				"digest", digest,
+				"version", strings.TrimSpace(report.Version),
+				"seq", preferences.clientUpdateAppliedSeq(clientID),
+				"client_ip", clientIP,
+			)
+			managementEvents.publish("updates")
+			managementEvents.publish("devices")
+		} else if packet.Type == protocol.ClientActivity {
+			var report struct {
+				State     string `bson:"state"`
+				MessageID string `bson:"message_id"`
+				Detail    string `bson:"detail"`
+				ElapsedMS int64  `bson:"elapsed_ms"`
+			}
+			if protocol.UnmarshalBSON(packet.Payload, &report) != nil {
+				slog.Warn("client activity report malformed", "client_id", clientID)
+				continue
+			}
+			state := strings.ToLower(strings.TrimSpace(report.State))
+			switch state {
+			case "processing", "idle", "":
+			default:
+				slog.Warn("client activity unknown state", "client_id", clientID, "state", state)
+				continue
+			}
+			prev := hub.Activity(clientID)
+			hub.SetActivity(clientID, session.ClientActivity{
+				State:     state,
+				MessageID: strings.TrimSpace(report.MessageID),
+				Detail:    strings.TrimSpace(report.Detail),
+				ElapsedMS: report.ElapsedMS,
+				UpdatedAt: time.Now().UnixMilli(),
+			})
+			// Only refresh the admin list when the visible state changes (or first processing tick).
+			changed := prev.State != state || (state == "processing" && prev.MessageID != strings.TrimSpace(report.MessageID))
+			if changed {
+				managementEvents.publish("devices")
+			}
 		}
 	}
 }
@@ -1884,150 +2052,178 @@ type messageAck struct {
 	Error     string `bson:"error,omitempty"`
 }
 
+// deliveryKick wakes dispatchMessages immediately after Create / approve so new
+// work does not wait up to one 250ms ticker interval (and so RetryAfter backoffs
+// cannot leave the admin UI looking "stuck" while the queue is idle).
+var deliveryKick = make(chan struct{}, 1)
+
+func kickDelivery() {
+	select {
+	case deliveryKick <- struct{}{}:
+	default:
+	}
+}
+
 func dispatchMessages(ctx context.Context, store *broadcast.Store, hub *session.Hub, configManager *config.Manager, registry *session.Registry) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	runOnce := func(now time.Time) {
+		if store.Expire(now) > 0 {
+			managementEvents.publish("messages")
+		}
+		ackTimeout := configManager.Current().AckTimeout
+		if ackTimeout <= 0 {
+			ackTimeout = config.DefaultAckTimeout
+		}
+		store.QueueDueRetries(now, ackTimeout)
+		// Drain several pending messages per wake so a kick after Create is not
+		// limited to a single Pop when the queue holds more than one item.
+		for i := 0; i < 32; i++ {
+			record := store.NextPending(now)
+			if record == nil {
+				return
+			}
+			dispatchOneMessage(store, hub, configManager, registry, record, now, ackTimeout)
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if store.Expire(now) > 0 {
-				managementEvents.publish("messages")
+			runOnce(now)
+		case <-deliveryKick:
+			runOnce(time.Now())
+		}
+	}
+}
+
+func dispatchOneMessage(store *broadcast.Store, hub *session.Hub, configManager *config.Manager, registry *session.Registry, record *broadcast.Record, now time.Time, ackTimeout time.Duration) {
+	if record == nil {
+		return
+	}
+	targets := make([]string, 0, len(record.TargetClients))
+	wildcard := false
+	for _, target := range record.TargetClients {
+		if target == "*" {
+			wildcard = true
+			continue
+		}
+		if target != "" {
+			targets = append(targets, target)
+		}
+	}
+	if wildcard {
+		for _, approved := range registry.ApprovedClientIDs() {
+			store.AddClientToBroadcasts(approved, now)
+			if !containsString(targets, approved) {
+				targets = append(targets, approved)
 			}
-			ackTimeout := configManager.Current().AckTimeout
-			if ackTimeout <= 0 {
-				ackTimeout = config.DefaultAckTimeout
+		}
+		// Refresh delivery map after expanding newly approved clients.
+		for _, item := range store.List(now) {
+			if item.Message.ID == record.Message.ID {
+				copy := item
+				record = &copy
+				break
 			}
-			store.QueueDueRetries(now, ackTimeout)
-			record := store.NextPending(now)
-			if record == nil {
+		}
+	}
+	if len(targets) == 0 {
+		_ = store.RetryAfter(record.Message.ID, now.Add(5*time.Second))
+		return
+	}
+	currentConfig := configManager.Current()
+	payload, err := protocol.MarshalBSON(messageEnvelope{
+		MessageID: record.Message.ID.String(), QueueSeq: record.Message.QueueSeq,
+		Priority: record.Message.Priority,
+		Content:  record.Message.DisplayText, CreatedAt: record.CreatedAt.UnixMilli(),
+		ExpiresAt: record.ExpiresAt.UnixMilli(), Speech: record.Message.Speech,
+		DisplayPosition:             record.Message.DisplayPosition,
+		DisplayDurationRatio:        record.Message.DisplayDurationRatio,
+		FontSize:                    record.Message.FontSize,
+		SpeechRate:                  record.Message.SpeechRate,
+		AsDefault:                   record.Message.AsDefault,
+		DefaultDisplayPosition:      currentConfig.DisplayPosition,
+		DefaultDisplayDurationRatio: currentConfig.DisplayDurationRatio,
+		DefaultSpeechRate:           currentConfig.SpeechRate,
+	})
+	if err != nil {
+		slog.Error("message envelope marshal failed", "message_id", record.Message.ID.String(), "error", err)
+		_ = store.Retry(record.Message.ID)
+		return
+	}
+	packet := protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.Message, 0, 0, payload)
+	messageChanged := false
+	offlinePending := 0
+	onlineFailed := 0
+	onlineNeeded := 0
+	onlineSent := 0
+	progressedClients := 0 // already past pending, or newly marked sent this round
+	for _, target := range targets {
+		status, hasStatus := record.Deliveries[target]
+		// 已经写入 sent/最终回执的目标无需在下一轮重复发送；只有 pending
+		// 目标在断线恢复后继续补投，避免离线重试造成重复弹窗。
+		if hasStatus && status != broadcast.DeliveryPending {
+			progressedClients++
+			if !store.ShouldRedeliver(record.Message.ID, target, now, ackTimeout) {
 				continue
 			}
-			targets := make([]string, 0, len(record.TargetClients))
-			wildcard := false
-			for _, target := range record.TargetClients {
-				if target == "*" {
-					wildcard = true
-					continue
-				}
-				if target != "" {
-					targets = append(targets, target)
-				}
-			}
-			if wildcard {
-				for _, approved := range registry.ApprovedClientIDs() {
-					store.AddClientToBroadcasts(approved, now)
-					if !containsString(targets, approved) {
-						targets = append(targets, approved)
-					}
-				}
-				// Refresh delivery map after expanding newly approved clients.
-				for _, item := range store.List(now) {
-					if item.Message.ID == record.Message.ID {
-						copy := item
-						record = &copy
-						break
-					}
-				}
-			}
-			if len(targets) == 0 {
-				_ = store.RetryAfter(record.Message.ID, now.Add(5*time.Second))
+		}
+		// Only attempt delivery on currently online TLS sessions.
+		// Offline targets stay pending and are retried later without hub.Send or WARN spam.
+		if !hub.Online(target) {
+			offlinePending++
+			continue
+		}
+		onlineNeeded++
+		if err := hub.Send(target, packet); err != nil {
+			// Race: session dropped between Online check and Send.
+			if errors.Is(err, session.ErrClientOffline) {
+				offlinePending++
+				onlineNeeded--
 				continue
 			}
-			currentConfig := configManager.Current()
-			payload, err := protocol.MarshalBSON(messageEnvelope{
-				MessageID: record.Message.ID.String(), QueueSeq: record.Message.QueueSeq,
-				Priority: record.Message.Priority,
-				Content:  record.Message.DisplayText, CreatedAt: record.CreatedAt.UnixMilli(),
-				ExpiresAt: record.ExpiresAt.UnixMilli(), Speech: record.Message.Speech,
-				DisplayPosition:             record.Message.DisplayPosition,
-				DisplayDurationRatio:        record.Message.DisplayDurationRatio,
-				FontSize:                    record.Message.FontSize,
-				SpeechRate:                  record.Message.SpeechRate,
-				AsDefault:                   record.Message.AsDefault,
-				DefaultDisplayPosition:      currentConfig.DisplayPosition,
-				DefaultDisplayDurationRatio: currentConfig.DisplayDurationRatio,
-				DefaultSpeechRate:           currentConfig.SpeechRate,
-			})
-			if err != nil {
-				slog.Error("message envelope marshal failed", "message_id", record.Message.ID.String(), "error", err)
-				_ = store.Retry(record.Message.ID)
-				continue
-			}
-			packet := protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.Message, 0, 0, payload)
-			messageChanged := false
-			offlinePending := 0
-			onlineFailed := 0
-			onlineNeeded := 0
-			onlineSent := 0
-			progressedClients := 0 // already past pending, or newly marked sent this round
-			for _, target := range targets {
-				status, hasStatus := record.Deliveries[target]
-				// 已经写入 sent/最终回执的目标无需在下一轮重复发送；只有 pending
-				// 目标在断线恢复后继续补投，避免离线重试造成重复弹窗。
-				if hasStatus && status != broadcast.DeliveryPending {
-					progressedClients++
-					if !store.ShouldRedeliver(record.Message.ID, target, now, ackTimeout) {
-						continue
-					}
-				}
-				// Only attempt delivery on currently online TLS sessions.
-				// Offline targets stay pending and are retried later without hub.Send or WARN spam.
-				if !hub.Online(target) {
-					offlinePending++
-					continue
-				}
-				onlineNeeded++
-				if err := hub.Send(target, packet); err != nil {
-					// Race: session dropped between Online check and Send.
-					if errors.Is(err, session.ErrClientOffline) {
-						offlinePending++
-						onlineNeeded--
-						continue
-					}
-					slog.Warn("message delivery failed", "message_id", record.Message.ID.String(), "client_id", target, "error", err)
-					onlineFailed++
-				} else {
-					prev := status
-					if !store.MarkSent(record.Message.ID, target, now) {
-						slog.Warn("message delivery bookkeeping failed", "message_id", record.Message.ID.String(), "client_id", target)
-						onlineFailed++
-					} else {
-						onlineSent++
-						progressedClients++
-						// Only count a real pending→sent transition as a UI-visible change.
-						// Re-sends after ack timeout must not spam SSE "messages" refresh.
-						if !hasStatus || prev == broadcast.DeliveryPending {
-							messageChanged = true
-						}
-					}
-				}
-			}
-			// Mark the message "sent" once every currently-online attempt succeeded
-			// and at least one client has progressed past pending. Remaining offline
-			// targets keep per-client pending rows and are retried later — do not
-			// leave the admin UI stuck on 待投递 forever when some peers are offline.
-			onlineOK := onlineFailed == 0 && onlineNeeded == onlineSent
-			if onlineOK && progressedClients > 0 {
-				if store.Complete(record.Message.ID, now) {
+			slog.Warn("message delivery failed", "message_id", record.Message.ID.String(), "client_id", target, "error", err)
+			onlineFailed++
+		} else {
+			prev := status
+			if !store.MarkSent(record.Message.ID, target, now) {
+				slog.Warn("message delivery bookkeeping failed", "message_id", record.Message.ID.String(), "client_id", target)
+				onlineFailed++
+			} else {
+				onlineSent++
+				progressedClients++
+				// Only count a real pending→sent transition as a UI-visible change.
+				// Re-sends after ack timeout must not spam SSE "messages" refresh.
+				if !hasStatus || prev == broadcast.DeliveryPending {
 					messageChanged = true
 				}
 			}
-			if !onlineOK || offlinePending > 0 {
-				// Back off when waiting on offline clients so the 250ms ticker does not busy-poll hub.Send.
-				delay := 5 * time.Second
-				if offlinePending > 0 && onlineNeeded == 0 {
-					delay = 15 * time.Second
-				}
-				_ = store.RetryAfter(record.Message.ID, now.Add(delay))
-			}
-			// Publish only when deliveries/status actually changed — offline retries
-			// with no new sends must not flood the management SSE stream.
-			if messageChanged {
-				managementEvents.publish("messages")
-			}
 		}
+	}
+	// Mark the message "sent" once every currently-online attempt succeeded
+	// and at least one client has progressed past pending. Remaining offline
+	// targets keep per-client pending rows and are retried later — do not
+	// leave the admin UI stuck on 待投递 forever when some peers are offline.
+	onlineOK := onlineFailed == 0 && onlineNeeded == onlineSent
+	if onlineOK && progressedClients > 0 {
+		if store.Complete(record.Message.ID, now) {
+			messageChanged = true
+		}
+	}
+	if !onlineOK || offlinePending > 0 {
+		// Back off when waiting on offline clients so the 250ms ticker does not busy-poll hub.Send.
+		delay := 5 * time.Second
+		if offlinePending > 0 && onlineNeeded == 0 {
+			delay = 15 * time.Second
+		}
+		_ = store.RetryAfter(record.Message.ID, now.Add(delay))
+	}
+	// Publish only when deliveries/status actually changed — offline retries
+	// with no new sends must not flood the management SSE stream.
+	if messageChanged {
+		managementEvents.publish("messages")
 	}
 }
 
@@ -2364,7 +2560,7 @@ func serveUpdateDownloadSession(
 	loggedMilestones := map[float64]bool{}
 	slog.Info("update download streaming start",
 		"client_id", clientID,
-		"sha256", claims.SHA256,
+		"digest", claims.SHA256,
 		"total_bytes", total,
 		"chunk_size", protocol.UpdateDownloadChunkSize,
 		"client_ip", clientIP,
@@ -2375,7 +2571,7 @@ func serveUpdateDownloadSession(
 		case <-ctx.Done():
 			slog.Warn("update download cancelled",
 				"client_id", clientID,
-				"sha256", claims.SHA256,
+				"digest", claims.SHA256,
 				"offset", offset,
 				"total_bytes", total,
 				"chunks", chunks,
@@ -2428,7 +2624,7 @@ func serveUpdateDownloadSession(
 					// Only >0% / 25% / 50% / 75% / >99% — never per-chunk spam.
 					slog.Info("update download progress",
 						"client_id", clientID,
-						"sha256", claims.SHA256,
+						"digest", claims.SHA256,
 						"milestone", mark,
 						"offset", offset,
 						"total_bytes", total,
@@ -2460,7 +2656,7 @@ func serveUpdateDownloadSession(
 			}
 			slog.Info("update download completed",
 				"client_id", clientID,
-				"sha256", claims.SHA256,
+				"digest", claims.SHA256,
 				"bytes", offset,
 				"chunks", chunks,
 				"elapsed_s", elapsed,
@@ -2511,7 +2707,12 @@ type updatePackageMetadata struct {
 	UpdaterVersion string   `json:"updater_version"`
 	Platform       string   `json:"platform"`
 	PayloadFormat  string   `json:"payload_format"`
-	SHA256         string   `json:"sha256"`
+	// Blake3 is the files-v1 digest for new packages (packaging writes only this).
+	Blake3 string `json:"blake3,omitempty"`
+	// SHA256 is present on legacy packages only (real SHA-256 of the sha256-keyed
+	// manifest). Publish maps packageContentDigest into the API/DB field still
+	// named sha256 for download paths and UPDATE_AVAILABLE.
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // normalizeUpdateComponents returns the canonical list (updater before client).
@@ -2566,23 +2767,27 @@ func normalizeUpdateComponents(components []string, legacy string) ([]string, st
 }
 
 type updateManifestEntry struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-	Size   int    `json:"size"`
+	Path   string
+	Digest string // blake3 or sha256 hex of file contents
+	Size   int
 }
 
-// marshalFilesV1Manifest builds the canonical files-v1 JSON used for metadata.sha256.
-// Matches scripts/package_update.py, client/core/updater.py and updater/main.go:
-// compact UTF-8 array, entries sorted by path string, object keys sorted (path, sha256, size).
-func marshalFilesV1Manifest(entries []updateManifestEntry) ([]byte, error) {
+// marshalFilesV1Manifest builds the canonical files-v1 JSON.
+// New packages use key "blake3"; legacy packages use "sha256".
+// compact UTF-8 array, entries sorted by path string, object keys sorted.
+func marshalFilesV1Manifest(entries []updateManifestEntry, useBlake3 bool) ([]byte, error) {
 	sorted := append([]updateManifestEntry(nil), entries...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	digestKey := "sha256"
+	if useBlake3 {
+		digestKey = "blake3"
+	}
 	canonical := make([]map[string]interface{}, 0, len(sorted))
 	for _, entry := range sorted {
 		canonical = append(canonical, map[string]interface{}{
-			"path":   entry.Path,
-			"sha256": entry.SHA256,
-			"size":   entry.Size,
+			"path":    entry.Path,
+			digestKey: entry.Digest,
+			"size":    entry.Size,
 		})
 	}
 	return json.Marshal(canonical)
@@ -2696,18 +2901,44 @@ func sniffUpdateMagic(path string) ([4]byte, error) {
 	return magic, nil
 }
 
-func hashFileSHA256(path string) (string, int64, error) {
+func hashFileWith(path string, newHash func() hash.Hash) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
 	defer file.Close()
-	digest := sha256.New()
+	digest := newHash()
 	written, err := io.Copy(digest, file)
 	if err != nil {
 		return "", 0, err
 	}
 	return hex.EncodeToString(digest.Sum(nil)), written, nil
+}
+
+func hashFileSHA256(path string) (string, int64, error) {
+	return hashFileWith(path, sha256.New)
+}
+
+func hashFileBlake3(path string) (string, int64, error) {
+	return hashFileWith(path, func() hash.Hash { return blake3.New(32, nil) })
+}
+
+func digestManifest(manifest []byte, useBlake3 bool) string {
+	if useBlake3 {
+		sum := blake3.Sum256(manifest)
+		return hex.EncodeToString(sum[:])
+	}
+	sum := sha256.Sum256(manifest)
+	return hex.EncodeToString(sum[:])
+}
+
+// packageContentDigest returns the authoritative 64-hex identity from metadata
+// (prefer blake3, fall back to sha256 for legacy packages).
+func packageContentDigest(metadata updatePackageMetadata) string {
+	if d := strings.ToLower(strings.TrimSpace(metadata.Blake3)); d != "" {
+		return d
+	}
+	return strings.ToLower(strings.TrimSpace(metadata.SHA256))
 }
 
 // metadataFromUpdatePackage reads only metadata.json from a .tar.zst without hashing payload files.
@@ -2788,17 +3019,23 @@ func publishRequestFromPackageMetadata(metadata updatePackageMetadata) (publishU
 	if hasUpdater && metadata.UpdaterVersion == "" {
 		metadata.UpdaterVersion = metadata.Version
 	}
-	if metadata.SHA256 == "" {
-		return publishUpdateRequest{}, errors.New("update metadata sha256 is required")
+	digest := packageContentDigest(metadata)
+	if digest == "" {
+		return publishUpdateRequest{}, errors.New("update metadata blake3/sha256 is required")
+	}
+	if len(digest) != 64 {
+		return publishUpdateRequest{}, errors.New("update metadata digest is invalid")
 	}
 	return publishUpdateRequest{
 		Component: primary, Components: components, Version: metadata.Version, ClientVersion: metadata.ClientVersion,
 		UpdaterVersion: metadata.UpdaterVersion, Platform: metadata.Platform, PayloadFormat: metadata.PayloadFormat,
-		SHA256: strings.ToLower(metadata.SHA256),
+		// API/DB continue to expose the field as sha256 (64-hex package identity).
+		SHA256: digest,
 	}, nil
 }
 
-// verifyUpdatePackageFile fully extracts a .tar.zst and checks files-v1 manifest SHA-256.
+// verifyUpdatePackageFile fully extracts a .tar.zst and checks files-v1 manifest digest.
+// Prefer BLAKE3 when metadata.blake3 is set; otherwise verify legacy SHA-256 packages.
 func verifyUpdatePackageFile(packagePath, workDir string) error {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return err
@@ -2833,7 +3070,11 @@ func verifyUpdatePackageFile(packagePath, workDir string) error {
 
 	var metadata updatePackageMetadata
 	var metadataFound bool
-	manifestEntries := make([]updateManifestEntry, 0, len(members))
+	type pendingMember struct {
+		name     string
+		diskPath string
+	}
+	pending := make([]pendingMember, 0, len(members))
 	seen := make(map[string]struct{}, len(members))
 	for _, member := range members {
 		name := normalizeUpdateMemberPath(member.name)
@@ -2864,11 +3105,7 @@ func verifyUpdatePackageFile(packagePath, workDir string) error {
 			return fmt.Errorf("duplicate update archive path: %s", name)
 		}
 		seen[name] = struct{}{}
-		digestHex, size, hashErr := hashFileSHA256(member.diskPath)
-		if hashErr != nil {
-			return hashErr
-		}
-		manifestEntries = append(manifestEntries, updateManifestEntry{Path: name, SHA256: digestHex, Size: int(size)})
+		pending = append(pending, pendingMember{name: name, diskPath: member.diskPath})
 	}
 	if !metadataFound {
 		return errors.New("update archive metadata.json is missing")
@@ -2876,17 +3113,34 @@ func verifyUpdatePackageFile(packagePath, workDir string) error {
 	if _, err := publishRequestFromPackageMetadata(metadata); err != nil {
 		return err
 	}
-	manifest, err := marshalFilesV1Manifest(manifestEntries)
+	useBlake3 := strings.TrimSpace(metadata.Blake3) != ""
+	hashFn := hashFileSHA256
+	if useBlake3 {
+		hashFn = hashFileBlake3
+	}
+	manifestEntries := make([]updateManifestEntry, 0, len(pending))
+	for _, member := range pending {
+		digestHex, size, hashErr := hashFn(member.diskPath)
+		if hashErr != nil {
+			return hashErr
+		}
+		manifestEntries = append(manifestEntries, updateManifestEntry{Path: member.name, Digest: digestHex, Size: int(size)})
+	}
+	manifest, err := marshalFilesV1Manifest(manifestEntries, useBlake3)
 	if err != nil {
 		return err
 	}
-	manifestDigest := sha256.Sum256(manifest)
-	computedSHA := hex.EncodeToString(manifestDigest[:])
-	if metadata.SHA256 == "" {
-		return errors.New("update metadata sha256 is required")
+	computed := digestManifest(manifest, useBlake3)
+	expected := packageContentDigest(metadata)
+	if expected == "" {
+		return errors.New("update metadata blake3/sha256 is required")
 	}
-	if !strings.EqualFold(metadata.SHA256, computedSHA) {
-		return fmt.Errorf("update metadata sha256 does not match package contents (expected %s, got %s)", strings.ToLower(metadata.SHA256), computedSHA)
+	if !strings.EqualFold(expected, computed) {
+		algo := "sha256"
+		if useBlake3 {
+			algo = "blake3"
+		}
+		return fmt.Errorf("update metadata %s does not match package contents (expected %s, got %s)", algo, expected, computed)
 	}
 	return nil
 }
@@ -3107,10 +3361,11 @@ func clientVersionBehind(reported, target string) bool {
 }
 
 // latestPublishedUpdateForClient returns the highest-seq published update that
-// this client still needs (seq behind the effective last applied/offered seq).
-// Force and non-force share the same catch-up rule: never re-offer a package
-// whose client_version the client already meets or exceeds (prevents force
-// restart loops when overlay did not change version.json / version stayed put).
+// this client still needs (seq behind applied_seq from UpdateApplied reports).
+// Offering UPDATE_AVAILABLE alone does not advance applied_seq. Force and
+// non-force share the same catch-up rule: never re-offer a package whose
+// client_version the client already meets or exceeds (fallback for old clients
+// without UpdateApplied; prevents force restart loops).
 func (p *serverPreferences) latestPublishedUpdateForClient(clientID, reportedClientVersion string) (updateRecord, bool) {
 	if p == nil || p.db == nil || clientID == "" {
 		return updateRecord{}, false
@@ -3119,11 +3374,10 @@ func (p *serverPreferences) latestPublishedUpdateForClient(clientID, reportedCli
 	if err != nil {
 		return updateRecord{}, false
 	}
-	lastSeq := p.clientUpdateSeq(clientID)
-	// If the client already reports a published package's client_version (or newer),
-	// treat the highest such seq as applied so older packages cannot roll back and
-	// force packages cannot loop after a successful overlay that left the version
-	// string unchanged relative to a republished force of the same version.
+	lastSeq := p.clientUpdateAppliedSeq(clientID)
+	// Fallback for clients that never send UpdateApplied: if handshake
+	// client_version already meets a published package, treat that seq as
+	// applied so older packages cannot roll back and force cannot loop.
 	if reportedClientVersion != "" {
 		for _, item := range items {
 			if item.Status != "published" || item.ClientVersion == "" || item.Seq == 0 {
@@ -3208,6 +3462,16 @@ type deviceResponse struct {
 	SessionEndLabel     string `json:"session_end_label,omitempty"`
 	SessionEndAt        int64  `json:"session_end_at,omitempty"`
 	SessionEndDetail    string `json:"session_end_detail,omitempty"`
+	// ActivityState is an ephemeral online hint from ClientActivity (e.g. processing).
+	ActivityState     string `json:"activity_state,omitempty"`
+	ActivityMessageID string `json:"activity_message_id,omitempty"`
+	ActivityDetail    string `json:"activity_detail,omitempty"`
+	ActivityElapsedMS int64  `json:"activity_elapsed_ms,omitempty"`
+	ActivityStartedAt int64  `json:"activity_started_at,omitempty"`
+	// AppliedDigest is the last package digest the client reported via UpdateApplied
+	// (BLAKE3 for new packages; legacy packages may still be SHA-256).
+	AppliedDigest string `json:"applied_digest,omitempty"`
+	AppliedSeq    uint64 `json:"applied_seq,omitempty"`
 }
 
 type configUpdateRequest struct {
@@ -3498,14 +3762,35 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 		for _, device := range items {
 			online := hub.Online(device.ClientID)
 			reason, label := session.SessionEndDisplay(device, online, now)
-			response = append(response, deviceResponse{
+			item := deviceResponse{
 				Device:           device,
 				Online:           online,
 				SessionEndReason: reason,
 				SessionEndLabel:  label,
 				SessionEndAt:     device.SessionEndAt,
 				SessionEndDetail: device.SessionEndDetail,
-			})
+			}
+			if online {
+				if activity := hub.Activity(device.ClientID); activity.State == "processing" {
+					item.ActivityState = activity.State
+					item.ActivityMessageID = activity.MessageID
+					item.ActivityDetail = activity.Detail
+					item.ActivityStartedAt = activity.StartedAt
+					elapsed := activity.ElapsedMS
+					if activity.StartedAt > 0 {
+						elapsed = now.UnixMilli() - activity.StartedAt
+						if elapsed < 0 {
+							elapsed = 0
+						}
+					}
+					item.ActivityElapsedMS = elapsed
+				}
+			}
+			if preferences != nil {
+				item.AppliedDigest = preferences.clientAppliedDigest(device.ClientID)
+				item.AppliedSeq = preferences.clientUpdateAppliedSeq(device.ClientID)
+			}
+			response = append(response, item)
 		}
 		c.JSON(http.StatusOK, gin.H{"items": response})
 	})
@@ -3539,8 +3824,8 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			packet := protocol.New(protocol.ProtocolMajor, protocol.ProtocolMinor, protocol.UpdateAvailable, 0, 0, payload)
 			if sendErr := hub.Send(id, packet); sendErr != nil {
 				offline = append(offline, id)
-				// Do not mark offered while offline: connect catch-up uses last_seq < update.seq
-				// for both force and non-force publishes.
+				// Do not mark offered while offline. Catch-up uses applied_seq (UpdateApplied),
+				// not offer tracking; offer is diagnostics-only for online sends.
 				continue
 			}
 			if preferences != nil {
@@ -3829,6 +4114,7 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			device, _ = registry.Get(input.ClientID)
 		}
 		if store.AddClientToBroadcasts(device.ClientID, time.Now()) > 0 {
+			kickDelivery()
 			managementEvents.publish("messages")
 		}
 		managementEvents.publish("devices")
@@ -4035,6 +4321,7 @@ func newRouterWithDependencies(store *broadcast.Store, registry *session.Registr
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		kickDelivery()
 		managementEvents.publish("messages")
 		c.JSON(http.StatusCreated, toMessageResponse(record))
 	})

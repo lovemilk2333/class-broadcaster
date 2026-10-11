@@ -287,7 +287,17 @@ defineExpose({ flushToModel, focusEditor })
       <Button type="button" label="斜体" icon="pi pi-italic" text size="small" @click="exec('italic')" />
       <Button type="button" label="下划线" icon="pi pi-underline" text size="small" @click="exec('underline')" />
       <Button type="button" label="换行" icon="pi pi-arrow-down-left" text size="small" @click="exec('insertHTML', '<br />')" />
-      <Button type="button" label="插入图片" icon="pi pi-image" text size="small" @click="openImagePicker" />
+      <Button
+        type="button"
+        label="插入图片"
+        icon="pi pi-image"
+        text
+        size="small"
+        class="message-rich-image-btn"
+        title="实验性功能：消息内嵌图片"
+        aria-label="插入图片 beta"
+        @click="openImagePicker"
+      />
       <input
         ref="fileInputRef"
         type="file"

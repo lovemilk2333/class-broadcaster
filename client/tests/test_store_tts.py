@@ -251,31 +251,54 @@ class StoreAndTtsTest(unittest.TestCase):
         entry.ready.set()
         self.assertTrue(entry.ready.wait(0.01))
 
+    def tearDown(self):
+        StateStore.clear_registry()
+
     def test_engine_preference_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
-            preference = EnginePreference(Path(directory) / "tts.json")
+            data_dir = Path(directory)
+            preference = EnginePreference(data_dir)
             self.assertIsNone(preference.load())
             preference.save("piper")
             self.assertEqual(preference.load(), "piper")
-            # saved_at must be present for TTL tracking.
-            raw = json.loads((Path(directory) / "tts.json").read_text(encoding="utf-8"))
-            self.assertIn("saved_at", raw)
-            self.assertIsInstance(raw["saved_at"], (int, float))
+            # Persisted under state.json tts key.
+            raw = json.loads((data_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw["tts"]["engine"], "piper")
+            self.assertIsInstance(raw["tts"]["saved_at"], (int, float))
 
     def test_engine_preference_expires_after_ttl(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "tts-engine.json"
-            preference = EnginePreference(path, ttl_seconds=24 * 60 * 60)
+            data_dir = Path(directory)
+            store = StateStore.for_data_dir(data_dir)
+            preference = EnginePreference(store, ttl_seconds=24 * 60 * 60)
             preference.save("piper")
             self.assertEqual(preference.load(), "piper")
-            # Age the stamp past 24h.
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            raw["saved_at"] = time.time() - (24 * 60 * 60 + 1)
-            path.write_text(json.dumps(raw), encoding="utf-8")
+            # Age the stamp past 24h via state.json.
+            store.set_tts_engine_preference(
+                "piper", saved_at=time.time() - (24 * 60 * 60 + 1)
+            )
             self.assertIsNone(preference.load())
-            # Legacy file without saved_at also expires (force re-probe).
-            path.write_text(json.dumps({"engine": "sapi5-zh"}), encoding="utf-8")
+            # Missing saved_at also expires (force re-probe).
+            store.clear_tts_engine_preference()
+            # Manually plant engine without saved_at.
+            with store._lock:
+                store._state["tts"] = {"engine": "sapi5-zh", "saved_at": None}
+                store._commit_locked()
             self.assertIsNone(preference.load())
+
+    def test_legacy_tts_engine_file_migrates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            legacy = data_dir / "tts-engine.json"
+            legacy.write_text(
+                json.dumps({"engine": "piper", "saved_at": time.time()}, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            preference = EnginePreference(data_dir)
+            self.assertEqual(preference.load(), "piper")
+            self.assertFalse(legacy.exists())
+            raw = json.loads((data_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw["tts"]["engine"], "piper")
 
     def test_single_instance_lock_is_exclusive_and_reusable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -328,7 +351,7 @@ class StoreAndTtsTest(unittest.TestCase):
                 raise AssertionError("SAPI must not win when Piper is available")
 
         with tempfile.TemporaryDirectory() as directory:
-            preference = EnginePreference(Path(directory) / "tts-engine.json")
+            preference = EnginePreference(Path(directory))
             preference.save("sapi5-zh")
             piper = FakePiper()
             chosen = speak_with_fallback(

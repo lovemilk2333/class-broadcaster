@@ -325,37 +325,20 @@ def note_vc_redist_prompt(reason: str) -> None:
     _pending_vc_redist_prompt_reason = str(reason or "piper-tts native import failed")
 
 
-def _vc_redist_prompt_path(data_dir: Path) -> Path:
-    return Path(data_dir) / "vc-redist-prompt.json"
-
-
 def is_vc_redist_prompt_dismissed(data_dir: Path) -> bool:
     """True when the user already answered the one-time VC++ download prompt."""
-    path = _vc_redist_prompt_path(data_dir)
-    try:
-        if not path.is_file():
-            return False
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return bool(isinstance(payload, dict) and payload.get("dismissed"))
-    except (OSError, ValueError, TypeError):
-        return False
+    from .store import StateStore
+
+    return StateStore.for_data_dir(data_dir).vc_redist_prompt_dismissed()
 
 
 def mark_vc_redist_prompt_dismissed(data_dir: Path, *, opened_download: bool = False) -> None:
     """Persist that the automatic VC++ prompt must not show again on this machine."""
-    path = _vc_redist_prompt_path(data_dir)
+    from .store import StateStore
+
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "dismissed": True,
-                    "dismissed_at": time.time(),
-                    "opened_download": bool(opened_download),
-                },
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
+        StateStore.for_data_dir(data_dir).mark_vc_redist_prompt_dismissed(
+            opened_download=opened_download
         )
     except OSError as exc:
         LOGGER.warning("could not persist VC++ prompt dismissal error={}", exc)
@@ -1246,7 +1229,7 @@ def _subprocess_import_ok(module_name: str, *, timeout: float = 45.0) -> tuple[b
 class PiperLibraryEngine:
     """Preferred TTS: classic ``piper-tts`` with zh_CN-huayan + en_US-lessac.
 
-    Engine name stays ``piper`` so existing ``tts-engine.json`` preferences keep
+    Engine name stays ``piper`` so existing ``state.json`` ``tts.engine`` preferences keep
     working. On Windows, synthesize runs in a child process to isolate
     onnxruntime ACCESS_VIOLATION from the tray UI.
     """
@@ -1414,44 +1397,52 @@ ENGINE_PREFERENCE_TTL_SECONDS = 24 * 60 * 60
 
 
 class EnginePreference:
-    """Remember the last working engine for up to 24h, then re-probe."""
+    """Remember the last working engine for up to 24h, then re-probe.
+
+    Persistence is ``state.json`` ``tts`` key via ``StateStore``. The constructor
+    accepts either a ``StateStore``, a ``data_dir``, or a legacy file path
+    (``…/tts-engine.json`` / ``…/tts.json``) whose parent is treated as data_dir.
+    """
 
     def __init__(
         self,
-        path: Union[str, Path],
+        store_or_path: Union[str, Path, Any],
         *,
         ttl_seconds: int = ENGINE_PREFERENCE_TTL_SECONDS,
     ) -> None:
-        self.path = Path(path)
+        from .store import StateStore
+
         self.ttl_seconds = max(0, int(ttl_seconds))
+        if isinstance(store_or_path, StateStore):
+            self._store = store_or_path
+        else:
+            path = Path(store_or_path)
+            # Legacy call sites passed …/tts-engine.json; treat parent as data_dir.
+            if path.name in ("tts-engine.json", "tts.json", "state.json"):
+                data_dir = path.parent
+            else:
+                data_dir = path
+            self._store = StateStore.for_data_dir(data_dir)
+        # Kept for tests that still inspect .path (points at unified state.json).
+        self.path = self._store.path
 
     def load(self) -> Optional[str]:
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(value, dict):
-                return None
-            engine = value.get("engine")
-            if not engine:
-                return None
-            name = str(engine)
-            # Legacy files without saved_at: treat as expired so we re-probe.
-            saved_at = value.get("saved_at")
-            if saved_at is None:
-                return None
-            try:
-                age = time.time() - float(saved_at)
-            except (TypeError, ValueError):
-                return None
-            if self.ttl_seconds > 0 and age > self.ttl_seconds:
-                return None
-            return name
-        except (OSError, ValueError, KeyError, TypeError):
+        engine, saved_at = self._store.tts_engine_preference()
+        if not engine:
             return None
+        # Legacy / missing saved_at: treat as expired so we re-probe.
+        if saved_at is None:
+            return None
+        try:
+            age = time.time() - float(saved_at)
+        except (TypeError, ValueError):
+            return None
+        if self.ttl_seconds > 0 and age > self.ttl_seconds:
+            return None
+        return engine
 
     def save(self, engine: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"engine": engine, "saved_at": time.time()}
-        self.path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        self._store.set_tts_engine_preference(engine)
 
 
 def choose_engine(engines: List[Engine], preference: Optional[EnginePreference] = None) -> Engine:

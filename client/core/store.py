@@ -1,4 +1,9 @@
-"""Atomic storage for the trusted server and current config snapshot ID."""
+"""Unified atomic client persistence in ``data/state.json``.
+
+All durable local prefs live here under distinct keys (servers, TTS, applied
+updates, VC++ prompt, log trim threshold, updater log offset, …). Legacy
+sidecar files are migrated once on load and then removed.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +11,10 @@ import json
 import base64
 import os
 import tempfile
+import time
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Iterable, Optional, Union
 from loguru import logger
 
 
@@ -16,9 +22,37 @@ def _b64(value: bytes) -> str:
     return base64.b64encode(value).decode("ascii")
 
 
+_REGISTRY_LOCK = RLock()
+_REGISTRY: dict[str, "StateStore"] = {}
+
+_MAX_APPLIED_DIGESTS = 64
+
+
+def _normalize_digest(digest: object) -> str:
+    value = str(digest or "").strip().lower()
+    if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+        return ""
+    return value
+
+
+def _normalize_digest_list(items: object) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        digest = _normalize_digest(item)
+        if not digest or digest in seen:
+            continue
+        seen.add(digest)
+        ordered.append(digest)
+    return ordered
+
+
 class StateStore:
     def __init__(self, path: Union[str, os.PathLike]) -> None:
         self.path = Path(path)
+        self.data_dir = self.path.parent
         self._lock = RLock()
         self._state: dict[str, Any] = self._empty_state()
         self.load()
@@ -29,8 +63,29 @@ class StateStore:
     MIN_MESSAGE_FONT_SIZE = 16
     MAX_MESSAGE_FONT_SIZE = 120
 
+    @classmethod
+    def for_data_dir(cls, data_dir: Union[str, os.PathLike]) -> "StateStore":
+        """Return the shared store for ``data_dir`` (one instance per absolute path)."""
+        root = Path(data_dir).resolve()
+        key = str(root)
+        with _REGISTRY_LOCK:
+            existing = _REGISTRY.get(key)
+            if existing is not None:
+                return existing
+            store = cls(root / "state.json")
+            _REGISTRY[key] = store
+            return store
+
+    @classmethod
+    def clear_registry(cls) -> None:
+        """Drop cached instances (tests only)."""
+        with _REGISTRY_LOCK:
+            _REGISTRY.clear()
+
     @staticmethod
     def _empty_state() -> dict[str, Any]:
+        from .client_log import DEFAULT_LOG_MAX_BYTES
+
         return {
             "version": 1,
             "server": None,
@@ -40,6 +95,20 @@ class StateStore:
             "listener_port": 39004,
             # False until first launch applies the Windows default Run entry.
             "autostart_default_applied": False,
+            # Local client.log trim threshold (bytes); default 2 MiB.
+            "log_max_bytes": DEFAULT_LOG_MAX_BYTES,
+            # Soft TTS engine preference (24h TTL enforced by EnginePreference).
+            "tts": {"engine": None, "saved_at": None},
+            # Applied package digests + pending UpdateApplied reports.
+            "applied_updates": {"digests": [], "pending_report": []},
+            # One-shot Windows VC++ redistributable prompt.
+            "vc_redist_prompt": {
+                "dismissed": False,
+                "dismissed_at": None,
+                "opened_download": False,
+            },
+            # Byte offset into data/updater.log for ClientLog upload.
+            "updater_log_offset": 0,
         }
 
     @classmethod
@@ -97,10 +166,227 @@ class StateStore:
             self._state["autostart_default_applied"] = bool(
                 self._state.get("autostart_default_applied", False)
             )
+            from .client_log import DEFAULT_LOG_MAX_BYTES, clamp_log_max_bytes
+
+            self._state["log_max_bytes"] = clamp_log_max_bytes(
+                self._state.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES),
+                default=DEFAULT_LOG_MAX_BYTES,
+            )
             # Font family/size are admin-pushed only; drop any legacy local prefs.
             self._state.pop("message_font_family", None)
             self._state.pop("message_font_size", None)
+            self._normalize_unified_keys_locked()
+            migrated = self._migrate_legacy_sidecars_locked()
+            if migrated:
+                self._commit_locked()
             return self.snapshot()
+
+    def _normalize_unified_keys_locked(self) -> None:
+        """Ensure nested preference keys exist and have a safe shape."""
+        tts = self._state.get("tts")
+        if not isinstance(tts, dict):
+            tts = {}
+        engine = tts.get("engine")
+        saved_at = tts.get("saved_at")
+        try:
+            saved_at_value = float(saved_at) if saved_at is not None else None
+        except (TypeError, ValueError):
+            saved_at_value = None
+        self._state["tts"] = {
+            "engine": str(engine) if engine else None,
+            "saved_at": saved_at_value,
+        }
+
+        applied = self._state.get("applied_updates")
+        if not isinstance(applied, dict):
+            applied = {}
+        digests = _normalize_digest_list(
+            applied.get("digests") or applied.get("sha256") or []
+        )
+        pending = _normalize_digest_list(applied.get("pending_report") or [])
+        applied_set = set(digests)
+        pending = [item for item in pending if item in applied_set]
+        self._state["applied_updates"] = {
+            "digests": digests,
+            "pending_report": pending,
+        }
+
+        prompt = self._state.get("vc_redist_prompt")
+        if not isinstance(prompt, dict):
+            prompt = {}
+        try:
+            dismissed_at = (
+                float(prompt["dismissed_at"])
+                if prompt.get("dismissed_at") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            dismissed_at = None
+        self._state["vc_redist_prompt"] = {
+            "dismissed": bool(prompt.get("dismissed")),
+            "dismissed_at": dismissed_at,
+            "opened_download": bool(prompt.get("opened_download")),
+        }
+
+        try:
+            offset = int(self._state.get("updater_log_offset", 0) or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        self._state["updater_log_offset"] = offset if offset >= 0 else 0
+
+    def _migrate_legacy_sidecars_locked(self) -> bool:
+        """Fold legacy JSON/offset files into state.json; delete them on success."""
+        changed = False
+        data_dir = self.data_dir
+
+        # --- applied_updates.json ---
+        applied_path = data_dir / "applied_updates.json"
+        if applied_path.is_file():
+            try:
+                raw = json.loads(applied_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raw = None
+            if isinstance(raw, list):
+                digests = _normalize_digest_list(raw)
+                pending: list[str] = []
+            elif isinstance(raw, dict):
+                digests = _normalize_digest_list(
+                    raw.get("digests") or raw.get("sha256") or []
+                )
+                pending = _normalize_digest_list(raw.get("pending_report") or [])
+                applied_set = set(digests)
+                pending = [item for item in pending if item in applied_set]
+            else:
+                digests, pending = [], []
+            current = self._state.get("applied_updates")
+            if not isinstance(current, dict):
+                current = {"digests": [], "pending_report": []}
+            cur_digests = _normalize_digest_list(current.get("digests"))
+            cur_pending = _normalize_digest_list(current.get("pending_report"))
+            if not cur_digests and digests:
+                self._state["applied_updates"] = {
+                    "digests": digests,
+                    "pending_report": pending,
+                }
+                changed = True
+            elif digests or pending:
+                # Merge: prefer existing state, append missing from sidecar.
+                merged = list(cur_digests)
+                seen = set(merged)
+                for item in digests:
+                    if item not in seen:
+                        merged.append(item)
+                        seen.add(item)
+                merged_pending = list(cur_pending)
+                pending_seen = set(merged_pending)
+                for item in pending:
+                    if item in seen and item not in pending_seen:
+                        merged_pending.append(item)
+                        pending_seen.add(item)
+                self._state["applied_updates"] = {
+                    "digests": merged[:_MAX_APPLIED_DIGESTS],
+                    "pending_report": merged_pending[:_MAX_APPLIED_DIGESTS],
+                }
+                changed = True
+            try:
+                applied_path.unlink(missing_ok=True)
+                changed = True
+            except OSError:
+                pass
+
+        # --- tts-engine.json (and historical tts.json) ---
+        for name in ("tts-engine.json", "tts.json"):
+            tts_path = data_dir / name
+            if not tts_path.is_file():
+                continue
+            try:
+                raw = json.loads(tts_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raw = None
+            current_tts = self._state.get("tts")
+            if not isinstance(current_tts, dict):
+                current_tts = {"engine": None, "saved_at": None}
+            if (
+                isinstance(raw, dict)
+                and raw.get("engine")
+                and not current_tts.get("engine")
+            ):
+                try:
+                    saved_at = (
+                        float(raw["saved_at"])
+                        if raw.get("saved_at") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    saved_at = None
+                self._state["tts"] = {
+                    "engine": str(raw.get("engine")),
+                    "saved_at": saved_at,
+                }
+                changed = True
+            try:
+                tts_path.unlink(missing_ok=True)
+                changed = True
+            except OSError:
+                pass
+
+        # --- vc-redist-prompt.json ---
+        vc_path = data_dir / "vc-redist-prompt.json"
+        if vc_path.is_file():
+            try:
+                raw = json.loads(vc_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raw = None
+            current_prompt = self._state.get("vc_redist_prompt")
+            if not isinstance(current_prompt, dict):
+                current_prompt = {
+                    "dismissed": False,
+                    "dismissed_at": None,
+                    "opened_download": False,
+                }
+            if isinstance(raw, dict) and raw.get("dismissed") and not current_prompt.get(
+                "dismissed"
+            ):
+                try:
+                    dismissed_at = (
+                        float(raw["dismissed_at"])
+                        if raw.get("dismissed_at") is not None
+                        else time.time()
+                    )
+                except (TypeError, ValueError):
+                    dismissed_at = time.time()
+                self._state["vc_redist_prompt"] = {
+                    "dismissed": True,
+                    "dismissed_at": dismissed_at,
+                    "opened_download": bool(raw.get("opened_download")),
+                }
+                changed = True
+            try:
+                vc_path.unlink(missing_ok=True)
+                changed = True
+            except OSError:
+                pass
+
+        # --- updater.log.offset ---
+        offset_path = data_dir / "updater.log.offset"
+        if offset_path.is_file():
+            try:
+                raw_offset = int(offset_path.read_text(encoding="utf-8").strip())
+                if raw_offset < 0:
+                    raw_offset = 0
+            except (OSError, ValueError):
+                raw_offset = None
+            current_offset = int(self._state.get("updater_log_offset", 0) or 0)
+            if raw_offset is not None and current_offset == 0 and raw_offset > 0:
+                self._state["updater_log_offset"] = raw_offset
+                changed = True
+            try:
+                offset_path.unlink(missing_ok=True)
+                changed = True
+            except OSError:
+                pass
+
+        return changed
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -285,6 +571,155 @@ class StateStore:
     def set_autostart_default_applied(self, applied: bool = True) -> None:
         with self._lock:
             self._state["autostart_default_applied"] = bool(applied)
+            self._commit_locked()
+
+    def log_max_bytes(self) -> int:
+        from .client_log import DEFAULT_LOG_MAX_BYTES, clamp_log_max_bytes
+
+        with self._lock:
+            return clamp_log_max_bytes(
+                self._state.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES),
+                default=DEFAULT_LOG_MAX_BYTES,
+            )
+
+    def set_log_max_bytes(self, value: object) -> int:
+        from .client_log import DEFAULT_LOG_MAX_BYTES, clamp_log_max_bytes
+
+        cleaned = clamp_log_max_bytes(value, default=DEFAULT_LOG_MAX_BYTES)
+        with self._lock:
+            self._state["log_max_bytes"] = cleaned
+            self._commit_locked()
+            return cleaned
+
+    # --- TTS engine preference ---
+
+    def tts_engine_preference(self) -> tuple[Optional[str], Optional[float]]:
+        with self._lock:
+            tts = self._state.get("tts")
+            if not isinstance(tts, dict):
+                return None, None
+            engine = tts.get("engine")
+            saved_at = tts.get("saved_at")
+            try:
+                saved_at_value = float(saved_at) if saved_at is not None else None
+            except (TypeError, ValueError):
+                saved_at_value = None
+            return (str(engine) if engine else None), saved_at_value
+
+    def set_tts_engine_preference(self, engine: str, *, saved_at: Optional[float] = None) -> None:
+        name = str(engine or "").strip()
+        if not name:
+            return
+        stamp = time.time() if saved_at is None else float(saved_at)
+        with self._lock:
+            self._state["tts"] = {"engine": name, "saved_at": stamp}
+            self._commit_locked()
+
+    def clear_tts_engine_preference(self) -> None:
+        with self._lock:
+            self._state["tts"] = {"engine": None, "saved_at": None}
+            self._commit_locked()
+
+    # --- Applied updates ---
+
+    def applied_update_digests(self) -> set[str]:
+        with self._lock:
+            applied = self._state.get("applied_updates")
+            if not isinstance(applied, dict):
+                return set()
+            return set(_normalize_digest_list(applied.get("digests")))
+
+    def pending_update_reports(self) -> list[str]:
+        with self._lock:
+            applied = self._state.get("applied_updates")
+            if not isinstance(applied, dict):
+                return []
+            return list(_normalize_digest_list(applied.get("pending_report")))
+
+    def mark_update_applied(
+        self, digest: str, *, max_digests: int = _MAX_APPLIED_DIGESTS
+    ) -> None:
+        cleaned = _normalize_digest(digest)
+        if not cleaned:
+            return
+        limit = max(1, int(max_digests))
+        with self._lock:
+            applied = self._state.get("applied_updates")
+            if not isinstance(applied, dict):
+                applied = {"digests": [], "pending_report": []}
+            existing = [
+                item
+                for item in _normalize_digest_list(applied.get("digests"))
+                if item != cleaned
+            ]
+            ordered = [cleaned, *existing][:limit]
+            pending = [
+                item
+                for item in _normalize_digest_list(applied.get("pending_report"))
+                if item != cleaned
+            ]
+            pending = [cleaned, *pending][:limit]
+            self._state["applied_updates"] = {
+                "digests": ordered,
+                "pending_report": pending,
+            }
+            self._commit_locked()
+
+    def mark_update_reported(self, digest: str) -> None:
+        cleaned = _normalize_digest(digest)
+        if not cleaned:
+            return
+        with self._lock:
+            applied = self._state.get("applied_updates")
+            if not isinstance(applied, dict):
+                return
+            digests = _normalize_digest_list(applied.get("digests"))
+            pending = [
+                item
+                for item in _normalize_digest_list(applied.get("pending_report"))
+                if item != cleaned
+            ]
+            self._state["applied_updates"] = {
+                "digests": digests,
+                "pending_report": pending,
+            }
+            self._commit_locked()
+
+    # --- VC++ redistributable prompt ---
+
+    def vc_redist_prompt_dismissed(self) -> bool:
+        with self._lock:
+            prompt = self._state.get("vc_redist_prompt")
+            return bool(isinstance(prompt, dict) and prompt.get("dismissed"))
+
+    def mark_vc_redist_prompt_dismissed(self, *, opened_download: bool = False) -> None:
+        with self._lock:
+            self._state["vc_redist_prompt"] = {
+                "dismissed": True,
+                "dismissed_at": time.time(),
+                "opened_download": bool(opened_download),
+            }
+            self._commit_locked()
+
+    # --- Updater log upload offset ---
+
+    def updater_log_offset(self) -> int:
+        with self._lock:
+            try:
+                value = int(self._state.get("updater_log_offset", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+            return value if value >= 0 else 0
+
+    def set_updater_log_offset(self, offset: int) -> None:
+        try:
+            value = int(offset)
+        except (TypeError, ValueError):
+            value = 0
+        if value < 0:
+            value = 0
+        with self._lock:
+            self._state["updater_log_offset"] = value
             self._commit_locked()
 
     def _commit_locked(self) -> None:

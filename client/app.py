@@ -145,6 +145,12 @@ from .core.identity import (
 )
 from .core.protocol.bson import decode, encode
 from .core.protocol.packet import Packet, read_packet
+from .core.client_log import (
+    DEFAULT_LOG_MAX_BYTES,
+    cleanup_legacy_rotation_backups,
+    clamp_log_max_bytes,
+    trim_client_log_file,
+)
 from .core.store import StateStore
 from .core.tts import (
     DEFAULT_SPEECH_RATE,
@@ -317,36 +323,20 @@ def _application_icon() -> QIcon:
     return QIcon(pixmap)
 
 
-def _make_client_log_file_sink(log_path: Path):
+def _make_client_log_file_sink(log_path: Path, max_bytes: int = DEFAULT_LOG_MAX_BYTES):
     """Return a loguru sink that appends one JSON object per line.
 
     Must be a sink (not ``format=``): loguru still runs ``str.format_map`` on
     format templates, so a JSON body with ``{...}`` would raise KeyError.
+
+    When ``client.log`` reaches ``max_bytes``, the oldest ``floor(n/2)`` lines
+    are deleted in place (no ``client.log.N`` rotation backups).
     """
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    max_bytes = 2 * 1024 * 1024
-    retain = 3
-
-    def _rotate_if_needed() -> None:
-        try:
-            if not path.is_file() or path.stat().st_size < max_bytes:
-                return
-        except OSError:
-            return
-        # Simple size rotation: client.log -> client.log.1 ... keep ``retain`` files.
-        try:
-            oldest = path.with_name(f"{path.name}.{retain}")
-            if oldest.exists():
-                oldest.unlink(missing_ok=True)
-            for index in range(retain - 1, 0, -1):
-                src = path.with_name(f"{path.name}.{index}")
-                dst = path.with_name(f"{path.name}.{index + 1}")
-                if src.exists():
-                    src.replace(dst)
-            path.replace(path.with_name(f"{path.name}.1"))
-        except OSError:
-            pass
+    limit = clamp_log_max_bytes(max_bytes)
+    # Mutable so ClientWindow can refresh after StateStore loads log_max_bytes.
+    state = {"max_bytes": limit}
 
     def sink(message: Any) -> None:
         record = message.record
@@ -365,24 +355,28 @@ def _make_client_log_file_sink(log_path: Path):
             payload["msg"] = str(record.get("message", ""))[:4000]
             payload["logger"] = "mkcb.client"
             line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-        _rotate_if_needed()
+        trim_client_log_file(path, int(state["max_bytes"]))
         try:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line)
         except OSError:
             pass
 
+    sink.max_bytes_state = state  # type: ignore[attr-defined]
     return sink
 
 
-def _configure_logging(data_dir: Path) -> None:
+def _configure_logging(data_dir: Path, max_bytes: int = DEFAULT_LOG_MAX_BYTES):
+    """Install disk + upload sinks. Returns the file sink (for threshold updates)."""
     data_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_legacy_rotation_backups(data_dir)
     logger.remove()
     logger.configure(extra={"name": "mkcb.client"})
     # Disk + upload share the same JSON schema the server already requires (json.Valid).
     # Use a sink callable — do NOT put JSON in format= (braces break str.format_map).
+    file_sink = _make_client_log_file_sink(data_dir / "client.log", max_bytes=max_bytes)
     logger.add(
-        _make_client_log_file_sink(data_dir / "client.log"),
+        file_sink,
         level="DEBUG",
         backtrace=False,
         diagnose=False,
@@ -390,6 +384,7 @@ def _configure_logging(data_dir: Path) -> None:
         catch=True,
     )
     logger.add(_queue_client_log, level="DEBUG", enqueue=True, catch=True)
+    return file_sink
 
 
 def _read_client_log(data_dir: Path, max_bytes: int = 512 * 1024) -> str:
@@ -1995,7 +1990,7 @@ class SpeechWorker(QThread):
                 self.parts,
                 engines,
                 self.stop_event,
-                EnginePreference(self.data_dir / "tts-engine.json"),
+                EnginePreference(self.data_dir),
                 lambda text: self.text_part.emit(self.message_id, text),
                 speech_rate=self.speech_rate,
             )
@@ -2617,9 +2612,11 @@ class ClientWindow(QMainWindow):
         super().__init__()
         self.instance_lock: Optional[SingleInstanceLock] = None
         self.data_dir = _data_dir()
-        _configure_logging(self.data_dir)
+        # Default threshold first so StateStore load errors can still land on disk.
+        self._client_log_sink = _configure_logging(self.data_dir)
         LOGGER.info("client started")
-        self.state_store = StateStore(self.data_dir / "state.json")
+        self.state_store = StateStore.for_data_dir(self.data_dir)
+        self._apply_client_log_max_bytes(self.state_store.log_max_bytes())
         self.private_key, self.certificate = _identity_files(self.data_dir)
         self.servers: list[DiscoveryResponse] = []
         self.scan_worker: Optional[ScanWorker] = None
@@ -2643,7 +2640,6 @@ class ClientWindow(QMainWindow):
         self._processing_message_id = ""
         self._processing_plain = ""
         self._processing_started_at = 0.0
-        self._processing_last_log_at = 0.0
         self.current_displayed = False
         self.current_speech_done = False
         self.current_speech_success = False
@@ -2696,6 +2692,16 @@ class ClientWindow(QMainWindow):
             )
         # Windows: probe piper-tts / CRT at startup (not on first message).
         QTimer.singleShot(800, self._refresh_runtime_diagnostics)
+
+    def _apply_client_log_max_bytes(self, max_bytes: int) -> None:
+        """Refresh the live file-sink threshold from state.json ``log_max_bytes``."""
+        cleaned = clamp_log_max_bytes(max_bytes)
+        sink = getattr(self, "_client_log_sink", None)
+        state = getattr(sink, "max_bytes_state", None) if sink is not None else None
+        if isinstance(state, dict):
+            state["max_bytes"] = cleaned
+        # Trim once immediately if the existing file is already over the limit.
+        trim_client_log_file(self.data_dir / "client.log", cleaned)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -3118,10 +3124,6 @@ class ClientWindow(QMainWindow):
         self.withdrawal_timer = QTimer(self)
         self.withdrawal_timer.setSingleShot(True)
         self.withdrawal_timer.timeout.connect(self._withdrawal_display_elapsed)
-        # Periodic log + activity refresh while waiting on TTS prefetch.
-        self._processing_timer = QTimer(self)
-        self._processing_timer.setInterval(5000)
-        self._processing_timer.timeout.connect(self._tick_processing_activity)
         self.withdrawal_notice_active = False
         self.withdrawal_displayed = False
         self.withdrawal_speech_done = True
@@ -4304,13 +4306,14 @@ class ClientWindow(QMainWindow):
             and message_id not in self.withdrawn_ids
         ):
             elapsed_ms = self._processing_elapsed_ms()
+            plain = self._processing_plain or html_to_plain_text(self.current_message.content)
             LOGGER.info(
-                "TTS ready; presenting deferred message message_id={} elapsed_ms={} content={}",
+                "TTS processing finished message_id={} elapsed={:.1f}s content={}",
                 message_id,
-                elapsed_ms,
-                self._processing_plain or html_to_plain_text(self.current_message.content),
+                elapsed_ms / 1000.0,
+                plain,
             )
-            self._clear_processing_activity()
+            self._clear_processing_activity(log_end=False)
             self._present_current_message()
 
     def _processing_elapsed_ms(self) -> int:
@@ -4339,7 +4342,7 @@ class ClientWindow(QMainWindow):
                 pass
 
     def _begin_processing_activity(self, message: IncomingMessage) -> None:
-        """Mark admin status as 处理 and start progress logging (no popup)."""
+        """Mark admin status as 处理; log once at start (no popup yet)."""
         plain = html_to_plain_text(message.content).replace("\r", " ").replace("\n", " ").strip()
         if len(plain) > 200:
             plain = plain[:200] + "…"
@@ -4347,9 +4350,8 @@ class ClientWindow(QMainWindow):
         self._processing_message_id = str(message.message_id)
         self._processing_plain = plain
         self._processing_started_at = time.monotonic()
-        self._processing_last_log_at = self._processing_started_at
         LOGGER.info(
-            "message display deferred until TTS ready message_id={} content={}",
+            "TTS processing started message_id={} content={}",
             message.message_id,
             plain,
         )
@@ -4359,46 +4361,25 @@ class ClientWindow(QMainWindow):
             detail=plain,
             elapsed_ms=0,
         )
-        if not self._processing_timer.isActive():
-            self._processing_timer.start()
 
-    def _tick_processing_activity(self) -> None:
-        """Periodic log + activity refresh while waiting on TTS prefetch."""
-        if not self._awaiting_tts_ready or not self._processing_message_id:
-            self._processing_timer.stop()
-            return
-        message = self.current_message
-        if message is None or message.message_id != self._processing_message_id:
-            self._clear_processing_activity()
-            return
-        elapsed_ms = self._processing_elapsed_ms()
-        elapsed_s = elapsed_ms / 1000.0
-        LOGGER.info(
-            "TTS processing message_id={} elapsed={:.1f}s content={}",
-            self._processing_message_id,
-            elapsed_s,
-            self._processing_plain,
-        )
-        self._processing_last_log_at = time.monotonic()
-        self._report_activity_to_workers(
-            "processing",
-            message_id=self._processing_message_id,
-            detail=self._processing_plain,
-            elapsed_ms=elapsed_ms,
-        )
-
-    def _clear_processing_activity(self) -> None:
+    def _clear_processing_activity(self, *, log_end: bool = True) -> None:
         """Clear 处理 state after popup, withdraw, or interrupt."""
         was_processing = bool(self._awaiting_tts_ready or self._processing_message_id)
-        self._awaiting_tts_ready = False
         message_id = self._processing_message_id
+        plain = self._processing_plain
+        elapsed_ms = self._processing_elapsed_ms()
+        self._awaiting_tts_ready = False
         self._processing_message_id = ""
         self._processing_plain = ""
         self._processing_started_at = 0.0
-        self._processing_last_log_at = 0.0
-        if self._processing_timer.isActive():
-            self._processing_timer.stop()
         if was_processing:
+            if log_end and message_id:
+                LOGGER.info(
+                    "TTS processing finished message_id={} elapsed={:.1f}s content={}",
+                    message_id,
+                    elapsed_ms / 1000.0,
+                    plain,
+                )
             self._report_activity_to_workers("idle", message_id=message_id)
 
     def _evict_tts_cache_if_needed(self, *, keep: str = "") -> None:

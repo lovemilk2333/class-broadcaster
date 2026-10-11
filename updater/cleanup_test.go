@@ -20,7 +20,7 @@ func TestCleanupUpdateStagingRemovesUpdatesDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Sibling state that must survive.
-	if err := os.WriteFile(filepath.Join(root, "data", "applied_updates.json"), []byte("[]"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "data", "state.json"), []byte(`{"version":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "data", "client.log"), []byte("x"), 0o600); err != nil {
@@ -32,7 +32,7 @@ func TestCleanupUpdateStagingRemovesUpdatesDir(t *testing.T) {
 	if _, err := os.Stat(updates); !os.IsNotExist(err) {
 		t.Fatalf("data/updates still present: %v", err)
 	}
-	for _, name := range []string{"applied_updates.json", "client.log"} {
+	for _, name := range []string{"state.json", "client.log"} {
 		if _, err := os.Stat(filepath.Join(root, "data", name)); err != nil {
 			t.Fatalf("%s missing after cleanup: %v", name, err)
 		}

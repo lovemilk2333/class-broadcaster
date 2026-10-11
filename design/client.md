@@ -9,7 +9,7 @@
 - 首次启动（无 `data/state.json`）或没有任何已信任服务端时，自动打开配置页；Windows 打包启动器会设置 `QT_PLUGIN_PATH` / `QT_QPA_PLATFORM_PLUGIN_PATH`，确保能加载 `qwindows.dll`。
 - Windows 启动器 `lovemilk-class-broadcaster.exe` 与更新器 `lovemilk-class-broadcaster-updater.exe` 使用 `assets/icons/mkcb.ico` 作为 PE 图标（`make windows-icon` / `rsrc` 生成 `rsrc_windows_amd64.syso` 后由 `go build` 链入）。
 - 客户端身份由 Ed25519 公钥的 SHA-256（SPKI）指纹表示；界面统一显示为 `SHA256:<base64>`。TLS 证书和原始公钥只在握手内存中使用，不写入信任列表；协议握手仍携带原始公钥用于证书绑定。
-- 数据写在安装目录下的 `data/`，适配系统 C 盘重启还原：`identity.enc`、`state.json` 和 TTS 引擎偏好文件。客户端 TLS 证书每次启动后由私钥临时生成，不落盘。
+- 数据写在安装目录下的 `data/`，适配系统 C 盘重启还原：`identity.enc` 与统一的 `state.json`（含 servers / TTS / 已应用更新 / VC++ 提示 / 日志阈值等）。客户端 TLS 证书每次启动后由私钥临时生成，不落盘。
 
 ## 首次启动与配置页
 
@@ -74,30 +74,30 @@ Linux 教室客户端以 **X11** 为准（启动默认 `QT_QPA_PLATFORM=xcb`）�
 
 不使用 gTTS 或其他网络服务。管理端发送消息时由“朗读消息内容”选项决定是否发送语音文本节点；未勾选时客户端不探测 TTS，并记录 `TTS skipped`。**Windows 与 Linux** 均用经典 **`piper-tts`** + `zh_CN-huayan-medium` / `en_US-lessac-medium`（jieba 切中/英段后分别用对应 ONNX）。直接调用 Python 包 API，不使用 `piper` CLI，也不再依赖 piper-plus / Tsukuyomi / NLTK。模型缓存于 `client/tts/`（打包 `Lib/tts/`；`make clean` 不删）。`speech_rate` 为语速倍率（默认 `0.75`，1.0=正常），Piper 使用 `length_scale = 1/speech_rate`。失败时回退 Windows SAPI 5。成功引擎写入偏好文件，后续优先使用上次成功引擎，fallback 时从当前消息开头重新朗读。每次探测都会记录引擎是否可用；全部引擎都失败时仍显示文字，记录明确错误并回报 `spoken=failed`。
 
-启用 TTS 的消息在 **入队时**（`_message_received`）即后台预合成 Piper WAV（内存 plan，不落盘；上限约 8 条）。轮到播放时若预取尚未完成，**先不弹窗**，等该 `message_id` 预取结束（成功或失败）后再显示并立刻朗读；预取失败则弹窗后回退现场合成（Piper→SAPI）。等待期间客户端上报 `ClientActivity`（`0x020C`，`state=processing`），管理端连接状态显示 **处理**；本地日志周期性输出消息纯文本摘要与已耗时（`TTS processing … elapsed=…s content=…`），就绪后再记 `TTS ready; presenting …`。撤回/手动关闭/抢占时上报 `idle` 并清除等待。撤回/手动关闭丢弃缓存；高优先级抢占打断当前播放（含等待中）但保留被打断消息的缓存以便回队后即时播放。Windows piper-tts 子进程合成时父进程必须边跑边读 stdout（否则 WAV 超过管道缓冲会死锁）；播放用同步 `winsound.SND_MEMORY`（CPython 禁止 `SND_MEMORY|SND_ASYNC`），撤回时旁路 `SND_PURGE`。
+启用 TTS 的消息在 **入队时**（`_message_received`）即后台预合成 Piper WAV（内存 plan，不落盘；上限约 8 条）。轮到播放时若预取尚未完成，**先不弹窗**，等该 `message_id` 预取结束（成功或失败）后再显示并立刻朗读；预取失败则弹窗后回退现场合成（Piper→SAPI）。等待期间客户端上报 `ClientActivity`（`0x020C`，`state=processing`），管理端连接状态显示 **处理**；本地日志仅在开始与结束各记一条（`TTS processing started … content=…` / `TTS processing finished … elapsed=…s content=…`）。撤回/手动关闭/抢占时上报 `idle` 并清除等待。撤回/手动关闭丢弃缓存；高优先级抢占打断当前播放（含等待中）但保留被打断消息的缓存以便回队后即时播放。Windows piper-tts 子进程合成时父进程必须边跑边读 stdout（否则 WAV 超过管道缓冲会死锁）；播放用同步 `winsound.SND_MEMORY`（CPython 禁止 `SND_MEMORY|SND_ASYNC`），撤回时旁路 `SND_PURGE`。
 
 语音编辑器产生结构化 BSON 节点，不解析任意 XML/脚本。首版节点只有 `text`、`repeat(count, children)` 和 `pause(duration_ms)`；服务端限制重复次数和嵌套深度，客户端编译成安全的纯文本片段。
 
 ## 日志与开发者面板
 
-使用 `loguru` 写本地滚动日志，并在业务连接建立后通过 `ClientLog` 包将结构化本地日志批量上传；网络暂时不可用时最多在内存排队 1000 条，优先保留较新的日志。上传记录包含时间、级别、logger 名称和日志消息；不含公钥私钥或 TTS 音频。一般业务日志仍避免完整正文，但 TTS **处理**等待期间的进度日志会附带纯文本摘要与已耗时，便于管理端排查预合成卡住。服务端单独按客户端 ID 保留最近 500 条，最多保存 1000 个客户端的日志，并由前端客户端日志 Dialog 读取；新日志通过按客户端节流的 SSE 通知该 Dialog 刷新。这些内容与服务端进程日志完全分开。
+使用 `loguru` 写本地 `data/client.log`（JSONL），并在业务连接建立后通过 `ClientLog` 包将结构化本地日志批量上传；网络暂时不可用时最多在内存排队 1000 条，优先保留较新的日志。上传记录包含时间、级别、logger 名称和日志消息；不含公钥私钥或 TTS 音频。一般业务日志仍避免完整正文，但 TTS **处理**开始/结束日志会附带纯文本摘要与总耗时，便于管理端排查预合成卡住。本地文件达到 `state.json` 的 `log_max_bytes`（默认 **2 MiB**，范围 64 KiB–64 MiB）时，**就地删除最旧的 `floor(行数/2)` 行**并保留后半段，不再轮转到 `client.log.1/.2/.3`（启动时清理历史轮转备份）。服务端单独按客户端 ID 保留最近 500 条，最多保存 1000 个客户端的日志，并由前端客户端日志 Dialog 读取；新日志通过按客户端节流的 SSE 通知该 Dialog 刷新。这些内容与服务端进程日志完全分开。
 
 管理员从前端断开客户端时，服务端发送 `ClientDisconnect`。客户端不持久化管理员断开状态，并依据握手响应中的服务端 `connection_mode` 处理：监听模式停止自动重连，客户端设置页仍可手动连接；从模式每 5 分钟发送一次带 `reconnect_probe` 的握手，由服务端返回 `connect_allowed` 决定是否建立会话。手动连接使用 `manual_connect` 标记，成功后重置退避状态；失败后继续原有探测间隔，不改变监听/从模式策略。启动时仍会连接上次选中的服务端。服务端在已知客户端主动结束会话（`user_exit` / `update` / `admin`）且 TLS hub 已离线时，**不**再对该客户端累计监听探测丢包，避免人为退出/更新重启污染 `probe_loss_percent`。
 
 开发者面板「Exit client」或更新退出前，客户端对每条在线 TLS 会话发送 `ClientSessionEnd`（`reason=user_exit` 或 `update`），服务端据此显示 **人为终止** / **更新重启中**；未上报而掉线的客户端在 30 秒未重连后显示 **意外终止**。刷出 goodbye 后连接线程会 `keep_running=False` 并退出，避免短暂重握手清掉 `session_end` 后又被记成意外终止。
 
-Windows 设置页含「运行环境」：启动后后台探测 piper-tts / onnxruntime / CRT；若原生 ACCESS_VIOLATION 且本机尚未关闭过提示（`data/vc-redist-prompt.json`），则自动弹窗一次并可选打开 VC++ x64 官方下载；之后仅可从该页手动下载。
+Windows 设置页含「运行环境」：启动后后台探测 piper-tts / onnxruntime / CRT；若原生 ACCESS_VIOLATION 且本机尚未关闭过提示（`state.json` 的 `vc_redist_prompt.dismissed`），则自动弹窗一次并可选打开 VC++ x64 官方下载；之后仅可从该页手动下载。
 
 客户端本地日志使用独立 `ClientLog` 业务包上传到服务端有界缓冲。管理端日志 Dialog 请求后端分页，默认每页 100 条并按日志时间倒序，使用共享分页大小及页码跳转；SSE 更新仅刷新当前客户端日志页。
 
 关于页连续 7 次点击版本号且每次间隔不超过 1 秒后打开开发者面板。面板显示日志、协议版本、连接状态、服务端指纹和 snapshot ID，并提供关闭自启动和退出程序操作；这些操作不改变普通设置页面的持久状态。
 
-客户端握手携带 `client_version`，值来自仓库根目录 `version.json` 的 **`client`** 字段（经 `client/version.py` 读取；与 **`server`** 字段独立）；服务端管理端显示最近一次握手上报的版本。收到服务端 `UPDATE_AVAILABLE` (`0x0207`) 时，客户端根据 metadata 自动判断客户端/更新器/组合包：用 `download_token` 对推送方 TLS 端口新建短连接拉取 `.tar.zst`（或落盘内联小包）→ 校验 files-v1 清单与嵌入 metadata → 将包与 updater 复制到短路径 `data/updates/apply/<sha16>/pkg.tar.zst`（避免 Windows MAX_PATH）后以 `--pid` 启动独立 updater → 客户端释放单实例锁并退出 → updater 覆盖安装（保留 `data/`）→ 删除 `data/updates/` 暂存目录（保留 `data/applied_updates.json` 等状态）→ **自动重新启动** `lovemilk-class-broadcaster(.exe)` 以重新握手并上报新版本。只写英文日志，不弹 Windows 托盘通知。`MKCB_INSTALL_DIR` 未设置（开发模式）时只落盘校验不替换、不退出。管理端只上传更新包并由服务端解析 metadata，发布仅即时推送给在线且已批准的目标，离线目标保留为待发送记录。
+客户端握手携带 `client_version`，值来自仓库根目录 `version.json` 的 **`client`** 字段（经 `client/version.py` 读取；与 **`server`** 字段独立）；服务端管理端显示最近一次握手上报的版本。收到服务端 `UPDATE_AVAILABLE` (`0x0207`) 时，客户端根据 metadata 自动判断客户端/更新器/组合包：用 `download_token` 对推送方 TLS 端口新建短连接拉取 `.tar.zst`（或落盘内联小包）→ 校验 files-v1 清单与嵌入 metadata → 将包与 updater 复制到短路径 `data/updates/apply/<sha16>/pkg.tar.zst`（避免 Windows MAX_PATH）后以 `--pid` 启动独立 updater → 客户端释放单实例锁并退出 → updater 覆盖安装（保留 `data/`）→ 删除 `data/updates/` 暂存目录（保留 `data/state.json` 等状态）→ **自动重新启动** `lovemilk-class-broadcaster(.exe)` 以重新握手并上报新版本。只写英文日志，不弹 Windows 托盘通知。`MKCB_INSTALL_DIR` 未设置（开发模式）时只落盘校验不替换、不退出。管理端只上传更新包并由服务端解析 metadata，发布仅即时推送给在线且已批准的目标，离线目标保留为待发送记录。
 
 ## 更新包
 
 更新包仅为 zstd level 3 压缩的 `.tar.zst`（内部直接 tar，顶层含 `metadata.json` 与安装文件，无嵌套 zip）。metadata 含 `components`（如 `["updater","client"]`）、兼容字段 `component`（单组件名或 `bundle`）、`version`、`client_version`、`updater_version`、`platform`、`payload_format`、`sha256`；增量包可含 `incremental=true`。相对上一版本绿色 `.zip`、或 `build/cache/client-package-base/<version>/` 中其它版本快照（最多保留 2 个）可只打变更/新增文件（删除路径时回退全量）。
-服务端存 `data/updates/<manifest-digest>.tar.zst`（64 位十六进制；新包 BLAKE3，旧包 SHA-256；API/DB 字段名仍为 `sha256`）；`UPDATE_AVAILABLE` 只推 meta + 鉴权 `download_token`（Ed25519，绑定摘要/client_id/expires）+ 可选 `force`，**不**走管理 HTTP `39003`，也**不**写入握手响应，也**不**视为该客户端已完成。客户端对推送方 `host:tcp_port` **新建** TLS 连接，`ConnectReq.update_download=true` 后发送 `UpdateDownloadReq`（`0x0208`），服务端以 `UpdateDownloadResp`（`0x0209`）分块下发包体；短会话不加入 hub。下载进度日志按 `>0%` / `25%` / `50%` / `75%` / `>99%` 里程碑输出 `%=… speed=…MiB/s`。发布时在线目标即时推送；发布时离线或 `applied_seq` 落后的目标客户端，在下次成功建立业务会话后自动补推最高适用 seq（强制与非强制同一规则）。客户端应用成功后把摘要写入 `data/applied_updates.json`（含 `pending_report`）；重启重连后发送 `UpdateApplied`（`0x020B`），服务端据此推进该客户端的 `applied_seq`。是否下发由服务端按 `applied_seq` 与握手 `client_version` 判定；客户端一旦收到 `UPDATE_AVAILABLE` 即应用（仅本地已应用过的同一 digest 才跳过并补报 `UpdateApplied`）。已上报 `client_version` ≥ 包内版本的客户端服务端不再补推（旧客户端无 `UpdateApplied` 时的回退）。跨重启拒绝同一包。组合包安装顺序：先 updater 再 client。独立 Go updater 写 `data/updater.log`（与 `client.log` 分离）。`Makefile` 同时生成：绿色安装 `bin/*-windows-amd64.zip`（始终全量，首次部署解压即用，管理端发布不接受）与更新包 `bin/*-windows-amd64.tar.zst`（默认可增量）。
+服务端存 `data/updates/<manifest-digest>.tar.zst`（64 位十六进制；新包 BLAKE3，旧包 SHA-256；API/DB 字段名仍为 `sha256`）；`UPDATE_AVAILABLE` 只推 meta + 鉴权 `download_token`（Ed25519，绑定摘要/client_id/expires）+ 可选 `force`，**不**走管理 HTTP `39003`，也**不**写入握手响应，也**不**视为该客户端已完成。客户端对推送方 `host:tcp_port` **新建** TLS 连接，`ConnectReq.update_download=true` 后发送 `UpdateDownloadReq`（`0x0208`），服务端以 `UpdateDownloadResp`（`0x0209`）分块下发包体；短会话不加入 hub。下载进度日志按 `>0%` / `25%` / `50%` / `75%` / `>99%` 里程碑输出 `%=… speed=…MiB/s`。发布时在线目标即时推送；发布时离线或 `applied_seq` 落后的目标客户端，在下次成功建立业务会话后自动补推最高适用 seq（强制与非强制同一规则）。客户端应用成功后把摘要写入 `state.json` 的 `applied_updates`（含 `pending_report`）；重启重连后发送 `UpdateApplied`（`0x020B`），服务端据此推进该客户端的 `applied_seq`。是否下发由服务端按 `applied_seq` 与握手 `client_version` 判定；客户端一旦收到 `UPDATE_AVAILABLE` 即应用（仅本地已应用过的同一 digest 才跳过并补报 `UpdateApplied`）。已上报 `client_version` ≥ 包内版本的客户端服务端不再补推（旧客户端无 `UpdateApplied` 时的回退）。跨重启拒绝同一包。组合包安装顺序：先 updater 再 client。独立 Go updater 写 `data/updater.log`（与 `client.log` 分离；上传进度偏移在 `state.json` 的 `updater_log_offset`）。`Makefile` 同时生成：绿色安装 `bin/*-windows-amd64.zip`（始终全量，首次部署解压即用，管理端发布不接受）与更新包 `bin/*-windows-amd64.tar.zst`（默认可增量）。
 
 客户端发行目录由 CPython 3.11 Windows x64 embeddable runtime、PySide6 Essentials Windows wheels、优化字节码以及 Go GUI 启动器组成。启动器设置安装根目录后运行 `runtime/pythonw.exe -O -m client`；状态始终写入安装根目录的 `data/`。独立 Go updater 写 `data/updater.log`；成功覆盖后以 detached 方式重启同目录启动器，避免更新后进程不在线、管理端版本/在线状态不同步。Linux 使用 `scripts/build_embedded_client.py` 直接组装 Windows 包，不运行 PyInstaller；构建器拒绝混入 Linux `.so` 并检查入口、updater、Python runtime 均为 x86-64 PE。
 
@@ -105,7 +105,7 @@ Windows 设置页含「运行环境」：启动后后台探测 piper-tts / onnxr
 
 Ed25519 私钥以 `identity.enc` 密文保存。密码由安装时间戳、客户端公钥 SHA-256 指纹、CPUID、设备 ID 和固定域分隔符派生；使用 Argon2id（64 MiB、3 次、2 并行）得到 AES-256-GCM 密钥。salt、nonce 和 KDF 参数写入密文封装，派生密码和 key 只在内存短暂存在。
 
-`state.json` 仅保存服务端 endpoint、服务端 SHA-256 指纹和当前 `config_id`；不保存消息正文、回执或消息去重记录。写入使用临时文件、fsync 和原子替换；损坏时回到空状态并要求重新信任服务端。
+`state.json` 是客户端唯一本地偏好仓库（`version: 1`），按 key 区分：`servers` / `server`（endpoint + SPKI 指纹）、`config_id`、`listener_mode` / `listener_port`、`autostart_default_applied`、`log_max_bytes`、`tts`（引擎名 + `saved_at`）、`applied_updates`（`digests` + `pending_report`）、`vc_redist_prompt`、`updater_log_offset`。后续新增持久化字段也写入此文件。不保存消息正文、回执或消息去重记录。写入使用临时文件、fsync 和原子替换；损坏时回到空状态并要求重新信任服务端。启动时一次性迁移并删除旧旁路文件（`applied_updates.json`、`tts-engine.json` / `tts.json`、`vc-redist-prompt.json`、`updater.log.offset`）。
 
 ## 首版验收场景
 

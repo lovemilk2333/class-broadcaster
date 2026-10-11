@@ -13,31 +13,24 @@ from typing import Any
 
 
 UPDATER_LOGGER = "mkcb.updater"
-_OFFSET_NAME = "updater.log.offset"
 
 
 def updater_log_path(data_dir: Path) -> Path:
     return Path(data_dir) / "updater.log"
 
 
-def offset_path(data_dir: Path) -> Path:
-    return Path(data_dir) / _OFFSET_NAME
-
-
 def read_offset(data_dir: Path) -> int:
-    path = offset_path(data_dir)
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-        value = int(raw)
-        return value if value >= 0 else 0
-    except (OSError, ValueError):
-        return 0
+    """Byte offset into updater.log (stored in state.json ``updater_log_offset``)."""
+    from .store import StateStore
+
+    return StateStore.for_data_dir(data_dir).updater_log_offset()
 
 
 def write_offset(data_dir: Path, offset: int) -> None:
-    path = offset_path(data_dir)
+    from .store import StateStore
+
     try:
-        path.write_text(str(max(0, int(offset))), encoding="utf-8")
+        StateStore.for_data_dir(data_dir).set_updater_log_offset(offset)
     except OSError:
         pass
 

@@ -74,7 +74,7 @@ func main() {
 	}
 	updaterLog("info", "update apply completed package=%s install_dir=%s", *packagePath, *installDir)
 	// Drop downloaded / staged packages under data/updates (apply/<sha>/pkg.tar.zst,
-	// cached <sha>.tar.zst, metadata). applied_updates.json lives in data/ and is kept.
+	// cached <sha>.tar.zst, metadata). data/state.json (applied digests, servers, …) is kept.
 	cleanupUpdateStaging(*installDir)
 	// Always relaunch so the new binary reconnects and reports the new client_version.
 	if err := restartClient(*installDir); err != nil {

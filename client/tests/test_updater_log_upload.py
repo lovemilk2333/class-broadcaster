@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from client.core.store import StateStore
 from client.core.updater_log_upload import (
     UPDATER_LOGGER,
     collect_pending_updater_logs,
@@ -16,6 +17,9 @@ from client.core.updater_log_upload import (
 
 
 class UpdaterLogUploadTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        StateStore.clear_registry()
+
     def test_collect_json_and_legacy_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             data_dir = Path(temp)
